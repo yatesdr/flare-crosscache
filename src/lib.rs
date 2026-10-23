@@ -2,6 +2,7 @@ pub mod arena;
 pub mod disk;
 pub mod protocol;
 pub mod record;
+pub mod server;
 pub mod tree;
 
 use std::io;

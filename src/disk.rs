@@ -88,7 +88,7 @@ pub struct Faults {
     pub delay_ms: u64,
 }
 impl Faults {
-    fn checkpoint(&self, point: &str) {
+    pub(crate) fn checkpoint(&self, point: &str) {
         if self.pause_at.as_deref() == Some(point) {
             if let Some(path) = &self.signal {
                 fs::write(path, point).unwrap();
