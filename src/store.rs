@@ -283,6 +283,7 @@ const SNAPSHOT_BUFFER: usize = 65_536;
 #[derive(Clone)]
 enum LiveEvent {
     Catalog {
+        seq: u64,
         kind: u8,
         key: Key,
         entry: Option<EntryData>,
@@ -4230,10 +4231,10 @@ impl Store {
             match event {
                 StoreEvent::Catalog {
                     namespace,
+                    seq,
                     kind,
                     key,
                     entry,
-                    ..
                 } => {
                     let mut subscribers: Vec<u64> = self
                         .subscriptions
@@ -4244,6 +4245,7 @@ impl Store {
                     subscribers.sort_unstable();
                     for connection in subscribers {
                         let live = LiveEvent::Catalog {
+                            seq,
                             kind,
                             key,
                             entry: entry.clone(),
@@ -4265,11 +4267,21 @@ impl Store {
     /// Queues a live event behind an in-progress snapshot, or sends it when the
     /// snapshot has ended. Returns true when the snapshot buffer overflowed.
     fn buffer_or_send(&mut self, connection: u64, live: LiveEvent) -> bool {
+        let seq = match &live {
+            LiveEvent::Catalog { seq, .. } => Some(*seq),
+            LiveEvent::Room { .. } => None,
+        };
         let action = {
             let Some(subscription) = self.subscriptions.get_mut(&connection) else {
                 return false;
             };
-            if subscription.snapshot.is_some() {
+            // Once a snapshot is in progress, or buffered mutations remain
+            // after SnapshotEnd, everything queues behind them.
+            if subscription.snapshot.is_some() || !subscription.buffered.is_empty() {
+                if seq.is_some_and(|seq| seq <= subscription.seq0) {
+                    // Already represented in the snapshot boundary.
+                    return false;
+                }
                 if subscription.buffered.len() >= SNAPSHOT_BUFFER {
                     Some(None)
                 } else {
@@ -4794,7 +4806,9 @@ pub enum StoreCommand {
 
 fn live_event(live: &LiveEvent, sequence: u64) -> Option<crosscache::CatalogEvent> {
     match live {
-        LiveEvent::Catalog { kind, key, entry } => {
+        LiveEvent::Catalog {
+            kind, key, entry, ..
+        } => {
             let event = if *kind == 2 {
                 crosscache::catalog_event::Event::Removed(crate::control::key_to_proto(key))
             } else {
@@ -5369,6 +5383,159 @@ mod tests {
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/flare-crosscache").join(name));
+    }
+
+    fn insert_node(
+        store: &mut Store,
+        id: NamespaceId,
+        value: &Descriptor,
+        key: Key,
+        parent: Option<Key>,
+        tail: u32,
+    ) {
+        let header = Header::new(value, key, parent, [0; 16], tail).unwrap();
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                key,
+                parent,
+                [0; 16],
+                tail as usize,
+                true,
+                Location {
+                    header,
+                    memory: None,
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    retry: Instant::now(),
+                    bytes: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn snapshot_drops_mutations_at_or_before_the_boundary() {
+        let (mut store, directory) = store("snapshot-boundary");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let generation = store.sessions[&1].generation;
+        let key = Key {
+            consumed_tokens: 128,
+            digest: [1; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 2);
+        store.delta(id, 0, key);
+        assert_eq!(store.namespaces[&id].seq, 1);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        store.subscribe(1, id, generation, value, sender).unwrap();
+        store.flush_events();
+        let mut entries = 0;
+        let mut added = 0;
+        let mut ended = false;
+        while !ended {
+            store.pump_subscriptions();
+            while let Ok(event) = receiver.try_recv() {
+                match event.event.unwrap() {
+                    crosscache::catalog_event::Event::Entry(_) => entries += 1,
+                    crosscache::catalog_event::Event::Added(_) => added += 1,
+                    crosscache::catalog_event::Event::SnapshotEnd(_) => ended = true,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(entries, 1);
+        assert_eq!(
+            added, 0,
+            "an event at the snapshot boundary must not replay"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn live_events_do_not_bypass_buffered_mutations() {
+        let (mut store, directory) = store("snapshot-order");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let generation = store.sessions[&1].generation;
+        let first = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let second = Key {
+            consumed_tokens: 128,
+            digest: [2; 16],
+        };
+        let third = Key {
+            consumed_tokens: 192,
+            digest: [3; 16],
+        };
+        insert_node(&mut store, id, &value, first, None, 1);
+        insert_node(&mut store, id, &value, second, Some(first), 1);
+        insert_node(&mut store, id, &value, third, Some(second), 1);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        store.subscribe(1, id, generation, value, sender).unwrap();
+        // Two mutations happen while the snapshot is draining.
+        store.delta(id, 1, first);
+        store.delta(id, 1, second);
+        store.flush_events();
+        let mut events = Vec::new();
+        while !events.iter().any(|event: &crosscache::CatalogEvent| {
+            matches!(
+                event.event,
+                Some(crosscache::catalog_event::Event::SnapshotEnd(_))
+            )
+        }) {
+            store.pump_subscriptions();
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+        let subscription = &store.subscriptions[&1];
+        assert!(subscription.snapshot.is_none());
+        assert_eq!(subscription.buffered.len(), 2);
+        // A newer mutation must queue behind the older buffered ones.
+        store.delta(id, 1, third);
+        store.flush_events();
+        assert_eq!(store.subscriptions[&1].buffered.len(), 3);
+        loop {
+            store.pump_subscriptions();
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+            let subscription = &store.subscriptions[&1];
+            if subscription.buffered.is_empty() && subscription.snapshot.is_none() {
+                break;
+            }
+        }
+        let live: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                Some(crosscache::catalog_event::Event::Changed(entry)) => {
+                    Some(entry.key.as_ref().unwrap().consumed_tokens)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(live, vec![64, 128, 192]);
+        let mut sequence = 0;
+        for event in &events {
+            assert_eq!(event.sequence, sequence + 1);
+            sequence = event.sequence;
+        }
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
