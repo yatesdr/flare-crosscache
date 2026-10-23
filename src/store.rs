@@ -907,6 +907,25 @@ impl Store {
         None
     }
 
+    #[cfg(test)]
+    fn dispatch_trace(&mut self) -> Vec<&'static str> {
+        let mut trace = Vec::new();
+        let mut gets = 0;
+        for _ in 0..4 {
+            let Some(pending) = self.pop_get() else {
+                break;
+            };
+            gets += 1;
+            self.begin_get(pending);
+        }
+        trace.extend(std::iter::repeat_n("get", gets));
+        if let Some(pending) = self.pop_put() {
+            trace.push("put");
+            self.begin_put(pending);
+        }
+        trace
+    }
+
     fn dispatch(&mut self) {
         for _ in 0..4 {
             let Some(pending) = self.pop_get() else {
@@ -4603,6 +4622,75 @@ mod tests {
         assert_eq!(mismatch.namespace_id(), id);
         let error = store.register_namespace(mismatch).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn dispatch_prioritises_gets() {
+        let (mut store, directory) = store("dispatch");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let (get_events, _get_receiver) = tokio::sync::mpsc::channel(4);
+        let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
+        for index in 0..4 {
+            store.submit_get(
+                1,
+                100 + index,
+                GetRequest {
+                    keys: vec![Key {
+                        consumed_tokens: 64,
+                        digest: [4; 16],
+                    }],
+                    skip_pages: 0,
+                    expected_pages: 1,
+                    row: true,
+                },
+                get_events.clone(),
+            );
+        }
+        for index in 0..4 {
+            store.submit_put(
+                1,
+                200 + index,
+                PutRequest {
+                    key: Key {
+                        consumed_tokens: 128 + index * 64,
+                        digest: [5; 16],
+                    },
+                    published_parent: None,
+                    bucket: [0; 16],
+                    chain_pages: (128 + index * 64) as u32 / 64,
+                    published_tail_pages: (128 + index * 64) as u32 / 64,
+                    row: true,
+                },
+                put_events.clone(),
+            );
+        }
+        assert_eq!(
+            store.dispatch_trace(),
+            vec!["get", "get", "get", "get", "put"]
+        );
+        // One more round: the fifth get still precedes the queued Put.
+        store.submit_get(
+            1,
+            300,
+            GetRequest {
+                keys: vec![Key {
+                    consumed_tokens: 64,
+                    digest: [4; 16],
+                }],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+            },
+            get_events,
+        );
+        assert_eq!(store.dispatch_trace(), vec!["get", "put"]);
+        let _ = id;
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }

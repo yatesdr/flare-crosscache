@@ -1207,3 +1207,58 @@ async fn l0_26_namespace_registration_and_mismatch() {
     // The manager is still healthy.
     assert!(!client.fetch(&[key(128)], 0, 2).await[0].is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_27_no_progress_timeout_ends_the_call() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(client.begin(key(256), None)),
+        })
+        .await
+        .unwrap();
+    loop {
+        match replies.message().await.unwrap().unwrap().r {
+            Some(crosscache::put_reply::R::Accept(_)) => break,
+            Some(_) => continue,
+            None => panic!("reply stream ended"),
+        }
+    }
+    let start = Instant::now();
+    let mut timed_out = false;
+    loop {
+        match replies.message().await {
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+                timed_out = true;
+                break;
+            }
+            Ok(Some(reply)) => match reply.r {
+                Some(crosscache::put_reply::R::Refused(refused)) => {
+                    assert_eq!(refused.reason, crosscache::Reason::Invalid as i32);
+                    timed_out = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            },
+            Ok(None) => break,
+        }
+    }
+    assert!(timed_out, "the call did not end on the no-progress timer");
+    assert!(start.elapsed() >= Duration::from_secs(2));
+    assert!(start.elapsed() < Duration::from_secs(8));
+    drop(sender);
+    let mut fresh = host.client().await;
+    assert!(!fresh.fetch(&[key(128)], 0, 2).await[0].is_empty());
+}
