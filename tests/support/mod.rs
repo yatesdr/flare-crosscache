@@ -1,9 +1,15 @@
 #![allow(dead_code)]
 use flare_crosscache::{
-    Key, disk,
-    protocol::{self, Decoder, Encoder, Frame, tag},
-    record::{self, Descriptor, Header, RankSizes},
+    Key,
+    codec::{Decoder, Encoder},
+    disk,
+    protocol::{self, Frame, tag},
+    record::{self, Descriptor, Header, NamespaceId, RankSizes},
     server::{self, Config},
+    store::{
+        self, DispatchOutcome, EntryData, GetBeginOutcome, PutBeginOutcome, PutFrameInput,
+        PutFrameOutcome, PutRequest, Store, StoreEvent,
+    },
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -36,6 +42,7 @@ pub fn descriptor() -> Descriptor {
             planes: vec![4000],
             row_bytes: 1000,
         }],
+        tenant: String::new(),
     }
 }
 pub fn base(label: &str) -> PathBuf {
@@ -345,28 +352,7 @@ impl Client {
         parent: Option<Key>,
         first: u32,
     ) -> (Header, Vec<u8>, Vec<u64>) {
-        let pages = key.consumed_tokens / self.descriptor.page_tokens - u64::from(first);
-        let mut header = Header::new(&self.descriptor, key, parent, [4; 16], pages as u32).unwrap();
-        let mut bytes = vec![0; header.length_with_row() as usize];
-        let page_bytes = header.page_record_bytes() as usize;
-        let mut hashes = Vec::new();
-        for page in 0..pages as usize {
-            let offset = header.page_segment as usize + page * page_bytes;
-            let data = &mut bytes[offset..offset + page_bytes];
-            for (index, byte) in data.iter_mut().enumerate() {
-                *byte = ((page + first as usize) * 31 + index * 7) as u8;
-            }
-            hashes.push(record::checksum(data));
-        }
-        for (index, byte) in bytes[header.row_segment as usize..].iter_mut().enumerate() {
-            *byte = (key.consumed_tokens as usize + index * 13) as u8;
-        }
-        header.row_checksum = record::checksum(&bytes[header.row_segment as usize..]);
-        bytes[..4096].copy_from_slice(&encode_header(&header));
-        for (index, hash) in hashes.iter().enumerate() {
-            bytes[4096 + index * 8..4096 + index * 8 + 8].copy_from_slice(&hash.to_le_bytes());
-        }
-        (header, bytes, hashes)
+        content_for(&self.descriptor, key, parent, first)
     }
     pub fn upload(&mut self, op: u64, header: &Header, bytes: &[u8], hashes: &[u64]) {
         let page_bytes = header.page_record_bytes() as usize;
@@ -491,4 +477,503 @@ pub fn encode_header(header: &Header) -> [u8; 4096] {
     let mut bytes = [0; 4096];
     bytes[..encoder.0.len()].copy_from_slice(&encoder.0);
     bytes
+}
+
+pub fn content_for(
+    descriptor: &Descriptor,
+    key: Key,
+    parent: Option<Key>,
+    first: u32,
+) -> (Header, Vec<u8>, Vec<u64>) {
+    let pages = key.consumed_tokens / descriptor.page_tokens - u64::from(first);
+    let mut header = Header::new(descriptor, key, parent, [4; 16], pages as u32).unwrap();
+    let mut bytes = vec![0; header.length_with_row() as usize];
+    let page_bytes = header.page_record_bytes() as usize;
+    let mut hashes = Vec::new();
+    for page in 0..pages as usize {
+        let offset = header.page_segment as usize + page * page_bytes;
+        let data = &mut bytes[offset..offset + page_bytes];
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = ((page + first as usize) * 31 + index * 7) as u8;
+        }
+        hashes.push(record::checksum(data));
+    }
+    for (index, byte) in bytes[header.row_segment as usize..].iter_mut().enumerate() {
+        *byte = (key.consumed_tokens as usize + index * 13) as u8;
+    }
+    header.row_checksum = record::checksum(&bytes[header.row_segment as usize..]);
+    bytes[..4096].copy_from_slice(&encode_header(&header));
+    for (index, hash) in hashes.iter().enumerate() {
+        bytes[4096 + index * 8..4096 + index * 8 + 8].copy_from_slice(&hash.to_le_bytes());
+    }
+    (header, bytes, hashes)
+}
+
+#[derive(Clone, Debug)]
+pub struct Answer {
+    pub tag: u8,
+    pub payload: Vec<u8>,
+}
+
+pub struct TestConn {
+    pub id: u64,
+    pub generation: u64,
+    pub descriptor: Descriptor,
+    pub next_op: u64,
+}
+
+pub struct StoreHost {
+    pub base: PathBuf,
+    pub config: Config,
+    store: Option<Store>,
+    pub events: Vec<StoreEvent>,
+    pending: Vec<DispatchOutcome>,
+    next_connection: u64,
+}
+
+impl StoreHost {
+    pub fn new(memory: usize, nvme: u64) -> Self {
+        let base = base("store");
+        let config = Config::new(base.join("records"), base.join("run/m.sock"), memory, nvme);
+        let store = Store::open(config.clone()).unwrap();
+        Self {
+            base,
+            config,
+            store: Some(store),
+            events: Vec::new(),
+            pending: Vec::new(),
+            next_connection: 0,
+        }
+    }
+    pub fn open(config: Config) -> Self {
+        let base = config
+            .root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| config.root.clone());
+        Self {
+            base,
+            store: Some(Store::open(config.clone()).unwrap()),
+            config,
+            events: Vec::new(),
+            pending: Vec::new(),
+            next_connection: 0,
+        }
+    }
+    pub fn restart(&mut self) {
+        self.store.take();
+        self.store = Some(Store::open(self.config.clone()).unwrap());
+        self.events.clear();
+        self.pending.clear();
+    }
+    pub fn close_store(&mut self) {
+        self.store.take();
+    }
+    pub fn store(&self) -> &Store {
+        self.store.as_ref().unwrap()
+    }
+    pub fn store_mut(&mut self) -> &mut Store {
+        self.store.as_mut().unwrap()
+    }
+    pub fn connect(&mut self) -> TestConn {
+        self.connect_with(descriptor())
+    }
+    pub fn connect_with(&mut self, descriptor: Descriptor) -> TestConn {
+        self.try_connect_with(descriptor)
+            .expect("Hello must succeed")
+    }
+    pub fn try_connect_with(&mut self, descriptor: Descriptor) -> std::io::Result<TestConn> {
+        self.next_connection += 1;
+        let id = self.next_connection;
+        let generation =
+            self.store_mut()
+                .hello(id, "l0".into(), std::process::id(), descriptor.clone())?;
+        Ok(TestConn {
+            id,
+            generation,
+            descriptor,
+            next_op: 2,
+        })
+    }
+    pub fn namespace_id(&self, descriptor: &Descriptor) -> NamespaceId {
+        descriptor.namespace_id()
+    }
+    pub fn entries(&self) -> HashMap<Key, EntryData> {
+        let Some(id) = self.store().namespace_id() else {
+            return HashMap::new();
+        };
+        self.store()
+            .snapshot(id)
+            .map(|(_, entries)| {
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.key, entry))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn snapshot(&self) -> (u64, Vec<EntryData>) {
+        let id = self.store().namespace_id().expect("namespace");
+        self.store().snapshot(id).expect("namespace")
+    }
+    pub fn snapshot_keys(&self) -> Vec<Key> {
+        self.snapshot()
+            .1
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect()
+    }
+    pub fn pump(&mut self) {
+        self.store_mut().disk_events();
+        self.store_mut().cleanup_turn();
+        self.store_mut().schedule();
+        self.store_mut().tick();
+        self.collect();
+    }
+    pub fn collect(&mut self) {
+        let events = self.store_mut().take_events();
+        self.events.extend(events);
+    }
+    pub fn metrics(&self) -> String {
+        self.store().metrics_text()
+    }
+    pub fn gauge(&self, name: &str) -> u64 {
+        self.metrics()
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("cm_{name} ")))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+    pub fn wait(&mut self, mut condition: impl FnMut(&StoreHost) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            self.pump();
+            if condition(self) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "condition timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    pub fn durable(&mut self, count: usize) {
+        self.wait(|host| {
+            host.metrics()
+                .lines()
+                .filter(|line| line.starts_with("cm_records{") && line.contains("tier=\"disk\""))
+                .filter_map(|line| line.rsplit(' ').next().unwrap().parse::<usize>().ok())
+                .sum::<usize>()
+                == count
+        });
+    }
+    pub fn put(&mut self, conn: &mut TestConn, key: Key, parent: Option<Key>) -> (u64, Answer) {
+        let op = conn.next_op;
+        conn.next_op += 1;
+        let pages = key.consumed_tokens / conn.descriptor.page_tokens;
+        let tail = pages
+            - parent.map_or(0, |parent| {
+                parent.consumed_tokens / conn.descriptor.page_tokens
+            });
+        self.store_mut().submit_put(
+            conn.id,
+            op,
+            PutRequest {
+                key,
+                published_parent: parent,
+                bucket: [4; 16],
+                chain_pages: pages as u32,
+                published_tail_pages: tail as u32,
+                page_bytes: conn.descriptor.page_bytes(),
+                row_bytes: conn.descriptor.row_bytes(),
+                row: true,
+            },
+        );
+        let outcome = self.dispatch_for(conn.id, op, true);
+        match outcome {
+            DispatchOutcome::Put {
+                outcome: Ok(PutBeginOutcome::Accept { first_page, parent }),
+                ..
+            } => {
+                let mut payload = Encoder::default();
+                payload.u32(first_page);
+                payload.parent(parent);
+                (
+                    op,
+                    Answer {
+                        tag: tag::ACCEPT,
+                        payload: payload.0,
+                    },
+                )
+            }
+            DispatchOutcome::Put {
+                outcome: Ok(PutBeginOutcome::Present),
+                ..
+            } => (
+                op,
+                Answer {
+                    tag: tag::PRESENT,
+                    payload: Vec::new(),
+                },
+            ),
+            DispatchOutcome::Put {
+                outcome: Ok(PutBeginOutcome::Retry(reason)),
+                ..
+            } => (
+                op,
+                Answer {
+                    tag: tag::RETRY,
+                    payload: vec![reason],
+                },
+            ),
+            DispatchOutcome::Put {
+                outcome: Ok(PutBeginOutcome::Oversize),
+                ..
+            } => (
+                op,
+                Answer {
+                    tag: tag::OVERSIZE,
+                    payload: Vec::new(),
+                },
+            ),
+            DispatchOutcome::Put {
+                outcome: Err(error),
+                ..
+            } => panic!("{error}"),
+            _ => unreachable!(),
+        }
+    }
+    fn dispatch_for(&mut self, connection: u64, op: u64, put: bool) -> DispatchOutcome {
+        loop {
+            let index = self.pending.iter().position(|outcome| match outcome {
+                DispatchOutcome::Put {
+                    connection: c,
+                    op: o,
+                    ..
+                } => put && *c == connection && *o == op,
+                DispatchOutcome::Get {
+                    connection: c,
+                    op: o,
+                    ..
+                } => !put && *c == connection && *o == op,
+            });
+            if let Some(index) = index {
+                return self.pending.remove(index);
+            }
+            let outcomes = self.store_mut().dispatch();
+            assert!(!outcomes.is_empty(), "dispatch made no progress");
+            self.pending.extend(outcomes);
+        }
+    }
+    pub fn put_frame_retry<'a>(
+        &mut self,
+        conn: &TestConn,
+        op: u64,
+        mut make: impl FnMut() -> PutFrameInput<'a>,
+    ) -> std::io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match self.store_mut().put_frame(conn.id, op, make()) {
+                PutFrameOutcome::Ok => return Ok(()),
+                PutFrameOutcome::Error(error) => return Err(error),
+                PutFrameOutcome::Blocked => {
+                    assert!(Instant::now() < deadline, "Put frame blocked");
+                    self.pump();
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+    pub fn upload(
+        &mut self,
+        conn: &TestConn,
+        op: u64,
+        header: &Header,
+        bytes: &[u8],
+        hashes: &[u64],
+    ) -> std::io::Result<()> {
+        let page_bytes = header.page_record_bytes() as usize;
+        for first in (0..hashes.len()).step_by(64) {
+            let end = (first + 64).min(hashes.len());
+            self.put_frame_retry(conn, op, || PutFrameInput::Window {
+                index: first as u32,
+                pages: hashes[first..end].to_vec(),
+            })?;
+            let start = header.page_segment as usize + first * page_bytes;
+            let end = header.page_segment as usize + end * page_bytes;
+            for (index, chunk) in bytes[start..end].chunks(protocol::MAX_DATA).enumerate() {
+                let offset = start + index * protocol::MAX_DATA;
+                self.put_frame_retry(conn, op, || PutFrameInput::Data {
+                    offset: offset as u64,
+                    data: chunk,
+                })?;
+            }
+        }
+        self.put_frame_retry(conn, op, || PutFrameInput::Row {
+            checksum: header.row_checksum,
+        })?;
+        for (index, chunk) in bytes[header.row_segment as usize..]
+            .chunks(protocol::MAX_DATA)
+            .enumerate()
+        {
+            let offset = header.row_segment as usize + index * protocol::MAX_DATA;
+            self.put_frame_retry(conn, op, || PutFrameInput::Data {
+                offset: offset as u64,
+                data: chunk,
+            })?;
+        }
+        for (index, chunk) in bytes[..header.page_segment as usize]
+            .chunks(4096)
+            .enumerate()
+        {
+            self.put_frame_retry(conn, op, || PutFrameInput::Commit {
+                offset: (index * 4096) as u64,
+                metadata: chunk,
+            })?;
+        }
+        Ok(())
+    }
+    pub fn wait_put(&mut self, op: u64) -> std::io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            self.collect();
+            if let Some(index) = self
+                .events
+                .iter()
+                .position(|event| matches!(event, StoreEvent::PutResult { op: o, .. } if *o == op))
+            {
+                return match self.events.remove(index) {
+                    StoreEvent::PutResult { result, .. } => result,
+                    _ => unreachable!(),
+                };
+            }
+            assert!(Instant::now() < deadline, "Put result timed out");
+            self.pump();
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    pub fn store_record(&mut self, conn: &mut TestConn, key: Key, parent: Option<Key>) -> Vec<u8> {
+        let (op, answer) = self.put(conn, key, parent);
+        assert_eq!(answer.tag, tag::ACCEPT, "{answer:?}");
+        let mut accepted = Decoder::new(&answer.payload);
+        let first = accepted.u32().unwrap();
+        let shaped_parent = accepted.parent().unwrap();
+        accepted.end().unwrap();
+        let (header, bytes, hashes) = content_for(&conn.descriptor, key, shaped_parent, first);
+        self.upload(conn, op, &header, &bytes, &hashes).unwrap();
+        self.wait_put(op).unwrap();
+        assert!(self.entries().contains_key(&key), "Stored before Added");
+        bytes
+    }
+    pub fn cancel(&mut self, conn: &TestConn, op: u64) {
+        self.store_mut().cancel(conn.id, op);
+    }
+    pub fn close(&mut self, conn: &TestConn) {
+        self.store_mut().connection_closed(conn.id);
+    }
+    pub fn until_room(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            self.collect();
+            if let Some(index) = self
+                .events
+                .iter()
+                .position(|event| matches!(event, StoreEvent::Room { .. }))
+            {
+                self.events.remove(index);
+                return;
+            }
+            assert!(Instant::now() < deadline, "Room timed out");
+            self.pump();
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    pub fn fetch(
+        &mut self,
+        conn: &mut TestConn,
+        keys: &[Key],
+        skip: u32,
+        pages: u32,
+    ) -> Vec<(u32, u64, Vec<u8>)> {
+        let op = conn.next_op;
+        conn.next_op += 1;
+        self.store_mut().submit_get(
+            conn.id,
+            op,
+            store::GetRequest {
+                keys: keys.to_vec(),
+                skip_pages: skip,
+                expected_pages: pages,
+                row: true,
+            },
+        );
+        let outcome = self.dispatch_for(conn.id, op, false);
+        let DispatchOutcome::Get { outcome, .. } = outcome else {
+            unreachable!()
+        };
+        let GetBeginOutcome::Plan(plan) = outcome else {
+            panic!("Get failed");
+        };
+        let staging = self.store().staging();
+        let mut data = Vec::new();
+        let mut records = plan.records;
+        for (index, record) in records.iter_mut().enumerate() {
+            if let Some(extent) = record.fill.take() {
+                let file = record.file.as_ref().unwrap();
+                let extent = record
+                    .reader
+                    .read(file, disk::ENVELOPE_BYTES, extent)
+                    .unwrap();
+                record::verify_record(extent.bytes(), &record.header, record.row).unwrap();
+                let extent = Arc::new(extent);
+                record.memory = Some(extent.clone());
+                self.store_mut()
+                    .get_filled(conn.id, record.header.key, &record.header, extent);
+            }
+            let mut whole = None;
+            if record.memory.is_none() {
+                if let Some(file) = &record.file {
+                    let length = record.header.length(record.row) as usize;
+                    let extent = staging.allocate(length).unwrap();
+                    let extent = record
+                        .reader
+                        .read(file, disk::ENVELOPE_BYTES, extent)
+                        .unwrap();
+                    record::verify_record(extent.bytes(), &record.header, record.row).unwrap();
+                    whole = Some(extent);
+                }
+            }
+            for &(offset, length) in &record.ranges {
+                let mut done = 0;
+                while done < length {
+                    let position = offset + done as u64;
+                    let count = (length - done).min(protocol::MAX_DATA);
+                    let bytes = if let Some(memory) = &record.memory {
+                        memory.bytes()[position as usize..position as usize + count].to_vec()
+                    } else if let Some(buffer) = &whole {
+                        buffer.bytes()[position as usize..position as usize + count].to_vec()
+                    } else {
+                        let buffer = staging.allocate(count).unwrap();
+                        let buffer = record
+                            .reader
+                            .read(
+                                record.file.as_ref().unwrap(),
+                                disk::ENVELOPE_BYTES + position,
+                                buffer,
+                            )
+                            .unwrap();
+                        buffer.bytes().to_vec()
+                    };
+                    data.push((index as u32, position, bytes));
+                    done += count;
+                }
+            }
+        }
+        self.store_mut().get_finished(conn.id, op, true);
+        data
+    }
+}
+impl Drop for StoreHost {
+    fn drop(&mut self) {
+        self.store.take();
+        let _ = fs::remove_dir_all(&self.base);
+    }
 }

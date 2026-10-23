@@ -1,8 +1,15 @@
 use crate::{
-    Key, Result, invalid,
-    protocol::{Decoder, Encoder},
+    Key, Result,
+    codec::{Decoder, Encoder},
+    invalid,
+};
+use blake2::{
+    Blake2bVar,
+    digest::{Update, VariableOutput},
 };
 use std::fmt::Write as _;
+
+pub type NamespaceId = [u8; 32];
 
 pub const BLOCK_BYTES: u64 = 4096;
 pub const HEADER_BYTES: usize = 4096;
@@ -80,13 +87,21 @@ pub struct Descriptor {
     pub fingerprint: [u8; 16],
     pub page_tokens: u64,
     pub ranks: Vec<RankSizes>,
+    pub tenant: String,
 }
 impl Descriptor {
     pub fn validate(&self) -> Result<()> {
-        layout(self.page_tokens, &self.ranks).map(|_| ())
+        layout(self.page_tokens, &self.ranks).map(|_| ())?;
+        if self.tenant.len() > 255 {
+            return Err(invalid("tenant exceeds 255 bytes"));
+        }
+        Ok(())
+    }
+    pub fn namespace_id(&self) -> NamespaceId {
+        namespace_id(&self.identity, &self.fingerprint, &self.tenant)
     }
     pub fn name(&self) -> String {
-        directory_name(&self.identity, &self.fingerprint)
+        hex(&self.namespace_id())
     }
     pub fn page_bytes(&self) -> u64 {
         page_bytes(&self.ranks)
@@ -235,15 +250,23 @@ impl Header {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(text, "{byte:02x}").unwrap();
     }
     text
 }
-pub fn directory_name(identity: &[u8; 32], fingerprint: &[u8; 16]) -> String {
-    format!("{}-{}", hex(&identity[..8]), hex(fingerprint))
+pub fn namespace_id(identity: &[u8; 32], fingerprint: &[u8; 16], tenant: &str) -> NamespaceId {
+    let mut hasher = Blake2bVar::new(32).unwrap();
+    hasher.update(b"crosscache-ns-v1");
+    hasher.update(identity);
+    hasher.update(fingerprint);
+    hasher.update(&[tenant.len() as u8]);
+    hasher.update(tenant.as_bytes());
+    let mut id = [0; 32];
+    hasher.finalize_variable(&mut id).unwrap();
+    id
 }
 pub fn file_name(key: &Key) -> String {
     format!("{:016x}-{}.rec", key.consumed_tokens, hex(&key.digest))
@@ -263,4 +286,26 @@ pub fn parse_file_name(name: &str) -> Option<Key> {
 }
 pub fn checksum(bytes: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(bytes)
+}
+
+pub fn verify_record(bytes: &[u8], header: &Header, row: bool) -> Result<()> {
+    let length = header.length(row);
+    if Header::decode(bytes)? != *header || bytes.len() as u64 != length {
+        return Err(invalid("record header or length"));
+    }
+    for page in 0..header.tail_pages as usize {
+        let start = header.page_segment as usize + page * header.page_record_bytes() as usize;
+        let expected = u64::from_le_bytes(
+            bytes[4096 + page * 8..4096 + page * 8 + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if checksum(&bytes[start..start + header.page_record_bytes() as usize]) != expected {
+            return Err(invalid("disk page checksum"));
+        }
+    }
+    if row && checksum(&bytes[header.row_segment as usize..]) != header.row_checksum {
+        return Err(invalid("disk row checksum"));
+    }
+    Ok(())
 }

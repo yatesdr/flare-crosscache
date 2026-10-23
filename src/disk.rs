@@ -1,10 +1,10 @@
 use crate::{
     Result,
     arena::{Arena, Extent},
-    invalid,
-    protocol::{Decoder, Encoder},
+    crosscache, invalid,
     record::{self, Descriptor, Header},
 };
+use prost::Message;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -24,6 +24,7 @@ use std::{
 
 pub const ENVELOPE_BYTES: u64 = 4096;
 const MAGIC: &[u8; 8] = b"FLCMREC1";
+const DESCRIPTOR_MAGIC: &[u8; 8] = b"FLCDSC2\0";
 
 pub struct RootLock {
     _file: File,
@@ -151,42 +152,137 @@ pub struct Completion {
     pub elapsed: Duration,
 }
 
+pub struct ReadTask {
+    pub file: Arc<File>,
+    pub offset: u64,
+    pub buffer: Extent,
+    pub ack: SyncSender<(Result<()>, Extent)>,
+}
+
+#[derive(Clone)]
+pub struct Reader {
+    sender: SyncSender<ReadTask>,
+}
+impl Reader {
+    pub fn read(&self, file: &Arc<File>, offset: u64, buffer: Extent) -> Result<Extent> {
+        let (ack, done) = mpsc::sync_channel(1);
+        self.sender
+            .send(ReadTask {
+                file: file.clone(),
+                offset,
+                buffer,
+                ack,
+            })
+            .map_err(|_| invalid("disk reader stopped"))?;
+        let (result, buffer) = done.recv().map_err(|_| invalid("disk reader stopped"))?;
+        result.map(|()| buffer)
+    }
+}
+
 pub struct Worker {
     pub sender: SyncSender<Task>,
     pub receiver: Receiver<Completion>,
+    reader: Reader,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 impl Worker {
     pub fn start(faults: Faults, lock: Arc<RootLock>) -> Self {
-        let (sender, tasks) = mpsc::sync_channel(8);
+        let (sender, writes) = mpsc::sync_channel(8);
+        let (read_sender, reads) = mpsc::sync_channel::<ReadTask>(8);
         let (done, receiver) = mpsc::sync_channel(16);
         let state_thread = thread::current();
-        thread::spawn(move || {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
             let _lock = lock;
-            for task in tasks {
-                let started = Instant::now();
-                let id = match &task {
-                    Task::Publish { id, .. }
-                    | Task::Chunk { id, .. }
-                    | Task::Compact { id, .. } => *id,
-                };
-                let result = execute(task, &faults);
-                let bytes = result.as_ref().copied().unwrap_or(0);
-                if done
-                    .send(Completion {
-                        id,
-                        result: result.map(|_| ()),
-                        bytes,
-                        elapsed: started.elapsed(),
-                    })
-                    .is_err()
-                {
+            let mut read_streak = 0;
+            loop {
+                if thread_stop.load(Ordering::Acquire) {
                     break;
                 }
-                state_thread.unpark();
+                let mut acted = false;
+                if read_streak < 4 {
+                    if let Ok(mut task) = reads.try_recv() {
+                        let result = read_into(&task.file, task.offset, &mut task.buffer);
+                        read_streak += 1;
+                        let _ = task.ack.send((result, task.buffer));
+                        acted = true;
+                    }
+                }
+                if !acted {
+                    if let Ok(task) = writes.try_recv() {
+                        read_streak = 0;
+                        let started = Instant::now();
+                        let id = match &task {
+                            Task::Publish { id, .. }
+                            | Task::Chunk { id, .. }
+                            | Task::Compact { id, .. } => *id,
+                        };
+                        let result = execute(task, &faults);
+                        let bytes = result.as_ref().copied().unwrap_or(0);
+                        let mut completion = Completion {
+                            id,
+                            result: result.map(|_| ()),
+                            bytes,
+                            elapsed: started.elapsed(),
+                        };
+                        loop {
+                            match done.try_send(completion) {
+                                Ok(()) => break,
+                                Err(mpsc::TrySendError::Full(returned)) => {
+                                    completion = returned;
+                                    if thread_stop.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    thread::park_timeout(Duration::from_micros(200));
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => break,
+                            }
+                        }
+                        state_thread.unpark();
+                        acted = true;
+                    }
+                }
+                if !acted {
+                    if let Ok(mut task) = reads.try_recv() {
+                        // No pending write: keep reading rather than idle.
+                        let result = read_into(&task.file, task.offset, &mut task.buffer);
+                        read_streak += 1;
+                        let _ = task.ack.send((result, task.buffer));
+                        acted = true;
+                    }
+                }
+                if !acted {
+                    thread::park_timeout(Duration::from_micros(100));
+                }
             }
         });
-        Self { sender, receiver }
+        Self {
+            sender,
+            receiver,
+            reader: Reader {
+                sender: read_sender,
+            },
+            stop,
+            thread: Some(thread),
+        }
     }
+    pub fn reader(&self) -> Reader {
+        self.reader.clone()
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn read_into(file: &File, offset: u64, buffer: &mut Extent) -> Result<()> {
+    read_at(file, buffer.bytes_mut(), offset)
 }
 
 fn open(path: &Path, write: bool) -> Result<File> {
@@ -339,8 +435,10 @@ pub struct Recovered {
     pub records: Vec<(Header, bool, Arc<DiskExtent>)>,
 }
 
-pub fn descriptor(directory: &Path, value: &Descriptor) -> Result<()> {
-    fs::create_dir_all(directory)?;
+pub fn descriptor(root: &Path, value: &Descriptor) -> Result<()> {
+    value.validate()?;
+    let directory = root.join(value.name());
+    fs::create_dir_all(&directory)?;
     let path = directory.join("descriptor");
     if path.exists() {
         if load_descriptor(&path)? != *value {
@@ -348,31 +446,93 @@ pub fn descriptor(directory: &Path, value: &Descriptor) -> Result<()> {
         }
         return Ok(());
     }
-    let mut bytes = Encoder::default();
-    bytes.descriptor(value);
-    let crc = crc32(&bytes.0);
-    bytes.u32(crc);
+    let encoded = proto_descriptor(value).encode_to_vec();
+    let length = u32::try_from(encoded.len()).map_err(|_| invalid("descriptor length"))?;
+    let mut bytes = Vec::with_capacity(16 + encoded.len());
+    bytes.extend_from_slice(DESCRIPTOR_MAGIC);
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&encoded);
+    let crc = crc32(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
     let temp = directory.join(".descriptor.tmp");
     let mut file = File::create(&temp)?;
-    file.write_all(&bytes.0)?;
+    file.write_all(&bytes)?;
     file.sync_data()?;
     fs::rename(temp, path)?;
     File::open(directory)?.sync_all()
 }
+
+fn proto_descriptor(value: &Descriptor) -> crosscache::Descriptor {
+    crosscache::Descriptor {
+        identity: value.identity.to_vec(),
+        fingerprint: value.fingerprint.to_vec(),
+        page_tokens: value.page_tokens,
+        ranks: value
+            .ranks
+            .iter()
+            .map(|rank| crosscache::RankPlanes {
+                plane_bytes: rank.planes.clone(),
+                row_bytes: rank.row_bytes,
+            })
+            .collect(),
+        page_record_bytes: value.page_bytes(),
+        row_record_bytes: value.row_bytes(),
+        tenant: value.tenant.clone(),
+    }
+}
+
+fn record_descriptor(value: crosscache::Descriptor) -> Result<Descriptor> {
+    let identity: [u8; 32] = value
+        .identity
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid("descriptor identity length"))?;
+    let fingerprint: [u8; 16] = value
+        .fingerprint
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid("descriptor fingerprint length"))?;
+    let descriptor = Descriptor {
+        identity,
+        fingerprint,
+        page_tokens: value.page_tokens,
+        ranks: value
+            .ranks
+            .into_iter()
+            .map(|rank| record::RankSizes {
+                planes: rank.plane_bytes,
+                row_bytes: rank.row_bytes,
+            })
+            .collect(),
+        tenant: value.tenant,
+    };
+    descriptor.validate()?;
+    if value.page_record_bytes != descriptor.page_bytes()
+        || value.row_record_bytes != descriptor.row_bytes()
+    {
+        return Err(invalid("record sizes disagree with ranks"));
+    }
+    Ok(descriptor)
+}
+
 fn load_descriptor(path: &Path) -> Result<Descriptor> {
     let mut bytes = Vec::new();
     File::open(path)?.take(8193).read_to_end(&mut bytes)?;
-    if bytes.len() < 4 || bytes.len() > 8192 {
+    if bytes.len() < 16 || bytes.len() > 8192 {
         return Err(invalid("descriptor length"));
     }
-    let tail = bytes.len() - 4;
+    if &bytes[..8] != DESCRIPTOR_MAGIC {
+        return Err(invalid("descriptor magic"));
+    }
+    let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    if 16 + length != bytes.len() {
+        return Err(invalid("descriptor length"));
+    }
+    let tail = 12 + length;
     if crc32(&bytes[..tail]) != u32::from_le_bytes(bytes[tail..].try_into().unwrap()) {
         return Err(invalid("descriptor CRC"));
     }
-    let mut decoder = Decoder::new(&bytes[..tail]);
-    let descriptor = decoder.descriptor()?;
-    decoder.end()?;
-    Ok(descriptor)
+    record_descriptor(crosscache::Descriptor::decode(&bytes[12..tail])?)
 }
 
 pub fn recover(root: &Path) -> Result<Vec<Recovered>> {
@@ -383,12 +543,21 @@ pub fn recover(root: &Path) -> Result<Vec<Recovered>> {
             continue;
         }
         let directory = entry.path();
-        if !directory.join("descriptor").exists() {
-            continue;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(not_migratable(&directory));
+        };
+        if name.len() != 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(not_migratable(&directory));
         }
-        let descriptor = load_descriptor(&directory.join("descriptor"))?;
-        if entry.file_name().to_str() != Some(&descriptor.name()) {
-            return Err(invalid("namespace directory name"));
+        let path = directory.join("descriptor");
+        let descriptor = load_descriptor(&path).map_err(|_| not_migratable(&path))?;
+        if name != descriptor.name() {
+            return Err(not_migratable(&path));
         }
         let mut records = Vec::new();
         for entry in fs::read_dir(&directory)? {
@@ -438,6 +607,13 @@ pub fn recover(root: &Path) -> Result<Vec<Recovered>> {
         });
     }
     Ok(namespaces)
+}
+
+fn not_migratable(path: &Path) -> io::Error {
+    invalid(format!(
+        "{}: v3 roots are not migratable to the v2 descriptor format",
+        path.display()
+    ))
 }
 
 fn inspect(path: &Path, name: &str, descriptor: &Descriptor) -> Result<(Header, bool)> {

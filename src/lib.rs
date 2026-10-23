@@ -1,9 +1,11 @@
 pub mod arena;
+pub mod codec;
 pub mod crosscache;
 pub mod disk;
 pub mod protocol;
 pub mod record;
 pub mod server;
+pub mod store;
 pub mod tree;
 
 use std::io;
