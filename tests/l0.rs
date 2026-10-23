@@ -1262,3 +1262,20 @@ async fn l0_27_no_progress_timeout_ends_the_call() {
     let mut fresh = host.client().await;
     assert!(!fresh.fetch(&[key(128)], 0, 2).await[0].is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_28_rootless_eviction_skips_internal_nodes() {
+    let mut host = Host::dram_only(65536);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    client.store(key(192), Some(key(128))).await;
+    // The arena is full and the root now has a child. Eviction must take the
+    // leaf child, not loop on the row-bearing internal root.
+    let stored = tokio::time::timeout(Duration::from_secs(5), client.store(key(256), None))
+        .await
+        .expect("rootless eviction must make progress");
+    assert!(!stored.is_empty());
+    let subscription = client.subscribe().await;
+    assert!(subscription.entries.contains_key(&key(256)));
+}

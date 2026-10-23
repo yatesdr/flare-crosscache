@@ -1206,13 +1206,23 @@ impl Store {
             let (id, key) = self.oldest(|node| {
                 node.location.memory.is_some()
                     && (!require_durable || node.location.durable)
-                    && (node.children() == 0 || (node.row && node.children() == 1))
+                    // A rootless manager has no disk copy to fall back on, so it
+                    // may only evict true leaves.
+                    && (if require_durable {
+                        node.children() == 0 || (node.row && node.children() == 1)
+                    } else {
+                        node.children() == 0
+                    })
             })?;
-            self.evict_memory(id, key);
+            if !self.evict_memory(id, key) {
+                return None;
+            }
         }
     }
 
-    fn evict_memory(&mut self, id: NamespaceId, key: Key) {
+    /// Returns whether the candidate was actually evicted. A node rejected by
+    /// `Tree::remove` (because it gained children) is left untouched.
+    fn evict_memory(&mut self, id: NamespaceId, key: Key) -> bool {
         let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
         let old = node.location.bytes;
         if node.location.disk.is_some() {
@@ -1220,13 +1230,19 @@ impl Store {
             node.location.bytes = record_charge(&node.location.header, false);
             self.charged = self.charged - old + node.location.bytes;
             self.delta(id, 1, key);
-        } else {
-            let bytes = node.location.bytes;
-            self.charged -= bytes;
-            let _ = self.namespaces.get_mut(&id).unwrap().tree.remove(&key);
-            self.metrics.evictions += 1;
-            self.delta(id, 2, key);
+            return true;
         }
+        let removed = self.namespaces.get_mut(&id).unwrap().tree.remove(&key).ok();
+        let Some(removed) = removed else {
+            return false;
+        };
+        let bytes: u64 = removed.iter().map(|node| node.location.bytes).sum();
+        self.charged = self.charged.saturating_sub(bytes);
+        self.metrics.evictions += removed.len() as u64;
+        for node in removed {
+            self.delta(id, 2, node.key);
+        }
+        true
     }
 
     fn make_room(&mut self, bytes: u64) -> bool {
@@ -4622,6 +4638,61 @@ mod tests {
         assert_eq!(mismatch.namespace_id(), id);
         let error = store.register_namespace(mismatch).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rootless_eviction_only_removes_leaves_and_accounts_them() {
+        let (mut store, directory) = store("evict");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let root_key = Key {
+            consumed_tokens: 64,
+            digest: [2; 16],
+        };
+        let child_key = Key {
+            consumed_tokens: 128,
+            digest: [3; 16],
+        };
+        let root_header = Header::new(&value, root_key, None, [0; 16], 1).unwrap();
+        let child_header = Header::new(&value, child_key, Some(root_key), [0; 16], 1).unwrap();
+        for header in [&root_header, &child_header] {
+            let extent = Arc::new(store.memory.allocate(4096).unwrap());
+            let bytes = record_charge(header, true);
+            store.charged += bytes;
+            store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .insert(
+                    header.key,
+                    header.parent,
+                    [0; 16],
+                    1,
+                    true,
+                    Location {
+                        header: header.clone(),
+                        memory: Some(extent),
+                        disk: None,
+                        durable: false,
+                        writing: false,
+                        retry: Instant::now(),
+                        bytes,
+                    },
+                )
+                .unwrap();
+        }
+        let charged = store.charged;
+        assert!(!store.evict_memory(id, root_key));
+        assert_eq!(store.charged, charged);
+        assert!(store.namespaces[&id].tree.node(&root_key).is_some());
+        assert!(store.evict_memory(id, child_key));
+        assert!(store.namespaces[&id].tree.node(&child_key).is_none());
+        assert!(store.evict_memory(id, root_key));
+        assert_eq!(store.charged, 0);
+        assert!(store.namespaces[&id].tree.node(&root_key).is_none());
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }
