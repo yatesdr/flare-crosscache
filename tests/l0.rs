@@ -466,6 +466,13 @@ async fn l0_09_disk_failure_is_refused_io() {
         PutOutcome::Refused(crosscache::Reason::Io as u8)
     );
     host.wait(|host| host.gauge("nvme_errors_total") > 0);
+    // A single-window stream must also get its IO refusal: the failing chunk is
+    // the last pending user, so removing the operation first would lose it.
+    let mut single = host.client().await;
+    assert_eq!(
+        single.put(key(64 * 64), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Io as u8)
+    );
     fs::remove_file(full).unwrap();
     let bytes = client.store(key(128), None).await;
     assert!(!bytes.is_empty());
