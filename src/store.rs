@@ -4485,6 +4485,7 @@ pub enum StoreCommand {
     PutBegin {
         connection: u64,
         transfer: u64,
+        generation: u64,
         namespace: NamespaceId,
         descriptor: Descriptor,
         key: Key,
@@ -4498,6 +4499,7 @@ pub enum StoreCommand {
     },
     WindowFilled {
         connection: u64,
+        generation: u64,
         transfer: u64,
         index: u32,
         page_xxh3: Vec<u64>,
@@ -4506,6 +4508,7 @@ pub enum StoreCommand {
     },
     PutCommit {
         connection: u64,
+        generation: u64,
         transfer: u64,
         metadata_offset: u64,
         metadata: Vec<u8>,
@@ -4514,6 +4517,7 @@ pub enum StoreCommand {
     GetBegin {
         connection: u64,
         transfer: u64,
+        generation: u64,
         namespace: NamespaceId,
         chain: Vec<Key>,
         skip_pages: u32,
@@ -4524,12 +4528,14 @@ pub enum StoreCommand {
     },
     WindowReleased {
         connection: u64,
+        generation: u64,
         transfer: u64,
         index: u32,
         reply: Reply<Result<()>>,
     },
     Cancel {
         connection: u64,
+        generation: u64,
         transfer: u64,
     },
     ConnectionClosed {
@@ -4685,6 +4691,7 @@ impl Store {
             StoreCommand::PutBegin {
                 connection,
                 transfer,
+                generation,
                 namespace,
                 descriptor,
                 key,
@@ -4700,6 +4707,17 @@ impl Store {
                     .sessions
                     .get(&connection)
                     .is_some_and(|session| session.namespace == Some(namespace));
+                if self
+                    .sessions
+                    .get(&connection)
+                    .is_none_or(|session| session.generation != generation)
+                {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "generation superseded",
+                    )));
+                    return;
+                }
                 let valid = session_ok
                     && descriptor.namespace_id() == namespace
                     && self.register_namespace(descriptor).is_ok();
@@ -4727,28 +4745,53 @@ impl Store {
             }
             StoreCommand::WindowFilled {
                 connection,
+                generation,
                 transfer,
                 index,
                 page_xxh3,
                 row_xxh3,
                 reply,
             } => {
-                let result = self.window_filled(connection, transfer, index, page_xxh3, row_xxh3);
+                let result = if self
+                    .sessions
+                    .get(&connection)
+                    .is_some_and(|session| session.generation == generation)
+                {
+                    self.window_filled(connection, transfer, index, page_xxh3, row_xxh3)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "generation superseded",
+                    ))
+                };
                 let _ = reply.send(result);
             }
             StoreCommand::PutCommit {
                 connection,
+                generation,
                 transfer,
                 metadata_offset,
                 metadata,
                 reply,
             } => {
-                let result = self.put_commit(connection, transfer, metadata_offset, metadata);
+                let result = if self
+                    .sessions
+                    .get(&connection)
+                    .is_some_and(|session| session.generation == generation)
+                {
+                    self.put_commit(connection, transfer, metadata_offset, metadata)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "generation superseded",
+                    ))
+                };
                 let _ = reply.send(result);
             }
             StoreCommand::GetBegin {
                 connection,
                 transfer,
+                generation,
                 namespace,
                 chain,
                 skip_pages,
@@ -4757,6 +4800,17 @@ impl Store {
                 events,
                 reply,
             } => {
+                if self
+                    .sessions
+                    .get(&connection)
+                    .is_none_or(|session| session.generation != generation)
+                {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "generation superseded",
+                    )));
+                    return;
+                }
                 if self
                     .sessions
                     .get(&connection)
@@ -4783,17 +4837,38 @@ impl Store {
             }
             StoreCommand::WindowReleased {
                 connection,
+                generation,
                 transfer,
                 index,
                 reply,
             } => {
-                let result = self.window_released(connection, transfer, index);
+                let result = if self
+                    .sessions
+                    .get(&connection)
+                    .is_some_and(|session| session.generation == generation)
+                {
+                    self.window_released(connection, transfer, index)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "generation superseded",
+                    ))
+                };
                 let _ = reply.send(result);
             }
             StoreCommand::Cancel {
                 connection,
+                generation,
                 transfer,
-            } => self.cancel(connection, transfer),
+            } => {
+                if self
+                    .sessions
+                    .get(&connection)
+                    .is_some_and(|session| session.generation == generation)
+                {
+                    self.cancel(connection, transfer);
+                }
+            }
             StoreCommand::ConnectionClosed { connection }
             | StoreCommand::ProcessExited { connection } => self.connection_closed(connection),
             StoreCommand::PeerHello {

@@ -461,12 +461,14 @@ impl LocalCache for Service {
         request: Request<Streaming<crosscache::PutMessage>>,
     ) -> std::result::Result<Response<Self::PutStream>, Status> {
         let peer = Self::peer(&request)?;
-        self.generation(&request, &peer)?;
+        let generation = self.generation(&request, &peer)?;
         let stream = request.into_inner();
         let transfer = self.transfers.fetch_add(1, Ordering::Relaxed);
         let commands = self.commands.clone();
         let (output, receiver) = mpsc::channel(8);
-        tokio::spawn(put_task(peer, stream, commands, transfer, output));
+        tokio::spawn(put_task(
+            peer, stream, commands, transfer, generation, output,
+        ));
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
@@ -475,12 +477,14 @@ impl LocalCache for Service {
         request: Request<Streaming<crosscache::GetMessage>>,
     ) -> std::result::Result<Response<Self::GetStream>, Status> {
         let peer = Self::peer(&request)?;
-        self.generation(&request, &peer)?;
+        let generation = self.generation(&request, &peer)?;
         let stream = request.into_inner();
         let transfer = self.transfers.fetch_add(1, Ordering::Relaxed);
         let commands = self.commands.clone();
         let (output, receiver) = mpsc::channel(8);
-        tokio::spawn(get_task(peer, stream, commands, transfer, output));
+        tokio::spawn(get_task(
+            peer, stream, commands, transfer, generation, output,
+        ));
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 }
@@ -522,6 +526,7 @@ async fn put_task(
     mut stream: Streaming<crosscache::PutMessage>,
     commands: mpsc::Sender<StoreCommand>,
     transfer: u64,
+    generation: u64,
     output: mpsc::Sender<std::result::Result<crosscache::PutReply, Status>>,
 ) {
     let first = match stream.message().await {
@@ -628,6 +633,7 @@ async fn put_task(
         .send(StoreCommand::PutBegin {
             connection: peer.connection,
             transfer,
+            generation,
             namespace,
             descriptor,
             key,
@@ -649,9 +655,10 @@ async fn put_task(
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             let status = match error.kind() {
-                io::ErrorKind::AlreadyExists
-                | io::ErrorKind::PermissionDenied
-                | io::ErrorKind::NotConnected => Status::failed_precondition(error.to_string()),
+                io::ErrorKind::PermissionDenied => Status::aborted(error.to_string()),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::NotConnected => {
+                    Status::failed_precondition(error.to_string())
+                }
                 _ => Status::invalid_argument(error.to_string()),
             };
             let _ = output.send(Err(status)).await;
@@ -696,6 +703,7 @@ async fn put_task(
                             let (reply, ack) = oneshot::channel();
                             if commands.send(StoreCommand::WindowFilled {
                                 connection: peer.connection,
+                                generation,
                                 transfer,
                                 index: filled.index,
                                 page_xxh3: filled.page_xxh3,
@@ -704,7 +712,12 @@ async fn put_task(
                             }).await.is_err() {
                                 break;
                             }
-                            if !matches!(ack.await, Ok(Ok(()))) {
+                            let ack = ack.await;
+                            if matches!(&ack, Ok(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied) {
+                                let _ = output.send(Err(Status::aborted("generation superseded"))).await;
+                                break;
+                            }
+                            if !matches!(ack, Ok(Ok(()))) {
                                 match pending_put_terminal(&mut event_stream).await {
                                     Some(answer) => {
                                         let _ = output.send(Ok(put_reply(answer))).await;
@@ -724,6 +737,7 @@ async fn put_task(
                             let (reply, ack) = oneshot::channel();
                             if commands.send(StoreCommand::PutCommit {
                                 connection: peer.connection,
+                                generation,
                                 transfer,
                                 metadata_offset: commit.metadata_offset,
                                 metadata: commit.metadata,
@@ -731,7 +745,12 @@ async fn put_task(
                             }).await.is_err() {
                                 break;
                             }
-                            if !matches!(ack.await, Ok(Ok(()))) {
+                            let ack = ack.await;
+                            if matches!(&ack, Ok(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied) {
+                                let _ = output.send(Err(Status::aborted("generation superseded"))).await;
+                                break;
+                            }
+                            if !matches!(ack, Ok(Ok(()))) {
                                 match pending_put_terminal(&mut event_stream).await {
                                     Some(answer) => {
                                         let _ = output.send(Ok(put_reply(answer))).await;
@@ -746,6 +765,7 @@ async fn put_task(
                         Some(put_message::M::Cancel(_)) => {
                             let _ = commands.send(StoreCommand::Cancel {
                                 connection: peer.connection,
+                                generation,
                                 transfer,
                             }).await;
                             if let Ok(Some(Ok(answer))) = tokio::time::timeout(
@@ -762,6 +782,7 @@ async fn put_task(
                             let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
                             let _ = commands.send(StoreCommand::Cancel {
                                 connection: peer.connection,
+                                generation,
                                 transfer,
                             }).await;
                             break;
@@ -770,6 +791,7 @@ async fn put_task(
                     Ok(None) => {
                         let _ = commands.send(StoreCommand::Cancel {
                             connection: peer.connection,
+                            generation,
                             transfer,
                         }).await;
                         break;
@@ -777,6 +799,7 @@ async fn put_task(
                     Err(_) => {
                         let _ = commands.send(StoreCommand::Cancel {
                             connection: peer.connection,
+                            generation,
                             transfer,
                         }).await;
                         break;
@@ -787,6 +810,7 @@ async fn put_task(
                 let _ = output.send(Err(Status::deadline_exceeded("no progress"))).await;
                 let _ = commands.send(StoreCommand::Cancel {
                     connection: peer.connection,
+                    generation,
                     transfer,
                 }).await;
                 break;
@@ -800,6 +824,7 @@ async fn get_task(
     mut stream: Streaming<crosscache::GetMessage>,
     commands: mpsc::Sender<StoreCommand>,
     transfer: u64,
+    generation: u64,
     output: mpsc::Sender<std::result::Result<crosscache::GetReply, Status>>,
 ) {
     let first = match stream.message().await {
@@ -883,6 +908,7 @@ async fn get_task(
         .send(StoreCommand::GetBegin {
             connection: peer.connection,
             transfer,
+            generation,
             namespace,
             chain,
             skip_pages,
@@ -901,6 +927,7 @@ async fn get_task(
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             let status = match error.kind() {
+                io::ErrorKind::PermissionDenied => Status::aborted(error.to_string()),
                 io::ErrorKind::NotConnected => Status::unauthenticated(error.to_string()),
                 _ => Status::invalid_argument(error.to_string()),
             };
@@ -946,13 +973,19 @@ async fn get_task(
                             let (reply, ack) = oneshot::channel();
                             if commands.send(StoreCommand::WindowReleased {
                                 connection: peer.connection,
+                                generation,
                                 transfer,
                                 index: released.index,
                                 reply,
                             }).await.is_err() {
                                 break;
                             }
-                            if !matches!(ack.await, Ok(Ok(()))) {
+                            let ack = ack.await;
+                            if matches!(&ack, Ok(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied) {
+                                let _ = output.send(Err(Status::aborted("generation superseded"))).await;
+                                break;
+                            }
+                            if !matches!(ack, Ok(Ok(()))) {
                                 match pending_get_terminal(&mut event_stream).await {
                                     Some(answer) => {
                                         let _ = output.send(Ok(get_reply(answer))).await;
@@ -967,6 +1000,7 @@ async fn get_task(
                         Some(get_message::M::Cancel(_)) => {
                             let _ = commands.send(StoreCommand::Cancel {
                                 connection: peer.connection,
+                                generation,
                                 transfer,
                             }).await;
                             break;
@@ -975,6 +1009,7 @@ async fn get_task(
                             let _ = output.send(Ok(refused_get(crosscache::Reason::Invalid))).await;
                             let _ = commands.send(StoreCommand::Cancel {
                                 connection: peer.connection,
+                                generation,
                                 transfer,
                             }).await;
                             break;
@@ -983,6 +1018,7 @@ async fn get_task(
                     Ok(None) => {
                         let _ = commands.send(StoreCommand::Cancel {
                             connection: peer.connection,
+                            generation,
                             transfer,
                         }).await;
                         break;
@@ -990,6 +1026,7 @@ async fn get_task(
                     Err(_) => {
                         let _ = commands.send(StoreCommand::Cancel {
                             connection: peer.connection,
+                            generation,
                             transfer,
                         }).await;
                         break;
@@ -1000,6 +1037,7 @@ async fn get_task(
                 let _ = output.send(Err(Status::deadline_exceeded("no progress"))).await;
                 let _ = commands.send(StoreCommand::Cancel {
                     connection: peer.connection,
+                    generation,
                     transfer,
                 }).await;
                 break;

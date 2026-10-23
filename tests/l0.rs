@@ -1512,3 +1512,54 @@ async fn l0_34_concurrent_nvme_gets_share_connection_credits() {
             && host.gauge("open_ops") == 0
     });
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_35_generation_fencing_reaches_the_owner_thread() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    // Open a Put stream under generation 1 but do not send its begin yet.
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    // A second Hello on the same transport supersedes generation 1.
+    let hello = client
+        .inner
+        .hello(tonic::Request::new(crosscache::HelloRequest {
+            protocol: 1,
+            replica: "again".into(),
+            descriptor: Some(descriptor_msg(&client.descriptor)),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    client.generation = hello.generation;
+    // The old stream must not be able to begin into the new session.
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(client.begin(key(256), None)),
+        })
+        .await
+        .unwrap();
+    let status = loop {
+        match replies.message().await {
+            Err(status) => break status,
+            Ok(Some(reply)) => match reply.r {
+                Some(crosscache::put_reply::R::Refused(_)) => {
+                    panic!("stale stream reached the new session")
+                }
+                _ => continue,
+            },
+            Ok(None) => panic!("stale stream ended without a status"),
+        }
+    };
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    drop(sender);
+    drop(replies);
+    let mut fresh = host.client().await;
+    fresh.store(key(256), None).await;
+}
