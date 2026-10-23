@@ -1674,3 +1674,75 @@ async fn l0_37_subscription_epoch_discards_queued_events() {
         Err(_) => {}
     }
 }
+
+#[test]
+fn l0_38_async_reads_overtake_queued_writes() {
+    let base = base("read-priority");
+    fs::create_dir_all(&base).unwrap();
+    let lock = Arc::new(disk::RootLock::acquire(&base.join("root")).unwrap());
+    let worker = disk::Worker::start(
+        disk::Faults {
+            delay_ms: 100,
+            ..disk::Faults::default()
+        },
+        lock,
+    );
+    let source = base.join("source");
+    fs::write(&source, vec![7u8; 4096]).unwrap();
+    let file = Arc::new(disk::open_read(&source).unwrap());
+    let arena = Arena::new(4096).unwrap();
+    let write_arena = Arena::new(8 * 4096).unwrap();
+    for index in 0..8u64 {
+        let mut extent = write_arena.allocate(4096).unwrap();
+        extent.bytes_mut().fill(index as u8);
+        let temporary = Arc::new(disk::DiskExtent::new(base.join(format!("w-{index}.tmp"))));
+        temporary.retire();
+        worker
+            .sender
+            .send(disk::Task::Chunk {
+                id: index,
+                temporary,
+                offset: 0,
+                data: Arc::new(extent),
+            })
+            .unwrap();
+    }
+    worker
+        .read_sender
+        .send(disk::Task::Read {
+            id: 999,
+            file,
+            offset: 0,
+            buffer: arena.allocate(4096).unwrap(),
+        })
+        .unwrap();
+    let first = worker.receiver.recv().unwrap();
+    assert_eq!(
+        first.id, 999,
+        "the read must not wait behind the write queue"
+    );
+    assert_eq!(first.data.unwrap().bytes(), &[7u8; 4096]);
+    for _ in 0..8 {
+        worker.receiver.recv().unwrap();
+    }
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_39_gap_recovery_uses_a_fresh_snapshot() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let mut first = client.subscribe().await;
+    client.store(key(128), None).await;
+    client.store(key(256), Some(key(128))).await;
+    first.until_added(key(256)).await;
+    // The client detects a missing event / gap and rebuilds with a fresh
+    // Subscribe (gRPC has no RESYNC); the new snapshot must contain both.
+    drop(first);
+    let mut second = client.subscribe().await;
+    assert!(second.entries.contains_key(&key(128)));
+    assert!(second.entries.contains_key(&key(256)));
+    client.store(key(384), Some(key(256))).await;
+    second.until_added(key(384)).await;
+}

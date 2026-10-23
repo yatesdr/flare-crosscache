@@ -1086,11 +1086,25 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let (commands, mut receiver) = mpsc::channel::<StoreCommand>(64);
     let owner = thread::spawn(move || {
         let mut store = store;
-        while let Some(command) = receiver.blocking_recv() {
-            let shutdown = matches!(command, StoreCommand::Shutdown);
-            store.handle(command);
-            if shutdown {
-                break;
+        'outer: while let Some(mut command) = receiver.blocking_recv() {
+            // Drain the batch before dispatching so queued Gets and Puts are
+            // ordered by the scheduler rather than by arrival.
+            let mut batch = 64;
+            loop {
+                let shutdown = matches!(command, StoreCommand::Shutdown);
+                store.handle(command);
+                if shutdown {
+                    break 'outer;
+                }
+                batch -= 1;
+                if batch == 0 {
+                    break;
+                }
+                match receiver.try_recv() {
+                    Ok(next) => command = next,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break 'outer,
+                }
             }
             store.pump();
             *owner_metrics.lock().unwrap() = store.metrics_text();

@@ -225,6 +225,9 @@ impl Reader {
 
 pub struct Worker {
     pub sender: SyncSender<Task>,
+    /// Async reads that report through `receiver` and are serviced before
+    /// queued writes, subject to the read-streak guard.
+    pub read_sender: SyncSender<Task>,
     pub receiver: Receiver<Completion>,
     reader: Reader,
     stop: Arc<AtomicBool>,
@@ -234,6 +237,7 @@ impl Worker {
     pub fn start(faults: Faults, lock: Arc<RootLock>) -> Self {
         let (sender, writes) = mpsc::sync_channel::<Task>(8);
         let (read_sender, reads) = mpsc::sync_channel::<ReadTask>(8);
+        let (async_read_sender, async_reads) = mpsc::sync_channel::<Task>(8);
         let (done, receiver) = mpsc::sync_channel(16);
         let state_thread = thread::current();
         let stop = Arc::new(AtomicBool::new(false));
@@ -251,6 +255,29 @@ impl Worker {
                         let result = read_into(&task.file, task.offset, &mut task.buffer);
                         read_streak += 1;
                         let _ = task.ack.send((result, task.buffer));
+                        acted = true;
+                    } else if let Ok(task) = async_reads.try_recv() {
+                        if let Task::Read {
+                            id,
+                            file,
+                            offset,
+                            mut buffer,
+                            ..
+                        } = task
+                        {
+                            let started = Instant::now();
+                            let result = read_into(&file, offset, &mut buffer);
+                            let completion = Completion {
+                                id,
+                                result,
+                                bytes: 0,
+                                elapsed: started.elapsed(),
+                                data: Some(buffer),
+                            };
+                            send_completion(&done, completion, &thread_stop);
+                            state_thread.unpark();
+                        }
+                        read_streak += 1;
                         acted = true;
                     }
                 }
@@ -298,6 +325,32 @@ impl Worker {
                     }
                 }
                 if !acted {
+                    if let Ok(task) = async_reads.try_recv() {
+                        if let Task::Read {
+                            id,
+                            file,
+                            offset,
+                            mut buffer,
+                            ..
+                        } = task
+                        {
+                            let started = Instant::now();
+                            let result = read_into(&file, offset, &mut buffer);
+                            let completion = Completion {
+                                id,
+                                result,
+                                bytes: 0,
+                                elapsed: started.elapsed(),
+                                data: Some(buffer),
+                            };
+                            send_completion(&done, completion, &thread_stop);
+                            state_thread.unpark();
+                        }
+                        read_streak += 1;
+                        acted = true;
+                    }
+                }
+                if !acted {
                     if let Ok(mut task) = reads.try_recv() {
                         // No pending write: keep reading rather than idle.
                         let result = read_into(&task.file, task.offset, &mut task.buffer);
@@ -313,6 +366,7 @@ impl Worker {
         });
         Self {
             sender,
+            read_sender: async_read_sender,
             receiver,
             reader: Reader {
                 sender: read_sender,
@@ -330,6 +384,22 @@ impl Drop for Worker {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+fn send_completion(done: &SyncSender<Completion>, mut completion: Completion, stop: &AtomicBool) {
+    loop {
+        match done.try_send(completion) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                completion = returned;
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::park_timeout(Duration::from_micros(200));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => break,
         }
     }
 }

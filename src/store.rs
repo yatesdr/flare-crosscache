@@ -2030,7 +2030,7 @@ impl Store {
             }
             return;
         };
-        if let Err(std::sync::mpsc::TrySendError::Full(task)) = worker.sender.try_send(task) {
+        if let Err(std::sync::mpsc::TrySendError::Full(task)) = worker.read_sender.try_send(task) {
             self.read_backlog.push_back((namespace, job, task));
         }
     }
@@ -3646,7 +3646,9 @@ impl Store {
             let Some(worker) = &self.namespaces[&namespace].disk else {
                 continue;
             };
-            if let Err(std::sync::mpsc::TrySendError::Full(task)) = worker.sender.try_send(task) {
+            if let Err(std::sync::mpsc::TrySendError::Full(task)) =
+                worker.read_sender.try_send(task)
+            {
                 self.read_backlog.push_back((namespace, job, task));
             }
         }
@@ -5223,6 +5225,51 @@ mod tests {
         assert_eq!(mismatch.namespace_id(), id);
         let error = store.register_namespace(mismatch).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn queued_get_overtakes_an_earlier_put() {
+        let (mut store, directory) = store("batch");
+        let value = descriptor();
+        store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let (get_events, _get_receiver) = tokio::sync::mpsc::channel(4);
+        let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 128,
+                    digest: [5; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 2,
+                published_tail_pages: 2,
+                row: true,
+            },
+            put_events,
+        );
+        store.submit_get(
+            1,
+            2,
+            GetRequest {
+                keys: vec![Key {
+                    consumed_tokens: 64,
+                    digest: [4; 16],
+                }],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+            },
+            get_events,
+        );
+        assert_eq!(store.dispatch_trace(), vec!["get", "put"]);
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }
