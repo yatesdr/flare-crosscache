@@ -1795,3 +1795,27 @@ async fn l0_40_detached_finalization_uses_the_put_namespace() {
     let subscription = other.subscribe().await;
     assert!(subscription.entries.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_41_streaming_windows_respect_the_nvme_cap() {
+    let base = base("staging-cap");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        24 * 1024,
+    );
+    config.name = instance_name("staging-cap");
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    // The disk record fits the cap but its first staging window does not.
+    assert_eq!(
+        client.put(key(128), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+    );
+    assert!(host.gauge("nvme_reserved_bytes") <= 24 * 1024);
+    // A row-only record whose window does fit still streams.
+    let _ = client.store(key(3), None).await;
+    assert!(host.gauge("nvme_reserved_bytes") <= 24 * 1024);
+}

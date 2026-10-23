@@ -1090,6 +1090,16 @@ impl Store {
         }
         let memory_charge = record_charge(&header, true);
         let disk_charge = record_charge(&header, false);
+        // The write budget covers the live staging window as well as the disk
+        // record for a streamed Put.
+        let window_charge = self
+            .config
+            .max_window_bytes
+            .max(header.page_record_bytes())
+            .max(header.row_record_bytes())
+            .max(4096)
+            .next_power_of_two();
+        let mut admission = memory_charge;
         let memory = if memory_charge - disk::ENVELOPE_BYTES <= self.memory.capacity() as u64 {
             self.memory_room(length as usize, self.config.root.is_some())
         } else {
@@ -1099,7 +1109,10 @@ impl Store {
             Some(extent) => (Some(Arc::new(extent)), None, memory_charge),
             // A streamed record still occupies its disk record plus whichever
             // staging windows are live; reserve the disk record now.
-            None if self.config.root.is_some() => (None, Some(()), disk_charge),
+            None if self.config.root.is_some() => {
+                admission = disk_charge + window_charge;
+                (None, Some(()), disk_charge)
+            }
             None => {
                 for key in &pins {
                     let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
@@ -1120,13 +1133,13 @@ impl Store {
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }
-        if !self.admit(connection, reservation) {
+        if !self.admit(connection, admission) {
             drop(memory);
             for key in &pins {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
             self.metrics.retry_budget += 1;
-            self.local.arm_budget(connection, reservation);
+            self.local.arm_budget(connection, admission);
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }
@@ -1479,6 +1492,20 @@ impl Store {
                 return false;
             }
         };
+        if memory.is_none() {
+            let window = plan.length.max(4096).next_power_of_two();
+            if self.charge_total().saturating_add(window) > self.config.nvme {
+                self.local
+                    .arm_budget(connection, disk::ENVELOPE_BYTES + window);
+                self.fail_put(
+                    connection,
+                    transfer,
+                    crosscache::Reason::Budget as u8,
+                    invalid("staging capacity"),
+                );
+                return false;
+            }
+        }
         let result = match memory {
             Some(memory) => self.local.grant_put_extent(
                 connection,
@@ -1921,6 +1948,16 @@ impl Store {
             }
             Next::Read { file } => {
                 let length = usize::try_from(plan.length).unwrap_or(usize::MAX);
+                let window = length.max(4096).next_power_of_two() as u64;
+                if self.charge_total().saturating_add(window) > self.config.nvme {
+                    self.fail_get(
+                        connection,
+                        transfer,
+                        crosscache::Reason::Budget as u8,
+                        invalid("staging capacity"),
+                    );
+                    return false;
+                }
                 let Some(extent) = self.staging.allocate(length) else {
                     self.fail_get(
                         connection,
@@ -2723,6 +2760,16 @@ impl Store {
             let (offset, buffer, kind) = if let Some(extent) = fill {
                 (disk::ENVELOPE_BYTES, extent, ReadKind::Fill)
             } else {
+                let window = meta_length.max(4096).next_power_of_two() as u64;
+                if self.charge_total().saturating_add(window) > self.config.nvme {
+                    self.fail_get(
+                        connection,
+                        transfer,
+                        crosscache::Reason::Budget as u8,
+                        invalid("staging capacity"),
+                    );
+                    return;
+                }
                 let Some(extent) = self.staging.allocate(meta_length) else {
                     self.fail_get(
                         connection,
@@ -5234,6 +5281,55 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         drop(store);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn streaming_admission_charges_a_staging_window() {
+        let name = format!(
+            "cm-unit-{}-budget-staging-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let mut config = Config::new(
+            base.join("records"),
+            base.join("manager.sock"),
+            4096,
+            64 << 20,
+        );
+        config.name = name.clone();
+        config.staging = 8 * 1024 * 1024;
+        config.write_budget = 1024 * 1024;
+        let mut store = Store::open(config).unwrap();
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 128,
+                    digest: [7; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 2,
+                published_tail_pages: 2,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch_trace();
+        assert!(
+            store.budget_balance(1).unwrap() < 0,
+            "staging window must count against the write budget"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/flare-crosscache").join(name));
     }
 
     #[test]
