@@ -2845,6 +2845,18 @@ impl Store {
                 matches!(&open.operation, Operation::Get(get) if get.terminal || get.finished)
             });
         if terminal {
+            if let Some(open) = self
+                .sessions
+                .get_mut(&connection)
+                .and_then(|session| session.ops.get_mut(&transfer))
+            {
+                if let Operation::Get(get) = &mut open.operation {
+                    get.pending_reads = get.pending_reads.saturating_sub(1);
+                    if matches!(kind, ReadKind::Window { .. }) {
+                        get.window_reads = get.window_reads.saturating_sub(1);
+                    }
+                }
+            }
             self.drain_get_read(connection, transfer);
             return;
         }
@@ -3041,6 +3053,16 @@ impl Store {
                 matches!(&open.operation, Operation::Get(get) if get.terminal || get.finished)
             });
         if terminal {
+            if let Some(open) = self
+                .sessions
+                .get_mut(&connection)
+                .and_then(|session| session.ops.get_mut(&transfer))
+            {
+                if let Operation::Get(get) = &mut open.operation {
+                    get.pending_reads = get.pending_reads.saturating_sub(1);
+                    get.window_reads = get.window_reads.saturating_sub(1);
+                }
+            }
             self.drain_get_read(connection, transfer);
             return;
         }
@@ -3245,6 +3267,10 @@ impl Store {
                 }
             }
             Operation::Get(mut get) => {
+                if get.finished {
+                    // A failure already transferred the pending reads to a drain.
+                    return;
+                }
                 get.cancelled = true;
                 if get.pending_reads == 0 {
                     let pins = std::mem::take(&mut get.pins);
@@ -3317,6 +3343,9 @@ impl Store {
                     }
                 }
                 Operation::Get(get) => {
+                    if get.finished {
+                        continue;
+                    }
                     if get.pending_reads == 0 {
                         if let Some(id) = id {
                             let namespace = self.namespaces.get_mut(&id).unwrap();
@@ -5335,6 +5364,66 @@ mod tests {
         assert_eq!(store.detached_puts[&(1, 1)].blocked.len(), 1);
         drop(store);
         let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn terminal_get_completions_transfer_to_one_drain() {
+        let (mut store, directory) = store("get-drain");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let get = Get {
+            pins: VecDeque::new(),
+            records: Vec::new(),
+            grants: Vec::new(),
+            next_grant: 0,
+            next_meta: 0,
+            outstanding: HashMap::new(),
+            released: HashSet::new(),
+            ready_windows: VecDeque::new(),
+            window_reads: 0,
+            pending_reads: 2,
+            cancelled: false,
+            terminal: true,
+            finished: true,
+            leased_sent: true,
+            events,
+            outbox: VecDeque::new(),
+        };
+        store.sessions.get_mut(&1).unwrap().ops.insert(
+            1,
+            Open {
+                operation: Operation::Get(Box::new(get)),
+                progress: Instant::now(),
+            },
+        );
+        store.retired_gets.push(GetDrain {
+            connection: 1,
+            transfer: 1,
+            namespace: id,
+            pins: VecDeque::new(),
+            pending: 2,
+        });
+        for expected in [1, 0] {
+            let extent = store.staging.allocate(4096).unwrap();
+            store.get_read_done(1, 1, 0, ReadKind::Meta { length: 0 }, Some(extent));
+            assert_eq!(store.retired_gets[0].pending, expected);
+            let Operation::Get(get) = &store.sessions[&1].ops[&1].operation else {
+                panic!("expected Get");
+            };
+            assert_eq!(get.pending_reads, expected);
+        }
+        store.cleanup_turn();
+        assert!(store.retired_gets.is_empty());
+        // Closing the connection must not create a second drain from the
+        // already transferred count.
+        store.connection_closed(1);
+        assert!(store.retired_gets.is_empty());
+        drop(store);
         let _ = fs::remove_dir_all(directory);
     }
 
