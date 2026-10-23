@@ -1,7 +1,7 @@
 use crate::{
     Key, Result,
     arena::{Arena, Extent},
-    disk::{self, DiskExtent, Task},
+    disk::{self, DiskExtent, RecordData, Task},
     invalid,
     protocol::{self, Decoder, Encoder, Frame, tag},
     record::{self, Descriptor, Header},
@@ -71,12 +71,41 @@ struct Location {
     bytes: u64,
 }
 
+impl Location {
+    fn reading(&self) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|extent| Arc::strong_count(extent) > 1)
+            || self
+                .disk
+                .as_ref()
+                .is_some_and(|extent| Arc::strong_count(extent) > 1)
+    }
+}
+
 struct Namespace {
+    directory: PathBuf,
     descriptor: Descriptor,
     tree: Tree<Location>,
     seq: u64,
     disk: disk::Worker,
     inflight: HashSet<Key>,
+}
+
+impl Namespace {
+    fn path(&self, key: Key) -> PathBuf {
+        self.directory.join(record::file_name(&key))
+    }
+    fn temporary(&self, id: u64) -> Arc<DiskExtent> {
+        let extent = Arc::new(DiskExtent::new(
+            self.directory.join(format!(".write-{id}.tmp")),
+        ));
+        extent.retire();
+        extent
+    }
+    fn parent_durable(&self, parent: Option<Key>) -> bool {
+        parent.is_none_or(|key| self.tree[&key].location.durable)
+    }
 }
 
 struct Put {
@@ -86,14 +115,14 @@ struct Put {
     checksums: Vec<u64>,
     cursor: u64,
     window_end: u64,
-    window_hashes: Vec<u64>,
+    verified_pages: usize,
     page_hash: Option<XxHash3_64>,
     row_hash: Option<u64>,
     row_started: bool,
     committed: bool,
     pending: usize,
     failed: bool,
-    parent_pinned: bool,
+    pins: VecDeque<Key>,
     replacement: bool,
     metadata: Option<Arc<Vec<u8>>>,
     commit_bytes: Vec<u8>,
@@ -129,6 +158,15 @@ struct Connection {
     dead: bool,
     pid: u32,
     connected: Instant,
+}
+
+impl Connection {
+    fn send(&mut self, output: Output) {
+        self.dead |= self.writer.try_send(output).is_err();
+    }
+    fn reply(&mut self, tag: u8, op: u64, payload: Vec<u8>) {
+        self.send(Output::Frame(Frame::new(tag, self.generation, op, payload)));
+    }
 }
 
 enum ReadEvent {
@@ -209,6 +247,14 @@ enum Job {
     },
 }
 
+struct Subscription {
+    namespace: String,
+    generation: u64,
+    op: u64,
+    writer: SyncSender<Output>,
+    failed: bool,
+}
+
 struct State {
     config: Config,
     lock: Arc<disk::RootLock>,
@@ -230,8 +276,7 @@ struct State {
     deferred_disk: Vec<Arc<DiskExtent>>,
     retired_puts: Vec<(String, Key, Arc<DiskExtent>, u64)>,
     retired_records: Vec<(String, Key, Location)>,
-    current: Option<(String, u64, u64, SyncSender<Output>)>,
-    current_failed: bool,
+    subscribers: HashMap<u64, Subscription>,
 }
 
 pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
@@ -268,8 +313,7 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
         deferred_disk: Vec::new(),
         retired_puts: Vec::new(),
         retired_records: Vec::new(),
-        current: None,
-        current_failed: false,
+        subscribers: HashMap::new(),
     };
     let mut recovered_age = Vec::new();
     for recovered in recovered {
@@ -279,19 +323,13 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 .modified()
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             recovered_age.push((modified, namespace.descriptor.name(), header.key));
-            let bytes = disk::ENVELOPE_BYTES
-                + if row {
-                    header.length_with_row()
-                } else {
-                    header.row_segment
-                };
+            let bytes = disk::ENVELOPE_BYTES + header.length(row);
             namespace.tree.insert(
                 header.key,
                 header.parent,
                 header.bucket,
                 header.tail_pages as usize,
                 row,
-                true,
                 Location {
                     header: header.clone(),
                     memory: None,
@@ -396,22 +434,15 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                             });
                     if let Some(frame) = frame {
                         active = true;
-                        state.current = connection.namespace.clone().map(|name| {
-                            (
-                                name,
-                                connection.generation,
-                                connection.control,
-                                connection.writer.clone(),
-                            )
-                        });
-                        state.current_failed = false;
                         connection.blocked = false;
                         if let Err(error) = state.frame(id, &mut connection, &frame) {
                             let _ = error;
                             connection.dead = true;
                         }
-                        connection.dead |= state.current_failed;
-                        state.current = None;
+                        connection.dead |= state
+                            .subscribers
+                            .get(&id)
+                            .is_some_and(|subscriber| subscriber.failed);
                         if connection.blocked {
                             connection.held = Some(frame);
                         } else if frame.payload.len() > 4096 {
@@ -425,11 +456,16 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                         .map(|(op, _)| *op)
                         .collect();
                     for op in expired {
-                        state.send(&mut connection, tag::CANCEL, op, Vec::new());
+                        connection.reply(tag::CANCEL, op, Vec::new());
                         state.cancel(&mut connection, op);
                     }
                 }
+                connection.dead |= state
+                    .subscribers
+                    .get(&id)
+                    .is_some_and(|subscriber| subscriber.failed);
                 if connection.dead {
+                    state.subscribers.remove(&id);
                     let _ = connection.socket.shutdown(std::net::Shutdown::Both);
                     let ops: Vec<u64> = connection.ops.keys().copied().collect();
                     for op in ops {
@@ -466,6 +502,7 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
 impl State {
     fn new_namespace(&self, descriptor: Descriptor) -> Namespace {
         Namespace {
+            directory: self.config.root.join(descriptor.name()),
             tree: Tree::new(descriptor.page_tokens),
             descriptor,
             seq: 0,
@@ -569,17 +606,6 @@ impl State {
         self.order.push_back(id);
         Ok(())
     }
-    fn send(&self, connection: &mut Connection, tag: u8, op: u64, payload: Vec<u8>) {
-        let frame = Frame {
-            tag,
-            generation: connection.generation,
-            op,
-            payload,
-        };
-        if connection.writer.try_send(Output::Frame(frame)).is_err() {
-            connection.dead = true;
-        }
-    }
     fn result(&self, connection: &mut Connection, tag: u8, op: u64, result: Result<()>) {
         let mut payload = Encoder::default();
         match result {
@@ -589,7 +615,7 @@ impl State {
                 payload.text(&error.to_string());
             }
         }
-        self.send(connection, tag, op, payload.0);
+        connection.reply(tag, op, payload.0);
     }
     fn retry(&mut self, connection: &mut Connection, op: u64, reason: u8) {
         match reason {
@@ -597,14 +623,14 @@ impl State {
             1 => self.metrics.retry_budget += 1,
             _ => self.metrics.retry_inflight += 1,
         }
-        self.send(connection, tag::RETRY, op, vec![reason]);
+        connection.reply(tag::RETRY, op, vec![reason]);
     }
     fn frame(&mut self, id: u64, connection: &mut Connection, frame: &Frame) -> Result<()> {
         if connection.namespace.is_none() {
             if frame.tag != tag::HELLO || frame.op == 0 {
                 return Err(invalid("expected Hello"));
             }
-            return self.hello(connection, frame);
+            return self.hello(id, connection, frame);
         }
         if frame.generation != connection.generation || frame.op == 0 {
             self.metrics.dropped += 1;
@@ -629,6 +655,7 @@ impl State {
                 let _last_seq = decoder.u64()?;
                 decoder.end()?;
                 connection.control = frame.op;
+                self.subscribers.get_mut(&id).unwrap().op = frame.op;
                 self.snapshot(connection);
                 Ok(())
             }
@@ -658,7 +685,7 @@ impl State {
             }
         }
     }
-    fn hello(&mut self, connection: &mut Connection, frame: &Frame) -> Result<()> {
+    fn hello(&mut self, id: u64, connection: &mut Connection, frame: &Frame) -> Result<()> {
         let parsed = (|| {
             let mut decoder = Decoder::new(&frame.payload);
             if decoder.u32()? != protocol::VERSION {
@@ -687,6 +714,16 @@ impl State {
         })();
         match parsed {
             Ok(namespace) => {
+                self.subscribers.insert(
+                    id,
+                    Subscription {
+                        namespace: namespace.clone(),
+                        generation: connection.generation,
+                        op: frame.op,
+                        writer: connection.writer.clone(),
+                        failed: false,
+                    },
+                );
                 connection.namespace = Some(namespace);
                 connection.control = frame.op;
                 connection.highest_op = frame.op;
@@ -699,23 +736,21 @@ impl State {
                 limits.u32(2);
                 limits.u32(2);
                 limits.u32(3000);
-                self.send(connection, tag::WELCOME, frame.op, limits.0);
+                connection.reply(tag::WELCOME, frame.op, limits.0);
                 self.snapshot(connection);
             }
             Err(error) => {
                 let mut reason = Encoder::default();
                 reason.text(&error.to_string());
-                self.send(connection, tag::REJECT, frame.op, reason.0);
+                connection.reply(tag::REJECT, frame.op, reason.0);
                 // The writer closes after sending the rejection.
-                if connection.writer.try_send(Output::Close).is_err() {
-                    connection.dead = true;
-                }
+                connection.send(Output::Close);
             }
         }
         Ok(())
     }
     fn entry(namespace: &Namespace, key: Key) -> Vec<u8> {
-        let node = namespace.tree.node(&key).unwrap();
+        let node = &namespace.tree[&key];
         let mut entry = Encoder::default();
         entry.key(key);
         entry.parent(node.parent);
@@ -729,30 +764,20 @@ impl State {
     }
     fn snapshot(&self, connection: &mut Connection) {
         let namespace = &self.namespaces[connection.namespace.as_ref().unwrap()];
-        let mut keys: Vec<Key> = namespace
-            .tree
-            .nodes()
-            .filter(|node| node.ready)
-            .map(|node| node.key)
-            .collect();
+        let mut keys: Vec<Key> = namespace.tree.nodes().map(|node| node.key).collect();
         keys.sort_unstable();
         let entries = keys
             .into_iter()
             .map(|key| Self::entry(namespace, key))
             .collect();
-        if connection
-            .writer
-            .try_send(Output::Snapshot {
-                generation: connection.generation,
-                op: connection.control,
-                seq: namespace.seq,
-                entries,
-            })
-            .is_err()
-        {
-            connection.dead = true;
-        }
+        connection.send(Output::Snapshot {
+            generation: connection.generation,
+            op: connection.control,
+            seq: namespace.seq,
+            entries,
+        });
     }
+
     fn delta(&mut self, name: &str, kind: u8, key: Key) {
         let namespace = self.namespaces.get_mut(name).unwrap();
         namespace.seq += 1;
@@ -764,34 +789,18 @@ impl State {
         } else {
             payload.bytes(&Self::entry(namespace, key));
         }
-        if let Some((current_name, generation, op, writer)) = &self.current {
-            if current_name == name
-                && writer
-                    .try_send(Output::Frame(Frame {
-                        tag: tag::DELTA,
-                        generation: *generation,
-                        op: *op,
-                        payload: payload.0.clone(),
-                    }))
-                    .is_err()
-            {
-                self.current_failed = true;
-            }
-        }
-        for connection in self
-            .connections
+        for subscriber in self
+            .subscribers
             .values_mut()
-            .filter(|connection| connection.namespace.as_deref() == Some(name))
+            .filter(|subscriber| subscriber.namespace == name)
         {
-            let frame = Frame {
-                tag: tag::DELTA,
-                generation: connection.generation,
-                op: connection.control,
-                payload: payload.0.clone(),
-            };
-            if connection.writer.try_send(Output::Frame(frame)).is_err() {
-                connection.dead = true;
-            }
+            let frame = Frame::new(
+                tag::DELTA,
+                subscriber.generation,
+                subscriber.op,
+                payload.0.clone(),
+            );
+            subscriber.failed |= subscriber.writer.try_send(Output::Frame(frame)).is_err();
         }
     }
     fn put(&mut self, connection: &mut Connection, frame: &Frame) -> Result<()> {
@@ -827,9 +836,9 @@ impl State {
             self.retry(connection, frame.op, 2);
             return Ok(());
         }
-        if old.is_some_and(|node| node.ready && node.row && namespace.tree.complete(&key)) {
+        if old.is_some_and(|node| node.row) {
             self.metrics.present += 1;
-            self.send(connection, tag::PRESENT, frame.op, Vec::new());
+            connection.reply(tag::PRESENT, frame.op, Vec::new());
             return Ok(());
         }
         if connection
@@ -845,66 +854,36 @@ impl State {
         let replacement = old.is_some();
         let parent = match old {
             Some(node) => node.parent,
-            None => published_parent.filter(|parent| {
-                namespace
-                    .tree
-                    .node(parent)
-                    .is_some_and(|node| node.ready && node.row)
-            }),
+            None => published_parent
+                .filter(|parent| namespace.tree.node(parent).is_some_and(|node| node.row)),
         };
         let first = parent.map_or(0, |parent| parent.consumed_tokens / descriptor.page_tokens);
         let tail = chain_pages - first as u32;
-        let header = Header::new(
-            descriptor,
-            descriptor.identity,
-            descriptor.fingerprint,
-            key,
-            parent,
-            bucket,
-            tail,
-            SystemTime::now(),
-        )?;
+        let header = Header::new(descriptor, key, parent, bucket, tail)?;
         let bytes = disk::ENVELOPE_BYTES + header.length_with_row();
         if bytes > self.config.nvme {
             self.metrics.oversize += 1;
-            self.send(connection, tag::OVERSIZE, frame.op, Vec::new());
+            connection.reply(tag::OVERSIZE, frame.op, Vec::new());
             return Ok(());
         }
-        let namespace = self.namespaces.get_mut(&name).unwrap();
-        if let Some(parent) = parent {
-            namespace.tree.pin(&parent)?;
+        let pins: VecDeque<Key> = parent
+            .into_iter()
+            .chain(replacement.then_some(key))
+            .collect();
+        for key in &pins {
+            self.namespaces.get_mut(&name).unwrap().tree.pin(key)?;
         }
-        if replacement {
-            namespace.tree.pin(&key)?;
-        }
-        if !self.make_room(bytes) {
-            let namespace = self.namespaces.get_mut(&name).unwrap();
-            if let Some(parent) = parent {
-                namespace.tree.unpin(&parent)?;
-            }
-            if replacement {
-                namespace.tree.unpin(&key)?;
-            }
-            connection.refused = connection.refused.max(bytes);
-            self.retry(connection, frame.op, 1);
-            return Ok(());
-        }
-        let memory =
-            if header.length_with_row().next_power_of_two() <= self.memory.capacity() as u64 {
-                self.memory_room(header.length_with_row() as usize)
-            } else {
-                None
-            };
-        // A fitting record without memory must wait: only records larger than the arena stream.
-        if memory.is_none()
-            && header.length_with_row().next_power_of_two() <= self.memory.capacity() as u64
-        {
-            let namespace = self.namespaces.get_mut(&name).unwrap();
-            if let Some(parent) = parent {
-                namespace.tree.unpin(&parent)?;
-            }
-            if replacement {
-                namespace.tree.unpin(&key)?;
+        let fits_memory =
+            header.length_with_row().next_power_of_two() <= self.memory.capacity() as u64;
+        let room = self.make_room(bytes);
+        let memory = if room && fits_memory {
+            self.memory_room(header.length_with_row() as usize)
+        } else {
+            None
+        };
+        if !room || (fits_memory && memory.is_none()) {
+            for key in &pins {
+                self.namespaces.get_mut(&name).unwrap().tree.unpin(key)?;
             }
             connection.refused = connection.refused.max(bytes);
             self.retry(connection, frame.op, 1);
@@ -912,7 +891,7 @@ impl State {
         }
         let cursor = header.page_segment;
         self.charged += bytes;
-        let directory = self.config.root.join(&name);
+        let directory = &self.namespaces[&name].directory;
         self.job_counter += 1;
         let temporary = Arc::new(DiskExtent::new(directory.join(format!(
             ".{}-{}.tmp",
@@ -932,14 +911,14 @@ impl State {
                     checksums: Vec::new(),
                     cursor,
                     window_end: cursor,
-                    window_hashes: Vec::new(),
+                    verified_pages: 0,
                     page_hash: None,
                     row_hash: None,
                     row_started: false,
                     committed: false,
                     pending: 0,
                     failed: false,
-                    parent_pinned: parent.is_some(),
+                    pins,
                     replacement,
                     metadata: None,
                     commit_bytes: Vec::new(),
@@ -950,42 +929,42 @@ impl State {
         let mut payload = Encoder::default();
         payload.u32(first as u32);
         payload.parent(parent);
-        self.send(connection, tag::ACCEPT, frame.op, payload.0);
+        connection.reply(tag::ACCEPT, frame.op, payload.0);
         Ok(())
+    }
+    fn oldest(
+        &self,
+        eligible: impl Fn(&crate::tree::Node<Location>) -> bool,
+    ) -> Option<(String, Key)> {
+        self.namespaces
+            .iter()
+            .flat_map(|(name, namespace)| {
+                namespace
+                    .tree
+                    .nodes()
+                    .filter(|node| {
+                        !node.pinned()
+                            && node.location.durable
+                            && !node.location.writing
+                            && eligible(node)
+                    })
+                    .map(move |node| (node.accessed(), node.key, name))
+            })
+            .min_by_key(|(accessed, key, _)| (*accessed, key.consumed_tokens))
+            .map(|(_, key, name)| (name.clone(), key))
     }
     fn memory_room(&mut self, bytes: usize) -> Option<Extent> {
         loop {
             if let Some(extent) = self.memory.allocate(bytes) {
                 return Some(extent);
             }
-            let candidate = self
-                .namespaces
-                .iter()
-                .flat_map(|(name, namespace)| {
-                    namespace
-                        .tree
-                        .nodes()
-                        .filter(|node| {
-                            node.ready
-                                && !node.pinned()
-                                && node.location.durable
-                                && !node.location.writing
-                                && node
-                                    .location
-                                    .memory
-                                    .as_ref()
-                                    .is_some_and(|data| Arc::strong_count(data) == 1)
-                        })
-                        .map(move |node| (name.clone(), node.key, node.accessed()))
-                })
-                .min_by_key(|(_, key, accessed)| (*accessed, key.consumed_tokens));
-            let (name, key, _) = candidate?;
-            self.namespaces
-                .get_mut(&name)
-                .unwrap()
-                .tree
-                .node_mut(&key)
-                .unwrap()
+            let (name, key) = self.oldest(|node| {
+                node.location
+                    .memory
+                    .as_ref()
+                    .is_some_and(|data| Arc::strong_count(data) == 1)
+            })?;
+            self.namespaces.get_mut(&name).unwrap().tree[&key]
                 .location
                 .memory = None;
             self.delta(&name, 1, key);
@@ -996,34 +975,11 @@ impl State {
             return false;
         }
         while self.charged.saturating_add(bytes) > self.config.nvme {
-            let candidate = self
-                .namespaces
-                .iter()
-                .flat_map(|(name, namespace)| {
-                    namespace
-                        .tree
-                        .nodes()
-                        .filter(|node| {
-                            node.ready
-                                && !node.pinned()
-                                && node.location.durable
-                                && !node.location.writing
-                                && node
-                                    .location
-                                    .memory
-                                    .as_ref()
-                                    .is_none_or(|extent| Arc::strong_count(extent) == 1)
-                                && node
-                                    .location
-                                    .disk
-                                    .as_ref()
-                                    .is_none_or(|extent| Arc::strong_count(extent) == 1)
-                                && (node.children() == 0 || (node.row && node.children() == 1))
-                        })
-                        .map(move |node| (name.clone(), node.key, node.accessed()))
-                })
-                .min_by_key(|(_, key, accessed)| (*accessed, key.consumed_tokens));
-            let Some((name, key, _)) = candidate else {
+            let candidate = self.oldest(|node| {
+                !node.location.reading()
+                    && (node.children() == 0 || (node.row && node.children() == 1))
+            });
+            let Some((name, key)) = candidate else {
                 return false;
             };
             let namespace = self.namespaces.get_mut(&name).unwrap();
@@ -1041,16 +997,10 @@ impl State {
                     }
                 }
                 Some(Eviction::Compacted(key)) => {
-                    let node = self.namespaces[&name].tree.node(&key).unwrap();
+                    let node = &self.namespaces[&name].tree[&key];
                     let source = node.location.disk.as_ref().unwrap().clone();
                     if source.reader().is_err() {
-                        self.namespaces
-                            .get_mut(&name)
-                            .unwrap()
-                            .tree
-                            .node_mut(&key)
-                            .unwrap()
-                            .row = true;
+                        self.namespaces.get_mut(&name).unwrap().tree[&key].row = true;
                         return false;
                     }
                     let header = node.location.header.clone();
@@ -1077,13 +1027,7 @@ impl State {
                                     bytes: freed,
                                 },
                             );
-                            let node = self
-                                .namespaces
-                                .get_mut(&name)
-                                .unwrap()
-                                .tree
-                                .node_mut(&key)
-                                .unwrap();
+                            let node = &mut self.namespaces.get_mut(&name).unwrap().tree[&key];
                             node.location.writing = true;
                             self.namespaces
                                 .get_mut(&name)
@@ -1095,13 +1039,7 @@ impl State {
                             self.delta(&name, 1, key);
                         }
                         Err(_) => {
-                            self.namespaces
-                                .get_mut(&name)
-                                .unwrap()
-                                .tree
-                                .node_mut(&key)
-                                .unwrap()
-                                .row = true;
+                            self.namespaces.get_mut(&name).unwrap().tree[&key].row = true;
                             return false;
                         }
                     }
@@ -1139,12 +1077,10 @@ impl State {
                 {
                     return Err(invalid("window pages or index"));
                 }
-                let mut hashes = Vec::new();
                 for _ in 0..pages {
-                    hashes.push(decoder.u64()?);
+                    put.checksums.push(decoder.u64()?);
                 }
                 decoder.end()?;
-                put.window_hashes = hashes;
                 put.window_end = put.cursor + u64::from(pages) * put.header.page_record_bytes();
                 put.page_hash = None;
             }
@@ -1185,14 +1121,7 @@ impl State {
                         [offset as usize..offset as usize + count]
                         .copy_from_slice(data);
                 } else {
-                    if put.header.parent.is_some_and(|parent| {
-                        !self.namespaces[&name]
-                            .tree
-                            .node(&parent)
-                            .unwrap()
-                            .location
-                            .durable
-                    }) {
+                    if !self.namespaces[&name].parent_durable(put.header.parent) {
                         connection.blocked = true;
                         return Ok(());
                     }
@@ -1260,16 +1189,13 @@ impl State {
                         let expected = if put.row_started {
                             put.row_hash.unwrap()
                         } else {
-                            let index = put.window_hashes.len()
-                                - ((put.window_end - put.cursor) / unit_bytes) as usize
-                                - 1;
-                            put.window_hashes[index]
+                            put.checksums[put.verified_pages]
                         };
                         if hash != expected {
                             return Err(invalid("checksum mismatch"));
                         }
                         if !put.row_started {
-                            put.checksums.push(hash);
+                            put.verified_pages += 1;
                         }
                         put.page_hash = None;
                     }
@@ -1349,7 +1275,7 @@ impl State {
         let name = connection.namespace.clone().unwrap();
         let key = put.header.key;
         let namespace = self.namespaces.get_mut(&name).unwrap();
-        let path = self.config.root.join(&name).join(record::file_name(&key));
+        let path = namespace.path(key);
         let location = Location {
             header: put.header.clone(),
             memory: put.memory,
@@ -1360,12 +1286,10 @@ impl State {
             bytes: disk::ENVELOPE_BYTES + put.header.length_with_row(),
         };
         if put.replacement {
-            let node = namespace.tree.node_mut(&key).unwrap();
+            let node = &mut namespace.tree[&key];
             let old = std::mem::replace(&mut node.location, location);
             self.retired_records.push((name.clone(), key, old));
             node.row = true;
-            node.ready = true;
-            namespace.tree.unpin(&key)?;
         } else {
             namespace.tree.insert(
                 key,
@@ -1373,12 +1297,11 @@ impl State {
                 put.header.bucket,
                 put.header.tail_pages as usize,
                 true,
-                true,
                 location,
             )?;
         }
-        if put.parent_pinned {
-            namespace.tree.unpin(&put.header.parent.unwrap())?;
+        for key in &put.pins {
+            namespace.tree.unpin(key)?;
         }
         namespace.inflight.remove(&key);
         self.clock += 1;
@@ -1423,8 +1346,7 @@ impl State {
                     .tree
                     .node(key)
                     .ok_or_else(|| invalid("Get key missing"))?;
-                if !node.ready
-                    || (index > 0 && node.parent != Some(keys[index - 1]))
+                if (index > 0 && node.parent != Some(keys[index - 1]))
                     || (index + 1 == keys.len() && !node.row)
                 {
                     return Err(invalid("Get chain"));
@@ -1480,11 +1402,7 @@ impl State {
         }
         for record in &mut records {
             if record.memory.is_none() {
-                let length = if record.row {
-                    record.header.length_with_row()
-                } else {
-                    record.header.row_segment
-                };
+                let length = record.header.length(record.row);
                 record.fill = self.memory_room(length as usize);
             }
         }
@@ -1513,18 +1431,12 @@ impl State {
                 }),
             },
         );
-        if connection
-            .writer
-            .try_send(Output::Get {
-                generation: connection.generation,
-                op: frame.op,
-                records,
-                cancelled,
-            })
-            .is_err()
-        {
-            connection.dead = true;
-        }
+        connection.send(Output::Get {
+            generation: connection.generation,
+            op: frame.op,
+            records,
+            cancelled,
+        });
         Ok(())
     }
     fn cancel(&mut self, connection: &mut Connection, op: u64) {
@@ -1534,14 +1446,7 @@ impl State {
         let name = connection.namespace.clone().unwrap();
         match open.operation {
             Operation::Put(put) => {
-                let mut pins = VecDeque::new();
-                if put.parent_pinned {
-                    pins.push_back(put.header.parent.unwrap());
-                }
-                if put.replacement {
-                    pins.push_back(put.header.key);
-                }
-                self.cleanup.push_back((name.clone(), pins));
+                self.cleanup.push_back((name.clone(), put.pins));
                 self.retired_puts.push((
                     name.clone(),
                     put.header.key,
@@ -1590,16 +1495,7 @@ impl State {
                 .tree
                 .node(key)
                 .is_none_or(|node| node.location.durable);
-            if !replaced_on_disk
-                || location
-                    .memory
-                    .as_ref()
-                    .is_some_and(|extent| Arc::strong_count(extent) > 1)
-                || location
-                    .disk
-                    .as_ref()
-                    .is_some_and(|extent| Arc::strong_count(extent) > 1)
-            {
+            if !replaced_on_disk || location.reading() {
                 true
             } else {
                 self.charged -= location.bytes;
@@ -1620,12 +1516,7 @@ impl State {
                         if node.location.header == *header
                             && node.location.memory.is_none()
                             && node.location.durable
-                            && extent.bytes().len() as u64
-                                == if node.row {
-                                    node.location.header.length_with_row()
-                                } else {
-                                    node.location.header.row_segment
-                                }
+                            && extent.bytes().len() as u64 == node.location.header.length(node.row)
                         {
                             node.location.memory = Some(extent);
                             self.delta(&name, 1, key);
@@ -1683,24 +1574,13 @@ impl State {
             };
             match job {
                 Job::Write { namespace, key } => {
-                    let Some(node) = self
-                        .namespaces
-                        .get_mut(&namespace)
-                        .unwrap()
-                        .tree
-                        .node_mut(&key)
-                    else {
-                        continue;
-                    };
+                    let namespace_state = self.namespaces.get_mut(&namespace).unwrap();
+                    let path = namespace_state.path(key);
+                    let node = &mut namespace_state.tree[&key];
                     node.location.writing = false;
                     if completion.result.is_ok() {
                         node.location.durable = true;
-                        node.location.disk = Some(Arc::new(DiskExtent::new(
-                            self.config
-                                .root
-                                .join(&namespace)
-                                .join(record::file_name(&key)),
-                        )));
+                        node.location.disk = Some(Arc::new(DiskExtent::new(path)));
                         self.delta(&namespace, 1, key);
                     } else {
                         node.location.retry = Instant::now() + Duration::from_millis(100);
@@ -1728,20 +1608,9 @@ impl State {
                         if connection.ops.contains_key(&op) {
                             if completion.result.is_ok() {
                                 final_extent.keep();
-                                self.current = connection.namespace.clone().map(|name| {
-                                    (
-                                        name,
-                                        connection.generation,
-                                        connection.control,
-                                        connection.writer.clone(),
-                                    )
-                                });
                                 if self.publish(&mut connection, op, true).is_err() {
                                     connection.dead = true;
                                 }
-                                connection.dead |= self.current_failed;
-                                self.current = None;
-                                self.current_failed = false;
                             } else {
                                 self.metrics.puts_error += 1;
                                 self.cancel(&mut connection, op);
@@ -1752,9 +1621,6 @@ impl State {
                                     Err(invalid("streaming disk write failed")),
                                 );
                             }
-                        } else if completion.result.is_ok() {
-                            // A cancelled finalize must not resurrect an unpublished record.
-                            // Its final path is removed by the retained temporary guard in schedule.
                         }
                         self.connections.insert(id, connection);
                     }
@@ -1764,31 +1630,21 @@ impl State {
                     key,
                     bytes,
                 } => {
+                    let path = self.namespaces[&namespace].path(key);
                     self.namespaces
                         .get_mut(&namespace)
                         .unwrap()
                         .tree
                         .unpin(&key)
                         .unwrap();
-                    let node = self
-                        .namespaces
-                        .get_mut(&namespace)
-                        .unwrap()
-                        .tree
-                        .node_mut(&key)
-                        .unwrap();
+                    let node = &mut self.namespaces.get_mut(&namespace).unwrap().tree[&key];
                     node.location.writing = false;
                     if completion.result.is_ok() {
                         node.location.bytes -= bytes;
                         self.charged -= bytes;
                         // Drop the cached row as well; future reads use the compacted file.
                         node.location.memory = None;
-                        node.location.disk = Some(Arc::new(DiskExtent::new(
-                            self.config
-                                .root
-                                .join(&namespace)
-                                .join(record::file_name(&key)),
-                        )));
+                        node.location.disk = Some(Arc::new(DiskExtent::new(path)));
                         self.delta(&namespace, 1, key);
                     } else {
                         node.row = true;
@@ -1806,16 +1662,10 @@ impl State {
                 .tree
                 .nodes()
                 .filter(|node| {
-                    node.ready
-                        && !node.location.durable
+                    !node.location.durable
                         && !node.location.writing
                         && node.location.retry <= Instant::now()
-                        && node.parent.is_none_or(|parent| {
-                            namespace
-                                .tree
-                                .node(&parent)
-                                .is_some_and(|parent| parent.location.durable)
-                        })
+                        && namespace.parent_durable(node.parent)
                 })
                 .map(|node| node.key)
                 .collect();
@@ -1823,20 +1673,14 @@ impl State {
             for key in keys {
                 self.job_counter += 1;
                 let id = self.job_counter;
-                let node = self.namespaces[&name].tree.node(&key).unwrap();
+                let node = &self.namespaces[&name].tree[&key];
                 let header = node.location.header.clone();
-                let temporary = Arc::new(DiskExtent::new(
-                    self.config
-                        .root
-                        .join(&name)
-                        .join(format!(".write-{id}.tmp")),
-                ));
-                temporary.retire();
-                let task = Task::Write {
+                let temporary = self.namespaces[&name].temporary(id);
+                let task = Task::Publish {
                     id,
                     temporary,
-                    final_path: self.config.root.join(&name).join(record::file_name(&key)),
-                    data: node.location.memory.as_ref().unwrap().clone(),
+                    destination: Arc::new(DiskExtent::new(self.namespaces[&name].path(key))),
+                    data: RecordData::Memory(node.location.memory.as_ref().unwrap().clone()),
                     header,
                     row: node.row,
                 };
@@ -1848,12 +1692,7 @@ impl State {
                             key,
                         },
                     );
-                    self.namespaces
-                        .get_mut(&name)
-                        .unwrap()
-                        .tree
-                        .node_mut(&key)
-                        .unwrap()
+                    self.namespaces.get_mut(&name).unwrap().tree[&key]
                         .location
                         .writing = true;
                 } else {
@@ -1884,29 +1723,18 @@ impl State {
                     );
                     continue;
                 }
-                if put.header.parent.is_some_and(|parent| {
-                    !self.namespaces[name]
-                        .tree
-                        .node(&parent)
-                        .unwrap()
-                        .location
-                        .durable
-                }) {
+                if !self.namespaces[name].parent_durable(put.header.parent) {
                     continue;
                 }
                 self.job_counter += 1;
                 let job = self.job_counter;
-                let final_extent = Arc::new(DiskExtent::new(
-                    self.config
-                        .root
-                        .join(name)
-                        .join(record::file_name(&put.header.key)),
-                ));
-                let task = Task::Finish {
+                let final_extent =
+                    Arc::new(DiskExtent::new(self.namespaces[name].path(put.header.key)));
+                let task = Task::Publish {
                     id: job,
                     temporary: put.temporary.clone(),
-                    final_extent: final_extent.clone(),
-                    metadata: put.metadata.as_ref().unwrap().clone(),
+                    destination: final_extent.clone(),
+                    data: RecordData::Metadata(put.metadata.as_ref().unwrap().clone()),
                     header: put.header.clone(),
                     row: true,
                 };
@@ -1958,15 +1786,13 @@ impl State {
                             .next_power_of_two())
             {
                 connection.refused = 0;
-                let frame = Frame {
-                    tag: tag::ROOM,
-                    generation: connection.generation,
-                    op: connection.control,
-                    payload: Vec::new(),
-                };
-                if connection.writer.try_send(Output::Frame(frame)).is_err() {
-                    connection.dead = true;
-                }
+                let frame = Frame::new(
+                    tag::ROOM,
+                    connection.generation,
+                    connection.control,
+                    Vec::new(),
+                );
+                connection.send(Output::Frame(frame));
             }
         }
     }
@@ -2028,32 +1854,24 @@ impl State {
         }
         for (name, namespace) in &self.namespaces {
             for tier in ["memory", "disk"] {
-                let nodes: Vec<_> = namespace
-                    .tree
-                    .nodes()
-                    .filter(|node| {
-                        if tier == "memory" {
-                            node.location.memory.is_some()
-                        } else {
-                            node.location.durable
-                        }
-                    })
-                    .collect();
-                let bytes: u64 = nodes
-                    .iter()
-                    .map(|node| {
-                        if tier == "memory" {
-                            if node.row {
-                                node.location.header.length_with_row()
-                            } else {
-                                node.location.header.row_segment
-                            }
+                let mut count = 0;
+                let mut bytes = 0;
+                for node in namespace.tree.nodes() {
+                    let retained = if tier == "memory" {
+                        node.location.memory.is_some()
+                    } else {
+                        node.location.durable
+                    };
+                    if retained {
+                        count += 1;
+                        bytes += if tier == "memory" {
+                            node.location.header.length(node.row)
                         } else {
                             node.location.bytes
-                        }
-                    })
-                    .sum();
-                text.push_str(&format!("cm_records{{namespace=\"{name}\",tier=\"{tier}\"}} {}\ncm_bytes{{namespace=\"{name}\",tier=\"{tier}\"}} {bytes}\n", nodes.len()));
+                        };
+                    }
+                }
+                text.push_str(&format!("cm_records{{namespace=\"{name}\",tier=\"{tier}\"}} {count}\ncm_bytes{{namespace=\"{name}\",tier=\"{tier}\"}} {bytes}\n"));
                 let hits = self
                     .metrics
                     .hits
@@ -2088,28 +1906,16 @@ fn output_command(
             let mut start = Encoder::default();
             start.u64(seq);
             start.u64(entries.len() as u64);
-            Frame {
-                tag: tag::SNAPSHOT,
-                generation,
-                op,
-                payload: start.0,
-            }
-            .write(socket)?;
+            Frame::new(tag::SNAPSHOT, generation, op, start.0).write(socket)?;
             for payload in entries {
-                Frame {
-                    tag: tag::ENTRY,
-                    generation,
-                    op,
-                    payload,
-                }
-                .write(socket)?;
+                Frame::new(tag::ENTRY, generation, op, payload).write(socket)?;
             }
-            Frame {
-                tag: tag::SNAPSHOT_END,
+            Frame::new(
+                tag::SNAPSHOT_END,
                 generation,
                 op,
-                payload: seq.to_le_bytes().to_vec(),
-            }
+                seq.to_le_bytes().to_vec(),
+            )
             .write(socket)
         }
         Output::Get {
@@ -2138,13 +1944,7 @@ fn output_command(
                         payload.text(&error.to_string());
                     }
                 }
-                Frame {
-                    tag: tag::DONE,
-                    generation,
-                    op,
-                    payload: payload.0,
-                }
-                .write(socket)?;
+                Frame::new(tag::DONE, generation, op, payload.0).write(socket)?;
             }
             let _ = events.send(WriterEvent::Finished(id, op, success));
             if result.as_ref().is_err_and(|error| {
@@ -2208,7 +2008,6 @@ fn stream_get(
             ));
         }
         let file = record.file.as_ref();
-        let mut metadata = Vec::new();
         for &(offset, length) in &record.ranges {
             let mut done = 0;
             while done < length {
@@ -2245,20 +2044,13 @@ fn stream_get(
                     )?;
                     buffer.bytes()
                 };
-                if offset == 0 {
-                    metadata.extend_from_slice(data);
+                if position == 0 && Header::decode(data)? != record.header {
+                    return Err(invalid("disk header changed"));
                 }
                 Frame::write_parts(socket, tag::DATA, generation, op, &prefix, data)?;
                 let _ = events.send(WriterEvent::Progress(id, op));
                 done += count;
             }
-        }
-        // Metadata is included even when no pages from this record are requested.
-        let decoded = Header::decode(&metadata)?;
-        if decoded != record.header
-            || (record.row && decoded.row_checksum != record.header.row_checksum)
-        {
-            return Err(invalid("disk header changed"));
         }
     }
     Ok(())
@@ -2301,11 +2093,7 @@ fn start_metrics(
 }
 
 fn verify_record(bytes: &[u8], header: &Header, row: bool) -> Result<()> {
-    let length = if row {
-        header.length_with_row()
-    } else {
-        header.row_segment
-    };
+    let length = header.length(row);
     if Header::decode(bytes)? != *header || bytes.len() as u64 != length {
         return Err(invalid("record header or length"));
     }

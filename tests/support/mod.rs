@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 static SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -226,14 +226,22 @@ impl Client {
         .unwrap();
     }
     pub fn read(&mut self) -> Frame {
-        let f = Frame::read(&mut self.stream).unwrap();
+        let frame = Frame::read(&mut self.stream).unwrap();
+        self.apply(&frame);
+        frame
+    }
+    pub fn read_into(&mut self, frame: &mut Frame) {
+        frame.read_into(&mut self.stream).unwrap();
+        self.apply(frame);
+    }
+    fn apply(&mut self, f: &Frame) {
         assert_eq!(f.generation, self.generation);
         if matches!(
             f.tag,
             tag::SNAPSHOT | tag::ENTRY | tag::SNAPSHOT_END | tag::DELTA | tag::ROOM
         ) && f.op != self.control
         {
-            return f;
+            return;
         }
         match f.tag {
             tag::SNAPSHOT => {
@@ -261,7 +269,7 @@ impl Client {
                     self.entries.clear();
                     self.control = self.op();
                     self.send(tag::RESYNC, self.control, self.seq.to_le_bytes().to_vec());
-                    return f;
+                    return;
                 }
                 self.seq = seq;
                 let kind = d.u8().unwrap();
@@ -284,7 +292,6 @@ impl Client {
             }
             _ => {}
         }
-        f
     }
     pub fn until(&mut self, tag: u8, op: u64) -> Frame {
         if let Some(index) = self.events.iter().position(|f| f.tag == tag && f.op == op) {
@@ -339,17 +346,7 @@ impl Client {
         first: u32,
     ) -> (Header, Vec<u8>, Vec<u64>) {
         let pages = key.consumed_tokens / self.descriptor.page_tokens - u64::from(first);
-        let mut header = Header::new(
-            &self.descriptor,
-            self.descriptor.identity,
-            self.descriptor.fingerprint,
-            key,
-            parent,
-            [4; 16],
-            pages as u32,
-            SystemTime::UNIX_EPOCH,
-        )
-        .unwrap();
+        let mut header = Header::new(&self.descriptor, key, parent, [4; 16], pages as u32).unwrap();
         let mut bytes = vec![0; header.length_with_row() as usize];
         let page_bytes = header.page_record_bytes() as usize;
         let mut hashes = Vec::new();
@@ -365,7 +362,7 @@ impl Client {
             *byte = (key.consumed_tokens as usize + index * 13) as u8;
         }
         header.row_checksum = record::checksum(&bytes[header.row_segment as usize..]);
-        bytes[..4096].copy_from_slice(&header.encode().unwrap());
+        bytes[..4096].copy_from_slice(&encode_header(&header));
         for (index, hash) in hashes.iter().enumerate() {
             bytes[4096 + index * 8..4096 + index * 8 + 8].copy_from_slice(&hash.to_le_bytes());
         }
@@ -469,4 +466,28 @@ impl Client {
         self.send(tag::RESYNC, op, self.seq.to_le_bytes().to_vec());
         self.until(tag::SNAPSHOT_END, op);
     }
+}
+
+
+pub fn encode_header(header: &Header) -> [u8; 4096] {
+    let mut encoder = Encoder::default();
+    encoder.bytes(b"FLARECKP");
+    encoder.u32(1);
+    encoder.u32(header.flags);
+    encoder.bytes(&header.identity);
+    encoder.bytes(&header.fingerprint);
+    encoder.key(header.key);
+    encoder.u8(header.parent.is_some() as u8);
+    encoder.key(header.parent.unwrap_or_default());
+    encoder.bytes(&header.bucket);
+    encoder.u64(header.page_tokens);
+    encoder.u32(header.tail_pages);
+    encoder.u64(header.page_segment);
+    encoder.u64(header.row_segment);
+    encoder.u64(header.row_checksum);
+    encoder.u64(header.created);
+    record::encode_ranks(&mut encoder, &header.ranks);
+    let mut bytes = [0; 4096];
+    bytes[..encoder.0.len()].copy_from_slice(&encoder.0);
+    bytes
 }

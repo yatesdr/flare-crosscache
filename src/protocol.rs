@@ -1,6 +1,6 @@
 use crate::{
     Key, Result, invalid,
-    record::{Descriptor, RankSizes},
+    record::{Descriptor, decode_ranks, encode_ranks},
 };
 use std::io::{self, IoSlice, Read, Write};
 
@@ -44,6 +44,15 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn new(tag: u8, generation: u64, op: u64, payload: Vec<u8>) -> Self {
+        Self {
+            tag,
+            generation,
+            op,
+            payload,
+        }
+    }
+
     pub fn read(reader: &mut impl Read) -> Result<Self> {
         let mut frame = Self {
             tag: 0,
@@ -64,11 +73,12 @@ impl Frame {
     }
     pub fn read_header(reader: &mut impl Read) -> Result<(Self, usize)> {
         let mut header = [0; 21];
-        reader.read_exact(&mut header)?;
+        reader.read_exact(&mut header[..4])?;
         let length = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
         if !(17..=MAX_FRAME).contains(&length) {
             return Err(invalid("frame length"));
         }
+        reader.read_exact(&mut header[4..])?;
         Ok((
             Self {
                 tag: header[4],
@@ -157,14 +167,7 @@ impl Encoder {
         self.bytes(&descriptor.identity);
         self.bytes(&descriptor.fingerprint);
         self.u64(descriptor.page_tokens);
-        self.u32(descriptor.ranks.len() as u32);
-        for rank in &descriptor.ranks {
-            self.u32(rank.planes.len() as u32);
-            for size in &rank.planes {
-                self.u64(*size);
-            }
-            self.u64(rank.row_bytes);
-        }
+        encode_ranks(self, &descriptor.ranks);
         self.u64(descriptor.page_bytes());
         self.u64(descriptor.row_bytes());
     }
@@ -223,25 +226,7 @@ impl<'a> Decoder<'a> {
         let identity = self.array()?;
         let fingerprint = self.array()?;
         let page_tokens = self.u64()?;
-        let count = self.u32()?;
-        if count == 0 || count > 326 {
-            return Err(invalid("rank count"));
-        }
-        let mut ranks = Vec::new();
-        for _ in 0..count {
-            let count = self.u32()?;
-            if count == 0 || count > 488 {
-                return Err(invalid("plane count"));
-            }
-            let mut planes = Vec::new();
-            for _ in 0..count {
-                planes.push(self.u64()?);
-            }
-            ranks.push(RankSizes {
-                planes,
-                row_bytes: self.u64()?,
-            });
-        }
+        let ranks = decode_ranks(self)?;
         let descriptor = Descriptor {
             identity,
             fingerprint,

@@ -109,12 +109,24 @@ impl Faults {
     }
 }
 
+pub enum RecordData {
+    Memory(Arc<Extent>),
+    Metadata(Arc<Vec<u8>>),
+}
+impl RecordData {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Memory(extent) => extent.bytes(),
+            Self::Metadata(bytes) => bytes,
+        }
+    }
+}
 pub enum Task {
-    Write {
+    Publish {
         id: u64,
         temporary: Arc<DiskExtent>,
-        final_path: PathBuf,
-        data: Arc<Extent>,
+        destination: Arc<DiskExtent>,
+        data: RecordData,
         header: Header,
         row: bool,
     },
@@ -123,14 +135,6 @@ pub enum Task {
         temporary: Arc<DiskExtent>,
         offset: u64,
         data: Arc<Extent>,
-    },
-    Finish {
-        id: u64,
-        temporary: Arc<DiskExtent>,
-        final_extent: Arc<DiskExtent>,
-        metadata: Arc<Vec<u8>>,
-        header: Header,
-        row: bool,
     },
     Compact {
         id: u64,
@@ -155,14 +159,14 @@ impl Worker {
     pub fn start(faults: Faults, lock: Arc<RootLock>) -> Self {
         let (sender, tasks) = mpsc::sync_channel(8);
         let (done, receiver) = mpsc::sync_channel(16);
+        let state_thread = thread::current();
         thread::spawn(move || {
             let _lock = lock;
             for task in tasks {
                 let started = Instant::now();
                 let id = match &task {
-                    Task::Write { id, .. }
+                    Task::Publish { id, .. }
                     | Task::Chunk { id, .. }
-                    | Task::Finish { id, .. }
                     | Task::Compact { id, .. } => *id,
                 };
                 let result = execute(task, &faults);
@@ -178,6 +182,7 @@ impl Worker {
                 {
                     break;
                 }
+                state_thread.unpark();
             }
         });
         Self { sender, receiver }
@@ -197,30 +202,10 @@ fn open(path: &Path, write: bool) -> Result<File> {
 }
 
 pub fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> Result<()> {
-    let mut done = 0;
-    while done < bytes.len() {
-        match file.read_at(&mut bytes[done..], offset + done as u64) {
-            Ok(0) => return Err(invalid("short disk read")),
-            Ok(count) if count % 4096 == 0 => done += count,
-            Ok(_) => return Err(invalid("unaligned disk read")),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
+    file.read_exact_at(bytes, offset)
 }
 fn write_at(file: &File, bytes: &[u8], offset: u64) -> Result<()> {
-    let mut done = 0;
-    while done < bytes.len() {
-        match file.write_at(&bytes[done..], offset + done as u64) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "disk write")),
-            Ok(count) if count % 4096 == 0 => done += count,
-            Ok(_) => return Err(invalid("unaligned disk write")),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
+    file.write_all_at(bytes, offset)
 }
 
 fn execute(task: Task, faults: &Faults) -> Result<u64> {
@@ -236,60 +221,47 @@ fn execute(task: Task, faults: &Faults) -> Result<u64> {
             write_at(&file, data.bytes(), ENVELOPE_BYTES + offset)?;
             Ok(data.bytes().len() as u64)
         }
-        Task::Write {
+        Task::Publish {
             temporary,
-            final_path,
+            destination,
             data,
             header,
             row,
             ..
         } => {
-            faults.checkpoint("parent_write");
             let file = open(&temporary.path, true)?;
-            write_at(&file, data.bytes(), ENVELOPE_BYTES)?;
+            match &data {
+                RecordData::Memory(extent) => {
+                    faults.checkpoint("parent_write");
+                    write_at(&file, extent.bytes(), ENVELOPE_BYTES)?;
+                }
+                RecordData::Metadata(bytes) => {
+                    let arena = Arena::new(4 * 1024 * 1024)?;
+                    for (index, chunk) in bytes.chunks(4 * 1024 * 1024).enumerate() {
+                        let mut buffer = arena.allocate(chunk.len()).unwrap();
+                        buffer.bytes_mut().copy_from_slice(chunk);
+                        write_at(
+                            &file,
+                            buffer.bytes(),
+                            ENVELOPE_BYTES + (index * 4 * 1024 * 1024) as u64,
+                        )?;
+                    }
+                }
+            }
             finish(
                 &file,
                 &temporary.path,
-                &final_path,
+                &destination.path,
                 data.bytes(),
                 &header,
                 row,
                 faults,
             )?;
+            if matches!(data, RecordData::Metadata(_)) {
+                destination.retire();
+            }
             faults.checkpoint("after_rename");
             Ok(data.bytes().len() as u64 + ENVELOPE_BYTES)
-        }
-        Task::Finish {
-            temporary,
-            final_extent,
-            metadata,
-            header,
-            row,
-            ..
-        } => {
-            let file = open(&temporary.path, true)?;
-            let arena = Arena::new(4 * 1024 * 1024)?;
-            for (index, chunk) in metadata.chunks(4 * 1024 * 1024).enumerate() {
-                let mut buffer = arena.allocate(chunk.len()).unwrap();
-                buffer.bytes_mut().copy_from_slice(chunk);
-                write_at(
-                    &file,
-                    buffer.bytes(),
-                    ENVELOPE_BYTES + (index * 4 * 1024 * 1024) as u64,
-                )?;
-            }
-            finish(
-                &file,
-                &temporary.path,
-                &final_extent.path,
-                &metadata,
-                &header,
-                row,
-                faults,
-            )?;
-            final_extent.retire();
-            faults.checkpoint("after_rename");
-            Ok(metadata.len() as u64 + ENVELOPE_BYTES)
         }
         Task::Compact {
             source,
@@ -337,11 +309,7 @@ fn finish(
     row: bool,
     faults: &Faults,
 ) -> Result<()> {
-    let length = if row {
-        header.length_with_row()
-    } else {
-        header.row_segment
-    };
+    let length = header.length(row);
     let arena = Arena::new(4096)?;
     let mut envelope = arena.allocate(4096).unwrap();
     envelope.bytes_mut().fill(0);
@@ -495,12 +463,7 @@ fn inspect(path: &Path, name: &str, descriptor: &Descriptor) -> Result<(Header, 
         || header.identity != descriptor.identity
         || header.fingerprint != descriptor.fingerprint
         || !header.matches(descriptor)
-        || length
-            != if row {
-                header.length_with_row()
-            } else {
-                header.row_segment
-            }
+        || length != header.length(row)
         || file.metadata()?.len() != ENVELOPE_BYTES + length
     {
         return Err(invalid("envelope record mismatch"));

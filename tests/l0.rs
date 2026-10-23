@@ -24,19 +24,23 @@ fn l0_01_tree_insert_chain_remove_parity() {
             let parent = index.checked_sub(1).map(|index| keys[index]);
             let pages =
                 key.consumed_tokens / pt - parent.map_or(0, |parent| parent.consumed_tokens / pt);
-            tree.insert(*key, parent, [4; 16], pages as usize, true, true, ())
+            tree.insert(*key, parent, [4; 16], pages as usize, true, ())
                 .unwrap();
+            tree.access_at(key, index as u64 + 1);
         }
-        let chain = tree.chain(&keys[2], 1000, &|node| node.ready).unwrap();
-        assert_eq!(chain.nodes, keys[1..]);
-        assert_eq!(chain.skip_pages as u64, 1000 / pt - 700 / pt);
-        assert_eq!(chain.pages as u64, 1990 / pt - 1000 / pt);
+        let parent = tree.node(&keys[2]).unwrap().parent.unwrap();
+        assert_eq!(parent, keys[1]);
+        assert_eq!(tree.node(&parent).unwrap().parent, Some(keys[0]));
+        let available =
+            tree.node(&parent).unwrap().tail_pages + tree.node(&keys[2]).unwrap().tail_pages;
+        let skip = (1000 / pt - 700 / pt) as usize;
+        assert_eq!(available - skip, (1990 / pt - 1000 / pt) as usize);
         assert!(
-            tree.insert(key(2000), Some(key(1999)), [0; 16], 0, true, true, ())
+            tree.insert(key(2000), Some(key(1999)), [0; 16], 0, true, ())
                 .is_err()
         );
         assert!(
-            tree.insert(key(2000), Some(keys[2]), [0; 16], 20, true, true, ())
+            tree.insert(key(2000), Some(keys[2]), [0; 16], 20, true, ())
                 .is_err()
         );
         assert_eq!(tree.node(&keys[2]).unwrap().children(), 0);
@@ -46,6 +50,19 @@ fn l0_01_tree_insert_chain_remove_parity() {
         tree.unpin(&keys[2]).unwrap();
         assert_eq!(tree.remove(&keys[2]).unwrap()[0].key, keys[2]);
         assert_eq!(tree.node(&keys[1]).unwrap().children(), 0);
+    }
+    let fixture = include_bytes!("fixtures/flare-header-v1.bin");
+    let decoded = record::Header::decode(fixture).unwrap();
+    let mut planned =
+        record::Header::new(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
+    planned.created = 1_700_000_000;
+    planned.row_checksum = 0x0123456789abcdef;
+    assert_eq!(decoded, planned);
+    assert_eq!(&encode_header(&planned), fixture);
+    for (offset, value) in [(129, 0u64), (173, 0), (181, u64::MAX)] {
+        let mut invalid = *fixture;
+        invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        assert!(record::Header::decode(&invalid).is_err());
     }
     let arena = Arena::new(1024 * 1024).unwrap();
     let extent = Arc::new(arena.allocate(9000).unwrap());
@@ -68,17 +85,17 @@ fn l0_02_leaf_lru_compaction_and_cascade() {
             [0; 16],
             (tokens / 64 - parent.unwrap_or(0) / 64) as usize,
             true,
-            true,
             (),
         )
         .unwrap();
+        tree.access_at(&key(tokens), tokens);
     }
-    tree.touch(&key(200));
+    tree.access_at(&key(200), 1000);
     tree.pin(&key(600)).unwrap();
     assert!(tree.evict(false, |_| true).is_none());
     assert!(matches!(tree.evict(true, |_| true), Some(Eviction::Compacted(k)) if k == key(400)));
-    assert!(!tree.complete(&key(400)));
-    assert!(tree.complete(&key(600)));
+    assert!(!tree.node(&key(400)).unwrap().row);
+    assert!(tree.node(&key(600)).unwrap().row);
     tree.unpin(&key(600)).unwrap();
     let Some(Eviction::Leaves(removed)) = tree.evict(false, |_| true) else {
         panic!("leaves")
@@ -399,6 +416,17 @@ fn l0_08_streaming_and_nvme_oversize() {
     wait(|| refill.gauge("memory_allocated_bytes") > 0);
     c.resync();
     assert_eq!(c.entries[&key(128)].tier, 0);
+    let mut split = Host::new(4096, 32 * 1024 * 1024);
+    split.start();
+    let mut geometry = descriptor();
+    geometry.ranks[0].planes = vec![protocol::MAX_DATA as u64 + 4096];
+    let mut c = Client::connect(&split.config, geometry);
+    let expected = c.store(key(128), None);
+    let mut actual = vec![0; expected.len()];
+    for (_, offset, data) in c.fetch(&[key(128)], 0, 2) {
+        actual[offset as usize..offset as usize + data.len()].copy_from_slice(&data);
+    }
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -593,6 +621,15 @@ fn l0_13_unknown_finished_cancelled_and_stale_frames() {
     c.send(tag::DATA, cancelled, vec![0; 4096]);
     wait(|| host.gauge("unknown_frames_total") == 4);
     c.fetch(&[key(128)], 0, 2);
+    host.durable(1);
+    let mut malformed = host.client();
+    use std::io::{Read, Write};
+    malformed
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    malformed.stream.write_all(&0u32.to_le_bytes()).unwrap();
+    assert_eq!(malformed.stream.read(&mut [0]).unwrap(), 0);
 }
 
 #[test]
