@@ -1746,3 +1746,52 @@ async fn l0_39_gap_recovery_uses_a_fresh_snapshot() {
     client.store(key(384), Some(key(256))).await;
     second.until_added(key(384)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_40_detached_finalization_uses_the_put_namespace() {
+    let base = base("detached-ns");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("detached-ns");
+    config.faults.delay_ms = 50;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut first = host.client().await;
+    let mut other_descriptor = descriptor();
+    other_descriptor.fingerprint = [9; 16];
+    let mut other = host.client_with(other_descriptor.clone()).await.unwrap();
+    let _other_subscription = other.subscribe().await;
+    // Parent in the first namespace, then a child whose connection goes away
+    // after commit. Finalization must use the Put's namespace, not an
+    // arbitrary one.
+    first.store(key(64), None).await;
+    host.wait(|host| host.durable_records() == 1);
+    let outcome = first
+        .put(
+            key(576 * 64),
+            Some(key(64)),
+            PutOptions {
+                abort_after_commit: true,
+                ..PutOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(outcome, PutOutcome::Abandoned);
+    drop(first);
+    host.wait(|host| host.durable_records() == 2);
+    drop(_other_subscription);
+    drop(other);
+    host.stop();
+    host.start();
+    let mut first = host.client().await;
+    let subscription = first.subscribe().await;
+    assert!(subscription.entries.contains_key(&key(64)));
+    assert!(subscription.entries.contains_key(&key(576 * 64)));
+    let mut other = host.client_with(other_descriptor.clone()).await.unwrap();
+    let subscription = other.subscribe().await;
+    assert!(subscription.entries.is_empty());
+}

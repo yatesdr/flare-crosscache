@@ -3897,10 +3897,8 @@ impl Store {
             };
             if put.committed && put.metadata.is_some() && put.pending == 0 && put.blocked.is_empty()
             {
-                let id = self.namespaces.keys().next().copied();
-                if let Some(id) = id {
-                    self.schedule_detached_finish(connection, transfer, id);
-                }
+                let id = put.namespace;
+                self.schedule_detached_finish(connection, transfer, id);
             }
         }
     }
