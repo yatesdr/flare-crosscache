@@ -5094,15 +5094,25 @@ impl Store {
                     )));
                     return;
                 }
-                if self
+                let Some(session_namespace) = self
                     .sessions
                     .get(&connection)
-                    .is_none_or(|session| session.namespace != Some(namespace))
-                {
+                    .and_then(|session| session.namespace)
+                else {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "Get before Hello",
                     )));
+                    return;
+                };
+                if session_namespace != namespace {
+                    // §8.0: a Get for a namespace the session has not
+                    // registered is a terminal operation refusal.
+                    let _ = reply.send(Ok(()));
+                    let _ = events.try_send(Ok(GetAnswer::Refused(Refused {
+                        reason: crosscache::Reason::Invalid as u8,
+                        detail: "Get namespace is not registered".into(),
+                    })));
                     return;
                 }
                 self.submit_get(

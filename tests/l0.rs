@@ -1883,3 +1883,46 @@ async fn l0_43_failed_get_drains_release_every_pin() {
     );
     host.wait(|host| host.gauge("cleanup_records") == 0 && host.gauge("leases") == 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_44_wrong_namespace_get_is_refused_invalid() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    let mut other = descriptor();
+    other.fingerprint = [12; 16];
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .get(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::GetMessage {
+            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+                namespace_id: other.namespace_id().to_vec(),
+                chain: vec![key_msg(key(128))],
+                skip_pages: 0,
+                expected_pages: 2,
+                row: true,
+                destinations: Vec::new(),
+                transfer: 0,
+            })),
+        })
+        .await
+        .unwrap();
+    let reply = replies.message().await.unwrap().unwrap();
+    assert!(matches!(
+        reply.r,
+        Some(crosscache::get_reply::R::Refused(crosscache::Refused {
+            reason,
+            ..
+        })) if reason == crosscache::Reason::Invalid as i32
+    ));
+    drop(sender);
+    drop(replies);
+    // The session is still usable for its own namespace.
+    assert!(!client.fetch(&[key(128)], 0, 2).await[0].is_empty());
+}
