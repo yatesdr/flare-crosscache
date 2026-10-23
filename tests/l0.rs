@@ -1488,3 +1488,27 @@ async fn l0_33_write_budget_uses_the_streaming_charge() {
     assert!(room > 0);
     client.store(key(256), None).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_34_concurrent_nvme_gets_share_connection_credits() {
+    let mut host = Host::new(4096, 64 * 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let one = client.store(key(64 * 64), None).await;
+    let two = client.store(key(128 * 64), None).await;
+    let (left, right) = client
+        .fetch_two((vec![key(64 * 64)], 0, 64), (vec![key(128 * 64)], 0, 128))
+        .await;
+    match (left, right) {
+        (GetOutcome::Done(records), GetOutcome::Done(other)) => {
+            assert_eq!(records[0], one);
+            assert_eq!(other[0], two);
+        }
+        other => panic!("concurrent Gets failed: {other:?}"),
+    }
+    host.wait(|host| {
+        host.gauge("leases") == 0
+            && host.gauge("cleanup_records") == 0
+            && host.gauge("open_ops") == 0
+    });
+}

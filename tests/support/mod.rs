@@ -782,103 +782,53 @@ impl Client {
         pages: u32,
         options: GetOptions,
     ) -> GetOutcome {
-        let (sender, receiver) = mpsc::channel(8);
-        let mut replies = match self
-            .inner
-            .get(self.request(ReceiverStream::new(receiver)))
-            .await
-        {
-            Ok(replies) => replies.into_inner(),
-            Err(status) => return GetOutcome::Status(status),
-        };
-        if sender
-            .send(GetMessage {
-                m: Some(get_message::M::Begin(crosscache::GetBegin {
-                    namespace_id: self.descriptor.namespace_id().to_vec(),
-                    chain: keys.iter().map(|key| key_msg(*key)).collect(),
-                    skip_pages: u64::from(skip),
-                    expected_pages: u64::from(pages),
-                    row: true,
-                    destinations: Vec::new(),
-                    transfer: 0,
-                })),
-            })
-            .await
-            .is_err()
-        {
-            return GetOutcome::Status(Status::internal("client send"));
-        }
-        let mut records: Vec<Vec<u8>> = Vec::new();
-        let mut filled: Vec<usize> = Vec::new();
-        loop {
-            let reply = match replies.message().await {
-                Ok(Some(reply)) => reply,
-                Ok(None) => return GetOutcome::Status(Status::aborted("reply stream ended")),
-                Err(status) => return GetOutcome::Status(status),
-            };
-            match reply.r {
-                Some(get_reply::R::Leased(leased)) => {
-                    records = leased
-                        .record_bytes
-                        .iter()
-                        .map(|bytes| vec![0; *bytes as usize])
-                        .collect();
-                    filled = vec![0; records.len()];
-                }
-                Some(get_reply::R::Meta(meta)) => {
-                    let record = meta.record as usize;
-                    let offset = meta.metadata_offset as usize;
-                    let end = offset + meta.metadata.len();
-                    if end > records[record].len() {
-                        return GetOutcome::Status(Status::out_of_range("metadata"));
-                    }
-                    records[record][offset..end].copy_from_slice(&meta.metadata);
-                    filled[record] = filled[record].max(end);
-                }
-                Some(get_reply::R::Ready(grant)) => {
-                    if options.cancel == Some(CancelAt::Grant) {
-                        let _ = sender
-                            .send(GetMessage {
-                                m: Some(get_message::M::Cancel(crosscache::Cancel {})),
-                            })
-                            .await;
-                        let _ = tokio::time::timeout(Duration::from_millis(500), replies.message())
-                            .await;
-                        return GetOutcome::Cancelled;
-                    }
-                    let memory = grant.memory.as_ref().unwrap();
-                    let region = if memory.region == crosscache::Region::Arena as i32 {
-                        Reg::Arena
-                    } else {
-                        Reg::Staging
-                    };
-                    let length = usize::try_from(memory.length).unwrap();
-                    let mut data = self.read(region, memory.offset, length);
-                    if options.corrupt_copy {
-                        data[0] ^= 1;
-                    }
-                    let record = grant.record as usize;
-                    let start = grant.record_offset as usize;
-                    records[record][start..start + length].copy_from_slice(&data);
-                    filled[record] = filled[record].max(start + length);
-                    let _ = sender
-                        .send(GetMessage {
-                            m: Some(get_message::M::Released(crosscache::WindowReleased {
-                                transfer: grant.transfer,
-                                index: grant.index,
-                            })),
-                        })
-                        .await;
-                }
-                Some(get_reply::R::Done(_)) => {
-                    return GetOutcome::Done(records);
-                }
-                Some(get_reply::R::Refused(refused)) => {
-                    return GetOutcome::Refused(u8::try_from(refused.reason).unwrap_or(0));
-                }
-                None => return GetOutcome::Status(Status::internal("empty Get reply")),
-            }
-        }
+        get_once(
+            self.inner.clone(),
+            self.descriptor.clone(),
+            self.generation,
+            self.arena.try_clone().unwrap(),
+            self.staging.try_clone().unwrap(),
+            keys.to_vec(),
+            skip,
+            pages,
+            options,
+        )
+        .await
+    }
+
+    pub async fn fetch_two(
+        &mut self,
+        left: (Vec<Key>, u32, u32),
+        right: (Vec<Key>, u32, u32),
+    ) -> (GetOutcome, GetOutcome) {
+        let descriptor = self.descriptor.clone();
+        let generation = self.generation;
+        let arena = self.arena.try_clone().unwrap();
+        let staging = self.staging.try_clone().unwrap();
+        tokio::join!(
+            get_once(
+                self.inner.clone(),
+                descriptor.clone(),
+                generation,
+                arena.try_clone().unwrap(),
+                staging.try_clone().unwrap(),
+                left.0,
+                left.1,
+                left.2,
+                GetOptions::default(),
+            ),
+            get_once(
+                self.inner.clone(),
+                descriptor,
+                generation,
+                arena,
+                staging,
+                right.0,
+                right.1,
+                right.2,
+                GetOptions::default(),
+            ),
+        )
     }
 
     pub async fn subscribe(&mut self) -> Subscription {
@@ -1102,4 +1052,119 @@ pub fn recovered_keys(root: &Path) -> Vec<Key> {
         .iter()
         .flat_map(|namespace| namespace.records.iter().map(|(header, _, _)| header.key))
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn get_once(
+    mut inner: LocalCacheClient<Channel>,
+    descriptor: Descriptor,
+    generation: u64,
+    arena: File,
+    staging: File,
+    keys: Vec<Key>,
+    skip: u32,
+    pages: u32,
+    options: GetOptions,
+) -> GetOutcome {
+    let (sender, receiver) = mpsc::channel(8);
+    let mut request = Request::new(ReceiverStream::new(receiver));
+    request.metadata_mut().insert(
+        "x-crosscache-generation",
+        generation.to_string().parse().unwrap(),
+    );
+    let mut replies = match inner.get(request).await {
+        Ok(replies) => replies.into_inner(),
+        Err(status) => return GetOutcome::Status(status),
+    };
+    if sender
+        .send(GetMessage {
+            m: Some(get_message::M::Begin(crosscache::GetBegin {
+                namespace_id: descriptor.namespace_id().to_vec(),
+                chain: keys.iter().map(|key| key_msg(*key)).collect(),
+                skip_pages: u64::from(skip),
+                expected_pages: u64::from(pages),
+                row: true,
+                destinations: Vec::new(),
+                transfer: 0,
+            })),
+        })
+        .await
+        .is_err()
+    {
+        return GetOutcome::Status(Status::internal("client send"));
+    }
+    let read = |region: Reg, offset: u64, length: usize| {
+        let file = match region {
+            Reg::Arena => &arena,
+            Reg::Staging => &staging,
+        };
+        let mut bytes = vec![0; length];
+        file.read_exact_at(&mut bytes, offset).unwrap();
+        bytes
+    };
+    let mut records: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let reply = match replies.message().await {
+            Ok(Some(reply)) => reply,
+            Ok(None) => return GetOutcome::Status(Status::aborted("reply stream ended")),
+            Err(status) => return GetOutcome::Status(status),
+        };
+        match reply.r {
+            Some(get_reply::R::Leased(leased)) => {
+                records = leased
+                    .record_bytes
+                    .iter()
+                    .map(|bytes| vec![0; *bytes as usize])
+                    .collect();
+            }
+            Some(get_reply::R::Meta(meta)) => {
+                let record = meta.record as usize;
+                let offset = meta.metadata_offset as usize;
+                let end = offset + meta.metadata.len();
+                if end > records[record].len() {
+                    return GetOutcome::Status(Status::out_of_range("metadata"));
+                }
+                records[record][offset..end].copy_from_slice(&meta.metadata);
+            }
+            Some(get_reply::R::Ready(grant)) => {
+                if options.cancel == Some(CancelAt::Grant) {
+                    let _ = sender
+                        .send(GetMessage {
+                            m: Some(get_message::M::Cancel(crosscache::Cancel {})),
+                        })
+                        .await;
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(500), replies.message()).await;
+                    return GetOutcome::Cancelled;
+                }
+                let memory = grant.memory.as_ref().unwrap();
+                let region = if memory.region == crosscache::Region::Arena as i32 {
+                    Reg::Arena
+                } else {
+                    Reg::Staging
+                };
+                let length = usize::try_from(memory.length).unwrap();
+                let mut data = read(region, memory.offset, length);
+                if options.corrupt_copy {
+                    data[0] ^= 1;
+                }
+                let record = grant.record as usize;
+                let start = grant.record_offset as usize;
+                records[record][start..start + length].copy_from_slice(&data);
+                let _ = sender
+                    .send(GetMessage {
+                        m: Some(get_message::M::Released(crosscache::WindowReleased {
+                            transfer: grant.transfer,
+                            index: grant.index,
+                        })),
+                    })
+                    .await;
+            }
+            Some(get_reply::R::Done(_)) => return GetOutcome::Done(records),
+            Some(get_reply::R::Refused(refused)) => {
+                return GetOutcome::Refused(u8::try_from(refused.reason).unwrap_or(0));
+            }
+            None => return GetOutcome::Status(Status::internal("empty Get reply")),
+        }
+    }
 }

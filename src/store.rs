@@ -208,6 +208,7 @@ pub struct Get {
     next_meta: usize,
     outstanding: HashMap<u32, PlannedGetGrant>,
     released: HashSet<u32>,
+    ready_windows: VecDeque<(u32, PlannedGetGrant, Arc<Extent>)>,
     window_reads: usize,
     pending_reads: usize,
     cancelled: bool,
@@ -1591,7 +1592,145 @@ impl Store {
         }
     }
 
+    fn get_credit_usage(&self, connection: u64) -> usize {
+        let granted = self
+            .local
+            .stats(connection)
+            .map(|stats| stats.get_windows as usize)
+            .unwrap_or(0);
+        let reserved: usize = self
+            .sessions
+            .get(&connection)
+            .map(|session| {
+                session
+                    .ops
+                    .values()
+                    .filter_map(|open| match &open.operation {
+                        Operation::Get(get) => Some(get.window_reads + get.ready_windows.len()),
+                        Operation::Put(_) => None,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        granted + reserved
+    }
+
     fn send_get_grant(&mut self, connection: u64, transfer: u64) -> bool {
+        if self.get_credit_usage(connection) >= WINDOW_CREDITS as usize {
+            return false;
+        }
+        if let Some((index, plan, extent)) = self
+            .sessions
+            .get_mut(&connection)
+            .and_then(|session| session.ops.get_mut(&transfer))
+            .and_then(|open| match &mut open.operation {
+                Operation::Get(get) => get.ready_windows.pop_front(),
+                Operation::Put(_) => None,
+            })
+        {
+            let header = self
+                .sessions
+                .get(&connection)
+                .and_then(|session| session.ops.get(&transfer))
+                .and_then(|open| match &open.operation {
+                    Operation::Get(get) => Some(get.records[plan.record as usize].header.clone()),
+                    Operation::Put(_) => None,
+                });
+            let Some(header) = header else {
+                return false;
+            };
+            let shape = match WindowShape::new(
+                plan.pages,
+                plan.row,
+                if plan.pages == 0 {
+                    0
+                } else {
+                    header.page_record_bytes()
+                },
+                if plan.row {
+                    header.row_record_bytes()
+                } else {
+                    0
+                },
+            ) {
+                Ok(shape) => shape,
+                Err(error) => {
+                    self.fail_get(
+                        connection,
+                        transfer,
+                        crosscache::Reason::Invalid as u8,
+                        error,
+                    );
+                    return false;
+                }
+            };
+            match self.local.grant_get_extent(
+                connection,
+                transfer,
+                index,
+                Region::Staging,
+                shape,
+                &extent,
+                0,
+            ) {
+                Ok(granted) => {
+                    if let Some(open) = self
+                        .sessions
+                        .get_mut(&connection)
+                        .and_then(|session| session.ops.get_mut(&transfer))
+                    {
+                        let Operation::Get(get) = &mut open.operation else {
+                            return false;
+                        };
+                        get.outstanding.insert(index, plan);
+                        get.outbox.push_back(Ok(GetAnswer::Ready(WindowGrant {
+                            transfer,
+                            index,
+                            record: plan.record,
+                            record_offset: plan.record_offset,
+                            length: plan.length,
+                            region: crosscache::Region::Staging as i32,
+                            offset: granted.offset,
+                            page_first: plan.page_first,
+                            page_count: plan.pages,
+                            row: plan.row,
+                        })));
+                        open.progress = Instant::now();
+                    }
+                    return true;
+                }
+                Err(GrantError::Credits) => {
+                    if let Some(open) = self
+                        .sessions
+                        .get_mut(&connection)
+                        .and_then(|session| session.ops.get_mut(&transfer))
+                    {
+                        if let Operation::Get(get) = &mut open.operation {
+                            get.ready_windows.push_front((index, plan, extent));
+                        }
+                    }
+                    return false;
+                }
+                Err(GrantError::Budget) => {
+                    self.fail_get(
+                        connection,
+                        transfer,
+                        crosscache::Reason::Budget as u8,
+                        invalid("staging grant"),
+                    );
+                    return false;
+                }
+                Err(GrantError::Invalid(detail)) => {
+                    self.fail_get(
+                        connection,
+                        transfer,
+                        crosscache::Reason::Invalid as u8,
+                        invalid(detail),
+                    );
+                    return false;
+                }
+            }
+        }
         let Some(ready) = self
             .sessions
             .get(&connection)
@@ -1638,11 +1777,7 @@ impl Store {
             let Operation::Get(get) = &mut open.operation else {
                 return false;
             };
-            if get.cancelled
-                || get.terminal
-                || !get.records[plan.record as usize].meta_sent
-                || get.outstanding.len() + get.window_reads >= WINDOW_CREDITS as usize
-            {
+            if get.cancelled || get.terminal || !get.records[plan.record as usize].meta_sent {
                 Next::Stop
             } else {
                 let record = &get.records[plan.record as usize];
@@ -2383,6 +2518,7 @@ impl Store {
             next_meta: 0,
             outstanding: HashMap::new(),
             released: HashSet::new(),
+            ready_windows: VecDeque::new(),
             window_reads: 0,
             pending_reads: 0,
             cancelled: false,
@@ -2682,14 +2818,16 @@ impl Store {
                 let (header, plan) = {
                     let Some(open) = self
                         .sessions
-                        .get(&connection)
-                        .and_then(|session| session.ops.get(&transfer))
+                        .get_mut(&connection)
+                        .and_then(|session| session.ops.get_mut(&transfer))
                     else {
                         return;
                     };
-                    let Operation::Get(get) = &open.operation else {
+                    let Operation::Get(get) = &mut open.operation else {
                         return;
                     };
+                    get.pending_reads = get.pending_reads.saturating_sub(1);
+                    get.window_reads = get.window_reads.saturating_sub(1);
                     let Some(plan) = get.grants.get(grant as usize) else {
                         return;
                     };
@@ -2750,8 +2888,6 @@ impl Store {
                                 return;
                             };
                             get.outstanding.insert(grant, plan);
-                            get.window_reads -= 1;
-                            get.pending_reads -= 1;
                             get.outbox.push_back(Ok(GetAnswer::Ready(WindowGrant {
                                 transfer,
                                 index: grant,
@@ -2766,6 +2902,19 @@ impl Store {
                             })));
                         }
                     }
+                    Err(GrantError::Credits) => {
+                        // The read is complete; keep the extent reserved until a
+                        // connection credit frees rather than failing or leaking it.
+                        if let Some(open) = self
+                            .sessions
+                            .get_mut(&connection)
+                            .and_then(|session| session.ops.get_mut(&transfer))
+                        {
+                            if let Operation::Get(get) = &mut open.operation {
+                                get.ready_windows.push_back((grant, plan, extent));
+                            }
+                        }
+                    }
                     Err(GrantError::Invalid(detail)) => {
                         self.fail_get(
                             connection,
@@ -2774,7 +2923,7 @@ impl Store {
                             invalid(detail),
                         );
                     }
-                    Err(_) => {
+                    Err(GrantError::Budget) => {
                         self.fail_get(
                             connection,
                             transfer,
@@ -2884,6 +3033,7 @@ impl Store {
                 && !get.cancelled
                 && get.next_grant >= get.grants.len()
                 && get.outstanding.is_empty()
+                && get.ready_windows.is_empty()
                 && get.window_reads == 0
                 && get.pending_reads == 0
                 && get.next_meta >= get.records.len()
