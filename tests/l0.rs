@@ -1595,3 +1595,20 @@ async fn l0_36_connection_limit_is_enforced() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_37_subscription_epoch_discards_queued_events() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let mut first = client.subscribe().await;
+    let mut second = client.subscribe().await;
+    // After the replacement the old epoch must not deliver new events.
+    client.store(key(128), None).await;
+    second.until_added(key(128)).await;
+    match first.stream.message().await {
+        Ok(None) => {}
+        Ok(Some(event)) => panic!("stale subscription yielded {event:?}"),
+        Err(_) => {}
+    }
+}

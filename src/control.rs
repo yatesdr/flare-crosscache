@@ -140,6 +140,17 @@ pub struct Service {
     commands: mpsc::Sender<StoreCommand>,
     generations: Arc<Mutex<HashMap<u64, Generation>>>,
     transfers: Arc<AtomicU64>,
+    epochs: Arc<Mutex<HashMap<u64, Arc<AtomicU64>>>>,
+}
+
+impl Service {
+    fn epoch(&self, connection: u64) -> Arc<AtomicU64> {
+        let mut epochs = self.epochs.lock().unwrap();
+        epochs
+            .entry(connection)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone()
+    }
 }
 
 pub fn key_to_proto(key: &Key) -> crosscache::Key {
@@ -446,6 +457,8 @@ impl LocalCache for Service {
             return Err(Status::unauthenticated("generation mismatch"));
         }
         let descriptor = descriptor_from_proto(message.descriptor)?;
+        let epoch = self.epoch(peer.connection);
+        let this_epoch = epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let (events, receiver) = mpsc::channel(65_536);
         let (reply, answer) = oneshot::channel();
         self.send(StoreCommand::Subscribe {
@@ -466,8 +479,11 @@ impl LocalCache for Service {
                 }
                 _ => Status::failed_precondition(error.to_string()),
             })?;
+        let current = epoch.clone();
         Ok(Response::new(Box::pin(
-            ReceiverStream::new(receiver).map(Ok::<_, Status>),
+            ReceiverStream::new(receiver)
+                .take_while(move |_| current.load(Ordering::Acquire) == this_epoch)
+                .map(Ok::<_, Status>),
         )))
     }
 
@@ -1120,6 +1136,7 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
         commands: commands.clone(),
         generations: generations.clone(),
         transfers: Arc::new(AtomicU64::new(1)),
+        epochs: Arc::new(Mutex::new(HashMap::new())),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
