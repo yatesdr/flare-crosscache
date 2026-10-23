@@ -511,6 +511,20 @@ fn l0_10_cancel_eof_and_io_lifetime() {
     assert_eq!(replica.wait().unwrap().signal(), Some(libc::SIGKILL));
     wait(|| host.gauge("open_ops") == 0 && host.gauge("cleanup_records") == 0);
     c.fetch(&[key(128)], 0, 2);
+    let mut blocked = host.client();
+    let (op, accept) = blocked.put(key(640 * 64), None);
+    assert_eq!(accept.tag, tag::ACCEPT);
+    let (header, bytes, hashes) = blocked.content(key(640 * 64), None, 0);
+    blocked.upload(op, &header, &bytes, &hashes);
+    wait(|| host.gauge("staging_allocated_bytes") == 10 * 64 * 4096);
+    let start = Instant::now();
+    c.fetch(&[key(128)], 0, 2);
+    assert!(start.elapsed() < Duration::from_millis(500));
+    blocked.send(tag::CANCEL, op, Vec::new());
+    wait(|| host.gauge("open_ops") == 0);
+    wait(|| host.gauge("staging_allocated_bytes") == 0);
+    blocked.resync();
+    assert!(!blocked.entries.contains_key(&key(640 * 64)));
 }
 
 #[test]

@@ -121,6 +121,7 @@ struct Put {
     row_started: bool,
     committed: bool,
     pending: usize,
+    staged: Option<(u64, Arc<Extent>)>,
     failed: bool,
     pins: VecDeque<Key>,
     replacement: bool,
@@ -433,7 +434,6 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                                 Err(mpsc::TryRecvError::Empty) => None,
                             });
                     if let Some(frame) = frame {
-                        active = true;
                         connection.blocked = false;
                         if let Err(error) = state.frame(id, &mut connection, &frame) {
                             let _ = error;
@@ -445,8 +445,11 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                             .is_some_and(|subscriber| subscriber.failed);
                         if connection.blocked {
                             connection.held = Some(frame);
-                        } else if frame.payload.len() > 4096 {
-                            let _ = connection.recycle.try_send(frame.payload);
+                        } else {
+                            active = true;
+                            if frame.payload.len() > 4096 {
+                                let _ = connection.recycle.try_send(frame.payload);
+                            }
                         }
                     }
                     let expired: Vec<u64> = connection
@@ -917,6 +920,7 @@ impl State {
                     row_started: false,
                     committed: false,
                     pending: 0,
+                    staged: None,
                     failed: false,
                     pins,
                     replacement,
@@ -1125,18 +1129,23 @@ impl State {
                         connection.blocked = true;
                         return Ok(());
                     }
-                    let Some(mut extent) = self.staging.allocate(count) else {
-                        connection.blocked = true;
-                        return Ok(());
+                    let (job, extent) = match put.staged.take() {
+                        Some(staged) => staged,
+                        None => {
+                            let Some(mut extent) = self.staging.allocate(count) else {
+                                connection.blocked = true;
+                                return Ok(());
+                            };
+                            extent.bytes_mut().copy_from_slice(data);
+                            self.job_counter += 1;
+                            (self.job_counter, Arc::new(extent))
+                        }
                     };
-                    extent.bytes_mut().copy_from_slice(data);
-                    self.job_counter += 1;
-                    let job = self.job_counter;
                     let task = Task::Chunk {
                         id: job,
                         temporary: put.temporary.clone(),
                         offset,
-                        data: Arc::new(extent),
+                        data: extent.clone(),
                     };
                     match self.namespaces[&name].disk.sender.try_send(task) {
                         Ok(()) => {
@@ -1150,6 +1159,7 @@ impl State {
                             );
                         }
                         Err(TrySendError::Full(_)) => {
+                            put.staged = Some((job, extent));
                             connection.blocked = true;
                             return Ok(());
                         }
