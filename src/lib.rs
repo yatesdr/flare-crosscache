@@ -2,6 +2,7 @@ pub mod arena;
 pub mod codec;
 pub mod crosscache;
 pub mod disk;
+pub mod local;
 pub mod protocol;
 pub mod record;
 pub mod server;
