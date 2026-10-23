@@ -1527,32 +1527,18 @@ impl Store {
                 reason,
                 detail: error.to_string(),
             })));
-            if !put.finished {
+            if !put.finished && put.pending == 0 {
                 put.finished = true;
-                if put.pending == 0 {
-                    let id = put.namespace;
-                    let pins = std::mem::take(&mut put.pins);
-                    let key = put.header.key;
-                    let reservation = put.reservation;
-                    let namespace = self.namespaces.get_mut(&id).unwrap();
-                    for key in &pins {
-                        let _ = namespace.tree.unpin(key);
-                    }
-                    namespace.inflight.remove(&key);
-                    self.charged = self.charged.saturating_sub(reservation);
-                } else {
-                    let drain = PutDrain {
-                        connection,
-                        transfer,
-                        namespace: put.namespace,
-                        key: put.header.key,
-                        pins: std::mem::take(&mut put.pins),
-                        pending: put.pending,
-                        reservation: put.reservation,
-                        _temporary: put.temporary.clone(),
-                    };
-                    self.retired_puts.push(drain);
+                let id = put.namespace;
+                let pins = std::mem::take(&mut put.pins);
+                let key = put.header.key;
+                let reservation = put.reservation;
+                let namespace = self.namespaces.get_mut(&id).unwrap();
+                for key in &pins {
+                    let _ = namespace.tree.unpin(key);
                 }
+                namespace.inflight.remove(&key);
+                self.charged = self.charged.saturating_sub(reservation);
             }
         }
     }
@@ -2249,7 +2235,7 @@ impl Store {
             let Operation::Put(put) = &mut open.operation else {
                 return;
             };
-            if put.terminal {
+            if put.finished {
                 return;
             }
             let header = put.header.clone();
@@ -2260,10 +2246,15 @@ impl Store {
             let replacement = put.replacement;
             let record_bytes = header.length_with_row();
             let key = header.key;
+            let already_terminal = put.terminal;
             put.terminal = true;
-            put.outbox.push_back(Ok(PutAnswer::Stored {
-                bytes: record_bytes,
-            }));
+            put.finished = true;
+            put.pending = 0;
+            if !already_terminal {
+                put.outbox.push_back(Ok(PutAnswer::Stored {
+                    bytes: record_bytes,
+                }));
+            }
             (header, memory, bytes, reservation, pins, replacement, key)
         };
         let (header, memory, bytes, reservation, pins, replacement, key) = prepared;
@@ -3169,7 +3160,7 @@ impl Store {
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                             }
                         }
-                        if put.terminal && put.outbox.is_empty() {
+                        if put.terminal && put.outbox.is_empty() && put.pending == 0 {
                             remove.push((connection, *transfer));
                         }
                     }
@@ -3195,6 +3186,21 @@ impl Store {
             if let Some(session) = self.sessions.get_mut(&connection) {
                 session.ops.remove(&transfer);
             }
+        }
+    }
+
+    fn settle_terminal_puts(&mut self) {
+        let mut ops = Vec::new();
+        for (connection, session) in &self.sessions {
+            for (transfer, open) in &session.ops {
+                if matches!(&open.operation, Operation::Put(put) if put.terminal && !put.finished && put.pending == 0)
+                {
+                    ops.push((*connection, *transfer));
+                }
+            }
+        }
+        for (connection, transfer) in ops {
+            self.settle_put(connection, transfer);
         }
     }
 
@@ -3285,7 +3291,7 @@ impl Store {
                             drain.pending = drain.pending.saturating_sub(1);
                         }
                     }
-                    let mut drained = false;
+                    let mut attached = false;
                     if let Some(open) = self
                         .sessions
                         .get_mut(&connection)
@@ -3293,51 +3299,39 @@ impl Store {
                     {
                         if let Operation::Put(put) = &mut open.operation {
                             put.pending = put.pending.saturating_sub(1);
-                            if failed {
-                                put.cancelled = true;
-                            }
                             open.progress = Instant::now();
-                            drained = put.pending == 0 && put.cancelled;
+                            attached = true;
                         }
                     }
+                    let mut detached_drained = false;
                     if let Some(put) = self.detached_puts.get_mut(&(connection, transfer)) {
                         put.pending = put.pending.saturating_sub(1);
                         if failed {
                             put.cancelled = true;
                         }
-                        drained |= put.pending == 0 && put.cancelled;
-                    }
-                    if drained {
-                        if let Some(put) = self.detached_puts.remove(&(connection, transfer)) {
-                            self.finish_detached_put(
-                                self.sessions
-                                    .get(&connection)
-                                    .and_then(|session| session.namespace),
-                                put,
-                            );
-                        } else if let Some(open) = self
-                            .sessions
-                            .get_mut(&connection)
-                            .and_then(|session| session.ops.remove(&transfer))
-                        {
-                            if let Operation::Put(put) = open.operation {
-                                self.finish_put_drain(connection, transfer, *put);
-                            }
-                        }
+                        detached_drained = put.pending == 0 && put.cancelled;
                     }
                     if failed {
-                        if let Some(open) = self
-                            .sessions
-                            .get_mut(&connection)
-                            .and_then(|session| session.ops.get_mut(&transfer))
-                        {
-                            if let Operation::Put(put) = &mut open.operation {
-                                put.terminal = true;
-                                put.outbox.push_back(Ok(PutAnswer::Refused(Refused {
-                                    reason: crosscache::Reason::Io as u8,
-                                    detail: "streaming disk write failed".into(),
-                                })));
+                        if attached {
+                            self.fail_put(
+                                connection,
+                                transfer,
+                                crosscache::Reason::Io as u8,
+                                invalid("streaming disk write failed"),
+                            );
+                            self.settle_put(connection, transfer);
+                        } else if detached_drained {
+                            if let Some(put) = self.detached_puts.remove(&(connection, transfer)) {
+                                let id = put.namespace;
+                                self.finish_detached_put(Some(id), put);
                             }
+                        }
+                    } else if attached {
+                        self.settle_put(connection, transfer);
+                    } else if detached_drained {
+                        if let Some(put) = self.detached_puts.remove(&(connection, transfer)) {
+                            let id = put.namespace;
+                            self.finish_detached_put(Some(id), put);
                         }
                     }
                 }
@@ -3346,10 +3340,21 @@ impl Store {
                     transfer,
                     final_extent,
                 } => {
-                    let attached = self
+                    let mut attached = false;
+                    if let Some(open) = self
                         .sessions
-                        .get(&connection)
-                        .is_some_and(|session| session.ops.contains_key(&transfer));
+                        .get_mut(&connection)
+                        .and_then(|session| session.ops.get_mut(&transfer))
+                    {
+                        if let Operation::Put(put) = &mut open.operation {
+                            put.pending = put.pending.saturating_sub(1);
+                            open.progress = Instant::now();
+                            attached = true;
+                        }
+                    }
+                    if let Some(put) = self.detached_puts.get_mut(&(connection, transfer)) {
+                        put.pending = put.pending.saturating_sub(1);
+                    }
                     if failed {
                         self.metrics.puts_error += 1;
                         if attached {
@@ -3359,7 +3364,7 @@ impl Store {
                                 crosscache::Reason::Io as u8,
                                 invalid("streaming disk write failed"),
                             );
-                            self.cancel_after_finish(connection, transfer);
+                            self.settle_put(connection, transfer);
                         } else if let Some(put) = self.detached_puts.remove(&(connection, transfer))
                         {
                             let id = put.namespace;
@@ -3418,31 +3423,38 @@ impl Store {
         }
     }
 
-    fn cancel_after_finish(&mut self, connection: u64, transfer: u64) {
-        let Some(open) = self
-            .sessions
-            .get_mut(&connection)
-            .and_then(|session| session.ops.remove(&transfer))
-        else {
+    fn settle_put(&mut self, connection: u64, transfer: u64) {
+        let released = {
+            let Some(open) = self
+                .sessions
+                .get_mut(&connection)
+                .and_then(|session| session.ops.get_mut(&transfer))
+            else {
+                return;
+            };
+            let Operation::Put(put) = &mut open.operation else {
+                return;
+            };
+            if !put.terminal || put.finished || put.pending > 0 {
+                return;
+            }
+            put.finished = true;
+            Some((
+                put.namespace,
+                std::mem::take(&mut put.pins),
+                put.header.key,
+                put.reservation,
+            ))
+        };
+        let Some((id, pins, key, reservation)) = released else {
             return;
         };
-        if let Operation::Put(mut put) = open.operation {
-            if put.pending == 0 {
-                self.finish_put_drain(connection, transfer, *put);
-            } else {
-                put.finished = true;
-                self.retired_puts.push(PutDrain {
-                    connection,
-                    transfer,
-                    namespace: self.sessions[&connection].namespace.unwrap(),
-                    key: put.header.key,
-                    pins: put.pins,
-                    pending: put.pending,
-                    reservation: put.reservation,
-                    _temporary: put.temporary,
-                });
-            }
+        let namespace = self.namespaces.get_mut(&id).unwrap();
+        for key in &pins {
+            let _ = namespace.tree.unpin(key);
         }
+        namespace.inflight.remove(&key);
+        self.charged = self.charged.saturating_sub(reservation);
     }
 
     fn pump_reads(&mut self) {
@@ -3741,6 +3753,7 @@ impl Store {
         };
         if worker.sender.try_send(task).is_ok() {
             put.finalizing = true;
+            put.pending += 1;
             self.jobs.insert(
                 job,
                 Job::Finish {
@@ -3784,6 +3797,7 @@ impl Store {
         };
         if worker.sender.try_send(task).is_ok() {
             put.finalizing = true;
+            put.pending += 1;
             self.jobs.insert(
                 job,
                 Job::Finish {
@@ -3885,6 +3899,7 @@ impl Store {
         self.dispatch();
         self.pump_grants();
         self.cleanup_turn();
+        self.settle_terminal_puts();
         self.schedule();
         self.tick();
         self.maybe_finish_gets();

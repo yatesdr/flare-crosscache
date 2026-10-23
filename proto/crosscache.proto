@@ -75,7 +75,7 @@ message WindowGrant {
   uint64 record_offset = 4;         // record-relative, multiple of 4096
   uint64 length = 5;                // multiple of 4096, 1..=64 whole pages and/or the row
   WindowRef memory = 6;
-  uint64 page_first = 7;            // absolute page index within the record; row grants: 0
+  uint64 page_first = 7;            // page index within the chain (the key's full page span); row grants: 0
   uint32 page_count = 8;            // 0 only for a row-only grant
   bool row = 9;                     // this grant carries the whole row
 }

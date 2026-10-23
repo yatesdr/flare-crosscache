@@ -1363,3 +1363,60 @@ async fn l0_30_committed_detached_put_finishes() {
     let subscription = check.subscribe().await;
     assert!(subscription.entries.contains_key(&key(512 * 64)));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_31_timed_out_publication_finishes_instead_of_orphaning() {
+    let base = base("timeout-publish");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("timeout-publish");
+    config.faults.pause_at = Some("before_rename".into());
+    let signal = base.join("gate");
+    config.faults.signal = Some(signal.clone());
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let task = tokio::spawn(async move { client.put(key(128), None, PutOptions::default()).await });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !signal.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "publication never reached before_rename"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Let the 3 s no-progress timer end the call while the rename is paused.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(host.durable_records(), 0);
+    fs::remove_file(&signal).unwrap();
+    let outcome = task.await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            PutOutcome::Status(_) | PutOutcome::Cancelled | PutOutcome::Abandoned
+        ),
+        "{outcome:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.durable_records() != 1 {
+        assert!(Instant::now() < deadline, "publication did not complete");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut check = host.client().await;
+    let subscription = check.subscribe().await;
+    assert!(subscription.entries.contains_key(&key(128)));
+    // Recovery must find exactly the record the catalog announced.
+    drop(subscription);
+    drop(check);
+    host.stop();
+    eprintln!("l0_31: stopped");
+    host.start();
+    let mut after = host.client().await;
+    let subscription = after.subscribe().await;
+    assert_eq!(subscription.entries.len(), 1);
+    assert!(subscription.entries.contains_key(&key(128)));
+}
