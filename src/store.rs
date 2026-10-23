@@ -2834,7 +2834,14 @@ impl Store {
         kind: ReadKind,
         data: Option<Extent>,
     ) {
-        if !self.has_op(connection, transfer) {
+        let terminal = self
+            .sessions
+            .get(&connection)
+            .and_then(|session| session.ops.get(&transfer))
+            .is_none_or(|open| {
+                matches!(&open.operation, Operation::Get(get) if get.terminal || get.finished)
+            });
+        if terminal {
             self.drain_get_read(connection, transfer);
             return;
         }
@@ -3023,7 +3030,14 @@ impl Store {
     }
 
     fn read_failed(&mut self, connection: u64, transfer: u64) {
-        if !self.has_op(connection, transfer) {
+        let terminal = self
+            .sessions
+            .get(&connection)
+            .and_then(|session| session.ops.get(&transfer))
+            .is_none_or(|open| {
+                matches!(&open.operation, Operation::Get(get) if get.terminal || get.finished)
+            });
+        if terminal {
             self.drain_get_read(connection, transfer);
             return;
         }

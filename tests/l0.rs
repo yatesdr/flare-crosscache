@@ -1854,3 +1854,32 @@ async fn l0_42_cancel_before_dispatch_withdraws_the_put() {
     // The withdrawn Put must not leave INFLIGHT behind.
     let _ = fresh.store(key(128), None).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_43_failed_get_drains_release_every_pin() {
+    let mut host = Host::new(4096, 64 * 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    client.store(key(256), Some(key(128))).await;
+    host.durable(2);
+    let directory = host
+        .config
+        .root
+        .as_ref()
+        .unwrap()
+        .join(client.descriptor.name());
+    for value in [key(128), key(256)] {
+        fs::write(directory.join(record::file_name(&value)), b"").unwrap();
+    }
+    // Two streamed records mean two reads are in flight; the first failure
+    // starts the drain, and the second completion must decrement it.
+    let outcome = client
+        .get(&[key(128), key(256)], 0, 4, GetOptions::default())
+        .await;
+    assert!(
+        matches!(outcome, GetOutcome::Refused(reason) if reason == crosscache::Reason::Io as u8),
+        "{outcome:?}"
+    );
+    host.wait(|host| host.gauge("cleanup_records") == 0 && host.gauge("leases") == 0);
+}
