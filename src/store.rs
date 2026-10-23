@@ -278,10 +278,29 @@ pub struct Session {
     pub budget: TokenBucket,
 }
 
+const SNAPSHOT_BUFFER: usize = 65_536;
+
+#[derive(Clone)]
+enum LiveEvent {
+    Catalog {
+        kind: u8,
+        key: Key,
+        entry: Option<EntryData>,
+    },
+    Room {
+        bytes: u64,
+    },
+}
+
 struct Subscription {
     namespace: NamespaceId,
     sender: tokio::sync::mpsc::Sender<crosscache::CatalogEvent>,
     sequence: u64,
+    seq0: u64,
+    snapshot: Option<VecDeque<EntryData>>,
+    begin_pending: bool,
+    buffered: VecDeque<LiveEvent>,
+    restarts: usize,
 }
 
 enum ReadKind {
@@ -4065,6 +4084,7 @@ impl Store {
         self.maybe_finish_gets();
         self.flush_outboxes();
         self.flush_events();
+        self.pump_subscriptions();
         self.local_exits();
     }
 
@@ -4100,10 +4120,10 @@ impl Store {
             match event {
                 StoreEvent::Catalog {
                     namespace,
-                    seq,
                     kind,
                     key,
                     entry,
+                    ..
                 } => {
                     let mut subscribers: Vec<u64> = self
                         .subscriptions
@@ -4113,54 +4133,185 @@ impl Store {
                         .collect();
                     subscribers.sort_unstable();
                     for connection in subscribers {
-                        let Some(subscription) = self.subscriptions.get_mut(&connection) else {
-                            continue;
+                        let live = LiveEvent::Catalog {
+                            kind,
+                            key,
+                            entry: entry.clone(),
                         };
-                        subscription.sequence += 1;
-                        let sequence = subscription.sequence;
-                        let value = match kind {
-                            2 => crosscache::CatalogEvent {
-                                sequence,
-                                event: Some(crosscache::catalog_event::Event::Removed(
-                                    crate::control::key_to_proto(&key),
-                                )),
-                            },
-                            _ => {
-                                let Some(entry) = entry.clone() else {
-                                    continue;
-                                };
-                                let proto = crate::control::entry_to_proto(&entry);
-                                crosscache::CatalogEvent {
-                                    sequence,
-                                    event: Some(if kind == 0 {
-                                        crosscache::catalog_event::Event::Added(proto)
-                                    } else {
-                                        crosscache::catalog_event::Event::Changed(proto)
-                                    }),
-                                }
-                            }
-                        };
-                        if subscription.sender.try_send(value).is_err() {
-                            self.subscriptions.remove(&connection);
+                        if self.buffer_or_send(connection, live) {
+                            self.restart_snapshot(connection);
                         }
                     }
-                    let _ = seq;
                 }
                 StoreEvent::Room { connection, bytes } => {
-                    let Some(subscription) = self.subscriptions.get_mut(&connection) else {
-                        continue;
-                    };
-                    subscription.sequence += 1;
-                    let value = crosscache::CatalogEvent {
-                        sequence: subscription.sequence,
-                        event: Some(crosscache::catalog_event::Event::Room(crosscache::Room {
-                            bytes,
-                        })),
-                    };
-                    if subscription.sender.try_send(value).is_err() {
-                        self.subscriptions.remove(&connection);
+                    if self.buffer_or_send(connection, LiveEvent::Room { bytes }) {
+                        self.restart_snapshot(connection);
                     }
                 }
+            }
+        }
+    }
+
+    /// Queues a live event behind an in-progress snapshot, or sends it when the
+    /// snapshot has ended. Returns true when the snapshot buffer overflowed.
+    fn buffer_or_send(&mut self, connection: u64, live: LiveEvent) -> bool {
+        let action = {
+            let Some(subscription) = self.subscriptions.get_mut(&connection) else {
+                return false;
+            };
+            if subscription.snapshot.is_some() {
+                if subscription.buffered.len() >= SNAPSHOT_BUFFER {
+                    Some(None)
+                } else {
+                    subscription.buffered.push_back(live);
+                    None
+                }
+            } else {
+                Some(Some(live))
+            }
+        };
+        match action {
+            None => false,
+            Some(None) => true,
+            Some(Some(live)) => {
+                self.send_live(connection, live);
+                false
+            }
+        }
+    }
+
+    fn send_live(&mut self, connection: u64, live: LiveEvent) {
+        let mut remove = false;
+        {
+            let Some(subscription) = self.subscriptions.get_mut(&connection) else {
+                return;
+            };
+            let sequence = subscription.sequence;
+            if let Some(value) = live_event(&live, sequence) {
+                subscription.sequence += 1;
+                if subscription.sender.try_send(value).is_err() {
+                    remove = true;
+                }
+            }
+        }
+        if remove {
+            self.subscriptions.remove(&connection);
+        }
+    }
+
+    fn restart_snapshot(&mut self, connection: u64) {
+        let Some(namespace) = self
+            .subscriptions
+            .get(&connection)
+            .map(|subscription| subscription.namespace)
+        else {
+            return;
+        };
+        let Some((seq0, entries)) = self.snapshot(namespace) else {
+            return;
+        };
+        if let Some(subscription) = self.subscriptions.get_mut(&connection) {
+            subscription.seq0 = seq0;
+            subscription.sequence = seq0 + 1;
+            subscription.snapshot = Some(entries.into());
+            subscription.begin_pending = true;
+            subscription.buffered.clear();
+            subscription.restarts += 1;
+        }
+    }
+
+    fn pump_subscriptions(&mut self) {
+        let connections: Vec<u64> = self.subscriptions.keys().copied().collect();
+        for connection in connections {
+            let mut remove = false;
+            {
+                let Some(subscription) = self.subscriptions.get_mut(&connection) else {
+                    continue;
+                };
+                let mut blocked = false;
+                if subscription.begin_pending {
+                    let value = crosscache::CatalogEvent {
+                        sequence: subscription.sequence,
+                        event: Some(crosscache::catalog_event::Event::SnapshotBegin(
+                            crosscache::SnapshotBegin {
+                                seq0: subscription.seq0,
+                            },
+                        )),
+                    };
+                    match subscription.sender.try_send(value) {
+                        Ok(()) => {
+                            subscription.sequence += 1;
+                            subscription.begin_pending = false;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => blocked = true,
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => remove = true,
+                    }
+                }
+                if !blocked {
+                    if let Some(queue) = &mut subscription.snapshot {
+                        while let Some(entry) = queue.pop_front() {
+                            let value = crosscache::CatalogEvent {
+                                sequence: subscription.sequence,
+                                event: Some(crosscache::catalog_event::Event::Entry(
+                                    crate::control::entry_to_proto(&entry),
+                                )),
+                            };
+                            match subscription.sender.try_send(value) {
+                                Ok(()) => subscription.sequence += 1,
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    queue.push_front(entry);
+                                    blocked = true;
+                                    break;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    remove = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !blocked && queue.is_empty() {
+                            let value = crosscache::CatalogEvent {
+                                sequence: subscription.sequence,
+                                event: Some(crosscache::catalog_event::Event::SnapshotEnd(
+                                    crosscache::SnapshotEnd {},
+                                )),
+                            };
+                            match subscription.sender.try_send(value) {
+                                Ok(()) => {
+                                    subscription.sequence += 1;
+                                    subscription.snapshot = None;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    blocked = true;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    remove = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !blocked && !remove {
+                    while let Some(live) = subscription.buffered.pop_front() {
+                        let Some(value) = live_event(&live, subscription.sequence) else {
+                            continue;
+                        };
+                        match subscription.sender.try_send(value) {
+                            Ok(()) => subscription.sequence += 1,
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                subscription.buffered.push_front(live);
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                remove = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if remove {
+                self.subscriptions.remove(&connection);
             }
         }
     }
@@ -4211,50 +4362,19 @@ impl Store {
         let (seq0, entries) = self
             .snapshot(namespace)
             .ok_or_else(|| invalid("namespace"))?;
-        let mut sequence = seq0 + 1;
         self.subscriptions.insert(
             connection,
             Subscription {
                 namespace,
-                sender: sender.clone(),
-                sequence,
+                sender,
+                sequence: seq0 + 1,
+                seq0,
+                snapshot: Some(entries.into()),
+                begin_pending: true,
+                buffered: VecDeque::new(),
+                restarts: 0,
             },
         );
-        let begin = crosscache::CatalogEvent {
-            sequence,
-            event: Some(crosscache::catalog_event::Event::SnapshotBegin(
-                crosscache::SnapshotBegin { seq0 },
-            )),
-        };
-        sequence += 1;
-        if sender.try_send(begin).is_err() {
-            self.subscriptions.remove(&connection);
-            return Err(invalid("subscription backlog"));
-        }
-        for entry in entries {
-            let value = crosscache::CatalogEvent {
-                sequence,
-                event: Some(crosscache::catalog_event::Event::Entry(
-                    crate::control::entry_to_proto(&entry),
-                )),
-            };
-            sequence += 1;
-            if sender.try_send(value).is_err() {
-                self.subscriptions.remove(&connection);
-                return Err(invalid("subscription backlog"));
-            }
-        }
-        let end = crosscache::CatalogEvent {
-            sequence,
-            event: Some(crosscache::catalog_event::Event::SnapshotEnd(
-                crosscache::SnapshotEnd {},
-            )),
-        };
-        if sender.try_send(end).is_err() {
-            self.subscriptions.remove(&connection);
-            return Err(invalid("subscription backlog"));
-        }
-        self.subscriptions.get_mut(&connection).unwrap().sequence = sequence;
         Ok(())
     }
 
@@ -4560,6 +4680,34 @@ pub enum StoreCommand {
     Peer(PeerEvent),
     Tick,
     Shutdown,
+}
+
+fn live_event(live: &LiveEvent, sequence: u64) -> Option<crosscache::CatalogEvent> {
+    match live {
+        LiveEvent::Catalog { kind, key, entry } => {
+            let event = if *kind == 2 {
+                crosscache::catalog_event::Event::Removed(crate::control::key_to_proto(key))
+            } else {
+                let entry = entry.as_ref()?;
+                let proto = crate::control::entry_to_proto(entry);
+                if *kind == 0 {
+                    crosscache::catalog_event::Event::Added(proto)
+                } else {
+                    crosscache::catalog_event::Event::Changed(proto)
+                }
+            };
+            Some(crosscache::CatalogEvent {
+                sequence,
+                event: Some(event),
+            })
+        }
+        LiveEvent::Room { bytes } => Some(crosscache::CatalogEvent {
+            sequence,
+            event: Some(crosscache::catalog_event::Event::Room(crosscache::Room {
+                bytes: *bytes,
+            })),
+        }),
+    }
 }
 
 fn region_wire(region: Region) -> i32 {
@@ -5029,6 +5177,111 @@ mod tests {
         assert!(store.evict_memory(id, root_key));
         assert_eq!(store.charged, 0);
         assert!(store.namespaces[&id].tree.node(&root_key).is_none());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn large_snapshot_streams_incrementally_and_restarts_on_overflow() {
+        let (mut store, directory) = store("snapshot");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let generation = store.sessions[&1].generation;
+        let total = 70_000u64;
+        let mut parent = None;
+        for index in 0..total {
+            let key = Key {
+                consumed_tokens: (index + 1) * 64,
+                digest: (index as u128).to_le_bytes(),
+            };
+            let header = Header::new(&value, key, parent, [0; 16], 1).unwrap();
+            store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .insert(
+                    key,
+                    parent,
+                    [0; 16],
+                    1,
+                    true,
+                    Location {
+                        header,
+                        memory: None,
+                        disk: None,
+                        durable: false,
+                        writing: false,
+                        retry: Instant::now(),
+                        bytes: 0,
+                    },
+                )
+                .unwrap();
+            parent = Some(key);
+        }
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+        store
+            .subscribe(1, id, generation, value.clone(), sender)
+            .unwrap();
+        // The channel is not filled by subscribe; the snapshot is pumped.
+        assert!(receiver.try_recv().is_err());
+        let mut begin = 0;
+        let mut entries = 0;
+        let mut end = 0;
+        let mut sequence = 0;
+        while end == 0 {
+            store.pump_subscriptions();
+            while let Ok(event) = receiver.try_recv() {
+                assert_eq!(event.sequence, sequence + 1);
+                sequence = event.sequence;
+                match event.event.unwrap() {
+                    crosscache::catalog_event::Event::SnapshotBegin(_) => begin += 1,
+                    crosscache::catalog_event::Event::Entry(_) => entries += 1,
+                    crosscache::catalog_event::Event::SnapshotEnd(_) => end += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(begin, 1);
+        assert_eq!(entries, total as usize);
+        assert_eq!(end, 1);
+        // A live event after SnapshotEnd continues the sequence.
+        store.delta(id, 0, parent.unwrap());
+        store.flush_events();
+        store.pump_subscriptions();
+        let live = receiver.try_recv().unwrap();
+        assert_eq!(live.sequence, sequence + 1);
+
+        // More mutations than the buffer can hold restart the snapshot at a new
+        // boundary rather than dropping events.
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        store
+            .subscribe(1, id, generation, value.clone(), sender)
+            .unwrap();
+        for _ in 0..=SNAPSHOT_BUFFER {
+            store.delta(id, 0, parent.unwrap());
+        }
+        store.flush_events();
+        let subscription = &store.subscriptions[&1];
+        assert!(subscription.restarts >= 1);
+        assert!(subscription.begin_pending);
+        assert!(subscription.buffered.len() <= SNAPSHOT_BUFFER);
+        let mut end = 0;
+        let mut entries = 0;
+        while end == 0 {
+            store.pump_subscriptions();
+            while let Ok(event) = receiver.try_recv() {
+                match event.event.unwrap() {
+                    crosscache::catalog_event::Event::Entry(_) => entries += 1,
+                    crosscache::catalog_event::Event::SnapshotEnd(_) => end += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(entries, total as usize);
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }
