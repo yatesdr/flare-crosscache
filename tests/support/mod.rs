@@ -352,6 +352,8 @@ pub enum CancelAt {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PutOptions {
     pub cancel: Option<CancelAt>,
+    pub cancel_after_fills: Option<u32>,
+    pub abort_after_commit: bool,
     pub early_commit: bool,
     pub skip_filled: bool,
     pub corrupt_page: Option<usize>,
@@ -363,6 +365,7 @@ pub enum PutOutcome {
     Stored(Vec<u8>),
     Refused(u8),
     Cancelled,
+    Abandoned,
     Status(Status),
 }
 
@@ -372,6 +375,7 @@ impl PartialEq for PutOutcome {
             (Self::Stored(left), Self::Stored(right)) => left == right,
             (Self::Refused(left), Self::Refused(right)) => left == right,
             (Self::Cancelled, Self::Cancelled) => true,
+            (Self::Abandoned, Self::Abandoned) => true,
             (Self::Status(left), Self::Status(right)) => {
                 left.code() == right.code() && left.message() == right.message()
             }
@@ -681,6 +685,19 @@ impl Client {
                         };
                     }
                     covered += grant.length;
+                    if options
+                        .cancel_after_fills
+                        .is_some_and(|fills| grants >= fills)
+                    {
+                        let _ = sender
+                            .send(PutMessage {
+                                m: Some(put_message::M::Cancel(crosscache::Cancel {})),
+                            })
+                            .await;
+                        let _ = tokio::time::timeout(Duration::from_millis(500), replies.message())
+                            .await;
+                        return PutOutcome::Cancelled;
+                    }
                     let header = header.clone();
                     let payload = header.length_with_row() - header.page_segment;
                     if !commit_sent
@@ -725,6 +742,12 @@ impl Client {
                             }
                         }
                         commit_sent = true;
+                        if options.abort_after_commit {
+                            // Let the request body flush so the manager owns the
+                            // committed Put before this stream disappears.
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            return PutOutcome::Abandoned;
+                        }
                         if options.cancel == Some(CancelAt::Commit) {
                             let _ = sender
                                 .send(PutMessage {

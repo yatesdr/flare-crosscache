@@ -2058,61 +2058,65 @@ impl Store {
                 offset: plan.record_offset,
                 data: extent.clone(),
             };
-            self.jobs.insert(
-                job,
-                Job::Chunk {
-                    connection,
-                    transfer,
+            enum ChunkAction {
+                Sent,
+                Blocked(Arc<Extent>),
+                Failed,
+            }
+            let action = match &self.namespaces[&namespace].disk {
+                Some(worker) => match worker.sender.try_send(task) {
+                    Ok(()) => ChunkAction::Sent,
+                    Err(std::sync::mpsc::TrySendError::Full(task)) => {
+                        if let Task::Chunk { data, .. } = task {
+                            ChunkAction::Blocked(data)
+                        } else {
+                            ChunkAction::Failed
+                        }
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => ChunkAction::Failed,
                 },
-            );
-            let blocked = {
-                let Some(open) = self
-                    .sessions
-                    .get_mut(&connection)
-                    .and_then(|session| session.ops.get_mut(&transfer))
-                else {
-                    return Ok(());
-                };
-                let Operation::Put(put) = &mut open.operation else {
-                    return Ok(());
-                };
-                put.pending += 1;
-                let Some(worker) = &self.namespaces[&namespace].disk else {
-                    put.pending -= 1;
-                    self.jobs.remove(&job);
+                None => ChunkAction::Failed,
+            };
+            match action {
+                ChunkAction::Sent => {
+                    self.jobs.insert(
+                        job,
+                        Job::Chunk {
+                            connection,
+                            transfer,
+                        },
+                    );
+                    if let Some(open) = self
+                        .sessions
+                        .get_mut(&connection)
+                        .and_then(|session| session.ops.get_mut(&transfer))
+                    {
+                        if let Operation::Put(put) = &mut open.operation {
+                            put.pending += 1;
+                        }
+                    }
+                    self.config.faults.checkpoint("data");
+                }
+                ChunkAction::Blocked(data) => {
+                    if let Some(open) = self
+                        .sessions
+                        .get_mut(&connection)
+                        .and_then(|session| session.ops.get_mut(&transfer))
+                    {
+                        if let Operation::Put(put) = &mut open.operation {
+                            put.blocked.push_back((job, plan.record_offset, data));
+                        }
+                    }
+                }
+                ChunkAction::Failed => {
                     self.fail_put(
                         connection,
                         transfer,
                         crosscache::Reason::Io as u8,
-                        invalid("no disk"),
+                        invalid("disk worker stopped"),
                     );
-                    return Ok(());
-                };
-                match worker.sender.try_send(task) {
-                    Ok(()) => {
-                        self.config.faults.checkpoint("data");
-                        false
-                    }
-                    Err(std::sync::mpsc::TrySendError::Full(task)) => {
-                        if let Task::Chunk { data, .. } = task {
-                            put.blocked.push_back((job, plan.record_offset, data));
-                        }
-                        true
-                    }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        put.pending -= 1;
-                        self.jobs.remove(&job);
-                        self.fail_put(
-                            connection,
-                            transfer,
-                            crosscache::Reason::Io as u8,
-                            invalid("disk worker stopped"),
-                        );
-                        return Ok(());
-                    }
                 }
-            };
-            let _ = blocked;
+            }
         } else {
             let _ = self.local.release(connection, transfer, index);
         }
@@ -2950,6 +2954,7 @@ impl Store {
                     return;
                 }
                 put.cancelled = true;
+                put.blocked.clear();
                 if put.pending == 0 {
                     self.finish_put_drain(connection, transfer, *put);
                 } else {
@@ -3022,6 +3027,7 @@ impl Store {
                         continue;
                     }
                     let mut put = *put;
+                    put.blocked.clear();
                     if put.pending == 0 {
                         self.finish_detached_put(id, put);
                     } else {
@@ -3476,24 +3482,21 @@ impl Store {
                         let Some((job, offset, data)) = put.blocked.pop_front() else {
                             break;
                         };
-                        Some((job, offset, data))
+                        put.temporary
+                            .clone()
+                            .map(|temporary| (job, offset, data, temporary))
                     };
-                    let Some((job, offset, data)) = next else {
+                    let Some((job, offset, data, temporary)) = next else {
                         break;
                     };
                     let namespace = self.sessions[&connection].namespace.unwrap();
                     let Some(worker) = &self.namespaces[&namespace].disk else {
-                        break;
-                    };
-                    let Some(temporary) = self
-                        .sessions
-                        .get(&connection)
-                        .and_then(|session| session.ops.get(&transfer))
-                        .and_then(|open| match &open.operation {
-                            Operation::Put(put) => put.temporary.clone(),
-                            Operation::Get(_) => None,
-                        })
-                    else {
+                        self.fail_put(
+                            connection,
+                            transfer,
+                            crosscache::Reason::Io as u8,
+                            invalid("no disk"),
+                        );
                         break;
                     };
                     let task = Task::Chunk {
@@ -3503,24 +3506,106 @@ impl Store {
                         data: data.clone(),
                     };
                     match worker.sender.try_send(task) {
-                        Ok(()) => {}
-                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                            let put = match &mut self
+                        Ok(()) => {
+                            self.jobs.insert(
+                                job,
+                                Job::Chunk {
+                                    connection,
+                                    transfer,
+                                },
+                            );
+                            if let Some(open) = self
                                 .sessions
                                 .get_mut(&connection)
-                                .unwrap()
-                                .ops
-                                .get_mut(&transfer)
-                                .unwrap()
-                                .operation
+                                .and_then(|session| session.ops.get_mut(&transfer))
                             {
-                                Operation::Put(put) => put,
-                                Operation::Get(_) => break,
-                            };
-                            put.blocked.push_front((job, offset, data));
+                                if let Operation::Put(put) = &mut open.operation {
+                                    put.pending += 1;
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::TrySendError::Full(task)) => {
+                            if let Task::Chunk { data, .. } = task {
+                                if let Some(open) = self
+                                    .sessions
+                                    .get_mut(&connection)
+                                    .and_then(|session| session.ops.get_mut(&transfer))
+                                {
+                                    if let Operation::Put(put) = &mut open.operation {
+                                        put.blocked.push_front((job, offset, data));
+                                    }
+                                }
+                            }
                             break;
                         }
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            self.fail_put(
+                                connection,
+                                transfer,
+                                crosscache::Reason::Io as u8,
+                                invalid("disk worker stopped"),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let detached: Vec<(u64, u64)> = self.detached_puts.keys().copied().collect();
+        for (connection, transfer) in detached {
+            loop {
+                let next = {
+                    let Some(put) = self.detached_puts.get_mut(&(connection, transfer)) else {
+                        break;
+                    };
+                    let Some((job, offset, data)) = put.blocked.pop_front() else {
+                        break;
+                    };
+                    put.temporary
+                        .clone()
+                        .map(|temporary| (job, offset, data, temporary, put.namespace))
+                };
+                let Some((job, offset, data, temporary, namespace)) = next else {
+                    break;
+                };
+                let Some(worker) = &self.namespaces[&namespace].disk else {
+                    if let Some(put) = self.detached_puts.remove(&(connection, transfer)) {
+                        self.finish_detached_put(Some(namespace), put);
+                    }
+                    break;
+                };
+                let task = Task::Chunk {
+                    id: job,
+                    temporary,
+                    offset,
+                    data: data.clone(),
+                };
+                match worker.sender.try_send(task) {
+                    Ok(()) => {
+                        self.jobs.insert(
+                            job,
+                            Job::Chunk {
+                                connection,
+                                transfer,
+                            },
+                        );
+                        if let Some(put) = self.detached_puts.get_mut(&(connection, transfer)) {
+                            put.pending += 1;
+                        }
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(task)) => {
+                        if let Task::Chunk { data, .. } = task {
+                            if let Some(put) = self.detached_puts.get_mut(&(connection, transfer)) {
+                                put.blocked.push_front((job, offset, data));
+                            }
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        if let Some(put) = self.detached_puts.remove(&(connection, transfer)) {
+                            self.finish_detached_put(Some(namespace), put);
+                        }
+                        break;
                     }
                 }
             }
@@ -3591,7 +3676,7 @@ impl Store {
                 .ops
                 .iter()
                 .filter(|(_, open)| {
-                    matches!(&open.operation, Operation::Put(put) if put.committed && put.metadata.is_some() && put.pending == 0 && put.temporary.is_some() && !put.terminal && !put.finalizing)
+                    matches!(&open.operation, Operation::Put(put) if put.committed && put.metadata.is_some() && put.pending == 0 && put.blocked.is_empty() && put.temporary.is_some() && !put.terminal && !put.finalizing)
                 })
                 .map(|(transfer, _)| *transfer)
                 .collect();
@@ -3604,7 +3689,8 @@ impl Store {
             let Some(put) = self.detached_puts.get(&(connection, transfer)) else {
                 continue;
             };
-            if put.committed && put.metadata.is_some() && put.pending == 0 {
+            if put.committed && put.metadata.is_some() && put.pending == 0 && put.blocked.is_empty()
+            {
                 let id = self.namespaces.keys().next().copied();
                 if let Some(id) = id {
                     self.schedule_detached_finish(connection, transfer, id);

@@ -1279,3 +1279,87 @@ async fn l0_28_rootless_eviction_skips_internal_nodes() {
     let subscription = client.subscribe().await;
     assert!(subscription.entries.contains_key(&key(256)));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_29_cancel_retires_blocked_chunks() {
+    let base = base("blocked");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("blocked");
+    config.faults.delay_ms = 300;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let outcome = client
+        .put(
+            key(1024 * 64),
+            None,
+            PutOptions {
+                cancel_after_fills: Some(12),
+                ..PutOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(outcome, PutOutcome::Cancelled);
+    // The cancelled Put must release INFLIGHT and its reservation; blocked
+    // chunks that were never submitted must not hold the drain open.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut probe = host.client().await;
+    loop {
+        let outcome = probe
+            .put(
+                key(1024 * 64),
+                None,
+                PutOptions {
+                    cancel: Some(CancelAt::Accept),
+                    ..PutOptions::default()
+                },
+            )
+            .await;
+        match outcome {
+            PutOutcome::Refused(reason) if reason == crosscache::Reason::Inflight as u8 => {
+                assert!(Instant::now() < deadline, "INFLIGHT did not drain");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            PutOutcome::Cancelled => break,
+            other => panic!("unexpected probe outcome: {other:?}"),
+        }
+    }
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_30_committed_detached_put_finishes() {
+    let base = base("detached");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("detached");
+    config.faults.delay_ms = 100;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let outcome = client
+        .put(
+            key(512 * 64),
+            None,
+            PutOptions {
+                abort_after_commit: true,
+                ..PutOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(outcome, PutOutcome::Abandoned);
+    drop(client);
+    host.wait(|host| host.durable_records() == 1);
+    let mut check = host.client().await;
+    let subscription = check.subscribe().await;
+    assert!(subscription.entries.contains_key(&key(512 * 64)));
+}
