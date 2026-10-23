@@ -3589,6 +3589,7 @@ impl Store {
                         put.pending = put.pending.saturating_sub(1);
                         if failed {
                             put.cancelled = true;
+                            put.blocked.clear();
                         }
                         detached_drained = put.pending == 0 && put.cancelled;
                     }
@@ -3854,6 +3855,9 @@ impl Store {
                     let Some(put) = self.detached_puts.get_mut(&(connection, transfer)) else {
                         break;
                     };
+                    if put.cancelled {
+                        break;
+                    }
                     let Some((job, offset, data)) = put.blocked.pop_front() else {
                         break;
                     };
@@ -5287,6 +5291,48 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
         );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cancelled_detached_puts_do_not_submit_blocked_chunks() {
+        let (mut store, base, directory) = store_with_root("detached-blocked", 4096);
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 128,
+                    digest: [10; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 2,
+                published_tail_pages: 2,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch_trace();
+        let open = store.sessions.get_mut(&1).unwrap().ops.remove(&1).unwrap();
+        let Operation::Put(put) = open.operation else {
+            panic!("expected Put");
+        };
+        let mut put = *put;
+        put.cancelled = true;
+        put.blocked
+            .push_back((777, 0, Arc::new(store.staging.allocate(4096).unwrap())));
+        store.detached_puts.insert((1, 1), put);
+        store.pump_chunks();
+        assert!(!store.jobs.contains_key(&777));
+        assert_eq!(store.detached_puts[&(1, 1)].blocked.len(), 1);
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);
