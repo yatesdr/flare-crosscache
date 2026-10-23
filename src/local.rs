@@ -820,6 +820,16 @@ impl Local {
             .filter(|bytes| *bytes != 0)
     }
 
+    /// Clears and returns the armed reservation without checking capacity. The
+    /// store uses this when it has already accounted for eviction and region
+    /// requirements itself.
+    pub fn take_armed(&mut self, connection: u64) -> Option<u64> {
+        let record = self.connections.get_mut(&connection)?;
+        let bytes = record.armed;
+        record.armed = 0;
+        (bytes != 0).then_some(bytes)
+    }
+
     /// Returns the armed reservation once capacity can admit it, clearing the arming.
     /// The caller emits `Room`; this never allocates.
     pub fn take_room(&mut self, connection: u64) -> Option<u64> {

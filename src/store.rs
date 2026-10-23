@@ -4155,15 +4155,17 @@ impl Store {
                 && (self.memory.can_allocate(allocation as usize)
                     || free + self.evictable_memory() >= allocation);
             let capacity = if self.config.root.is_some() {
-                let staging_ok = allocation <= self.staging.capacity() as u64
-                    && self.staging.can_allocate(allocation as usize);
+                // A streamed record only needs room for one window to retry.
+                let staging_need = allocation.min(self.config.max_window_bytes.max(4096));
+                let staging_ok = staging_need <= self.staging.capacity() as u64
+                    && self.staging.can_allocate(staging_need as usize);
                 self.charge_total().saturating_add(bytes) <= self.config.nvme
                     && (memory_ok || staging_ok)
             } else {
                 memory_ok
             };
             if budget_ok && capacity {
-                if let Some(bytes) = self.local.take_room(connection) {
+                if let Some(bytes) = self.local.take_armed(connection) {
                     self.events.push(StoreEvent::Room { connection, bytes });
                 }
             }
@@ -5254,6 +5256,30 @@ mod tests {
         let store = Store::open(config).unwrap();
         let directory = PathBuf::from("/dev/shm/flare-crosscache").join(name);
         (store, base, directory)
+    }
+
+    #[test]
+    fn streaming_room_only_needs_a_window() {
+        let (mut store, base, directory) = store_with_root("room-window-stream", 4096);
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        // A record far larger than staging can still stream one window at a
+        // time, so Room must not require the whole record to fit.
+        store
+            .local
+            .arm_budget(1, crate::disk::ENVELOPE_BYTES + 16 * 1024 * 1024);
+        store.room();
+        assert!(
+            store
+                .events
+                .iter()
+                .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
