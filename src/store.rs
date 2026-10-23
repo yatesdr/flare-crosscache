@@ -1585,6 +1585,8 @@ impl Store {
                 return;
             };
             put.terminal = true;
+            // Ownership is ending; never submit unsent chunks afterwards.
+            put.blocked.clear();
             put.outbox.push_back(Ok(PutAnswer::Refused(Refused {
                 reason,
                 detail: error.to_string(),
@@ -3718,6 +3720,7 @@ impl Store {
                 return;
             }
             put.finished = true;
+            put.blocked.clear();
             Some((
                 put.namespace,
                 std::mem::take(&mut put.pins),
@@ -5535,6 +5538,59 @@ mod tests {
             sequence = event.sequence;
         }
         drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_puts_drop_unsent_chunks() {
+        let (mut store, base, directory) = store_with_root("failed-chunks", 4096);
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 128,
+                    digest: [9; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 2,
+                published_tail_pages: 2,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch_trace();
+        {
+            let operation = &mut store
+                .sessions
+                .get_mut(&1)
+                .unwrap()
+                .ops
+                .get_mut(&1)
+                .unwrap()
+                .operation;
+            let Operation::Put(put) = operation else {
+                panic!("expected Put");
+            };
+            put.blocked
+                .push_back((999, 0, Arc::new(store.staging.allocate(4096).unwrap())));
+        }
+        store.fail_put(1, 1, crosscache::Reason::Io as u8, invalid("test"));
+        let operation = &store.sessions[&1].ops[&1].operation;
+        let Operation::Put(put) = operation else {
+            panic!("expected Put");
+        };
+        assert!(put.blocked.is_empty());
+        store.pump_chunks();
+        assert!(store.jobs.keys().all(|job| *job != 999));
+        drop(store);
+        let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);
     }
 
