@@ -745,8 +745,70 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
         })
         .await
         .ok();
-    let status = replies.message().await.err().unwrap();
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    let refused = replies.message().await.unwrap().unwrap();
+    assert!(matches!(
+        refused.r,
+        Some(crosscache::put_reply::R::Refused(crosscache::Refused {
+            reason,
+            ..
+        })) if reason == crosscache::Reason::Invalid as i32
+    ));
+    drop(sender);
+    drop(replies);
+
+    // An empty Put stream is a terminal Refused{INVALID}, not a status.
+    let (empty_sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    drop(empty_sender);
+    let refused = replies.message().await.unwrap().unwrap();
+    assert!(matches!(
+        refused.r,
+        Some(crosscache::put_reply::R::Refused(crosscache::Refused {
+            reason,
+            ..
+        })) if reason == crosscache::Reason::Invalid as i32
+    ));
+
+    // LocalCache.Get must reject destinations as a terminal refusal too.
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .get(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::GetMessage {
+            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+                namespace_id: client.descriptor.namespace_id().to_vec(),
+                chain: vec![key_msg(key(128))],
+                skip_pages: 0,
+                expected_pages: 2,
+                row: true,
+                destinations: vec![crosscache::GetDestination {
+                    record: 0,
+                    region: crosscache::Region::Arena as i32,
+                    offset: 0,
+                    bytes: 4096,
+                }],
+                transfer: 0,
+            })),
+        })
+        .await
+        .unwrap();
+    let refused = replies.message().await.unwrap().unwrap();
+    assert!(matches!(
+        refused.r,
+        Some(crosscache::get_reply::R::Refused(crosscache::Refused {
+            reason,
+            ..
+        })) if reason == crosscache::Reason::Invalid as i32
+    ));
 }
 
 #[test]

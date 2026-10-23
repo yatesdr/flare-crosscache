@@ -570,9 +570,7 @@ async fn put_task(
     let first = match stream.message().await {
         Ok(Some(message)) => message,
         Ok(None) => {
-            let _ = output
-                .send(Err(Status::invalid_argument("empty Put stream")))
-                .await;
+            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
             return;
         }
         Err(status) => {
@@ -583,63 +581,49 @@ async fn put_task(
     let begin = match first.m {
         Some(put_message::M::Begin(begin)) => begin,
         _ => {
-            let _ = output
-                .send(Err(Status::invalid_argument("Put must start with begin")))
-                .await;
+            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
             return;
         }
     };
     let namespace: [u8; 32] = match begin.namespace_id.as_slice().try_into() {
         Ok(namespace) => namespace,
         Err(_) => {
-            let _ = output
-                .send(Err(Status::invalid_argument(
-                    "namespace id must be 32 bytes",
-                )))
-                .await;
+            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
             return;
         }
     };
     let descriptor = match descriptor_from_proto(begin.descriptor) {
         Ok(descriptor) => descriptor,
-        Err(status) => {
-            let _ = output.send(Err(status)).await;
+        Err(_) => {
+            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
             return;
         }
     };
     let key = match key_from_proto(begin.key) {
         Ok(key) => key,
-        Err(status) => {
-            let _ = output.send(Err(status)).await;
+        Err(_) => {
+            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
             return;
         }
     };
     let bucket: [u8; 16] = match begin.bucket.as_slice().try_into() {
         Ok(bucket) => bucket,
         Err(_) => {
-            let _ = output
-                .send(Err(Status::invalid_argument("bucket must be 16 bytes")))
-                .await;
+            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
             return;
         }
     };
     let chain_pages = match u32::try_from(begin.chain_pages) {
         Ok(pages) => pages,
         Err(_) => {
-            let _ = output
-                .send(Err(Status::invalid_argument("chain_pages overflow")))
-                .await;
+            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
             return;
         }
     };
     let tail_pages = match u32::try_from(begin.published_tail_pages) {
         Ok(pages) => pages,
         Err(_) => {
-            let _ = output
-                .send(Err(Status::invalid_argument(
-                    "published_tail_pages overflow",
-                )))
-                .await;
+            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
             return;
         }
     };
@@ -648,17 +632,13 @@ async fn put_task(
             if begin.published_parent.as_ref().is_some_and(|key| {
                 key.consumed_tokens == 0 && key.digest.iter().all(|byte| *byte == 0)
             }) {
-                let _ = output
-                    .send(Err(Status::invalid_argument(
-                        "present parent without a key",
-                    )))
-                    .await;
+                let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
                 return;
             }
             match key_from_proto(begin.published_parent) {
                 Ok(key) => Some(key),
-                Err(status) => {
-                    let _ = output.send(Err(status)).await;
+                Err(_) => {
+                    let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
                     return;
                 }
             }
@@ -869,7 +849,7 @@ async fn get_task(
         Ok(Some(message)) => message,
         Ok(None) => {
             let _ = output
-                .send(Err(Status::invalid_argument("empty Get stream")))
+                .send(Ok(refused_get(crosscache::Reason::Invalid)))
                 .await;
             return;
         }
@@ -882,7 +862,7 @@ async fn get_task(
         Some(get_message::M::Begin(begin)) => begin,
         _ => {
             let _ = output
-                .send(Err(Status::invalid_argument("Get must start with begin")))
+                .send(Ok(refused_get(crosscache::Reason::Invalid)))
                 .await;
             return;
         }
@@ -891,18 +871,14 @@ async fn get_task(
         Ok(namespace) => namespace,
         Err(_) => {
             let _ = output
-                .send(Err(Status::invalid_argument(
-                    "namespace id must be 32 bytes",
-                )))
+                .send(Ok(refused_get(crosscache::Reason::Invalid)))
                 .await;
             return;
         }
     };
     if !begin.destinations.is_empty() || begin.transfer != 0 {
         let _ = output
-            .send(Err(Status::invalid_argument(
-                "LocalCache.Get destinations/transfer",
-            )))
+            .send(Ok(refused_get(crosscache::Reason::Invalid)))
             .await;
         return;
     }
@@ -910,15 +886,17 @@ async fn get_task(
     for key in begin.chain {
         match key_from_proto(Some(key)) {
             Ok(key) => chain.push(key),
-            Err(status) => {
-                let _ = output.send(Err(status)).await;
+            Err(_) => {
+                let _ = output
+                    .send(Ok(refused_get(crosscache::Reason::Invalid)))
+                    .await;
                 return;
             }
         }
     }
     if chain.is_empty() || chain.len() > store::MAX_CHAIN {
         let _ = output
-            .send(Err(Status::invalid_argument("Get chain length")))
+            .send(Ok(refused_get(crosscache::Reason::Invalid)))
             .await;
         return;
     }
@@ -926,7 +904,7 @@ async fn get_task(
         Ok(pages) => pages,
         Err(_) => {
             let _ = output
-                .send(Err(Status::invalid_argument("skip_pages overflow")))
+                .send(Ok(refused_get(crosscache::Reason::Invalid)))
                 .await;
             return;
         }
@@ -935,7 +913,7 @@ async fn get_task(
         Ok(pages) => pages,
         Err(_) => {
             let _ = output
-                .send(Err(Status::invalid_argument("expected_pages overflow")))
+                .send(Ok(refused_get(crosscache::Reason::Invalid)))
                 .await;
             return;
         }
