@@ -166,20 +166,33 @@ pub fn check_range(
     length: u64,
     pid: u32,
 ) -> std::result::Result<(), GrantError> {
+    check_range_opt(size, offset, length, Some(pid))
+}
+
+fn check_range_opt(
+    size: u64,
+    offset: u64,
+    length: u64,
+    pid: Option<u32>,
+) -> std::result::Result<(), GrantError> {
+    let who = pid.map_or_else(
+        || "peer session".to_owned(),
+        |pid| format!("peer pid {pid}"),
+    );
     if !offset.is_multiple_of(PAGE_BYTES) {
         return Err(GrantError::Invalid(format!(
-            "window offset {offset} is not {PAGE_BYTES}-aligned (peer pid {pid})"
+            "window offset {offset} is not {PAGE_BYTES}-aligned ({who})"
         )));
     }
     if !length.is_multiple_of(PAGE_BYTES) {
         return Err(GrantError::Invalid(format!(
-            "window length {length} is not a multiple of {PAGE_BYTES} (peer pid {pid})"
+            "window length {length} is not a multiple of {PAGE_BYTES} ({who})"
         )));
     }
     match offset.checked_add(length) {
         Some(end) if end <= size => Ok(()),
         _ => Err(GrantError::Invalid(format!(
-            "window [{offset}, +{length}) exceeds region size {size} (peer pid {pid})"
+            "window [{offset}, +{length}) exceeds region size {size} ({who})"
         ))),
     }
 }
@@ -187,6 +200,7 @@ pub fn check_range(
 enum Hold {
     Allocated { extent: Extent },
     Lease(Arc<Extent>),
+    None,
 }
 
 struct Window {
@@ -194,6 +208,12 @@ struct Window {
     length: usize,
     within: usize,
     hold: Hold,
+}
+
+impl Window {
+    fn take_hold(&mut self) -> Hold {
+        std::mem::replace(&mut self.hold, Hold::None)
+    }
 }
 
 impl Drop for Window {
@@ -205,13 +225,22 @@ impl Drop for Window {
 }
 
 struct Connection {
-    pid: u32,
+    kind: SessionKind,
+    pid: Option<u32>,
     pidfd: Option<OwnedFd>,
     exited: bool,
     reported: bool,
     closed: bool,
     windows: HashMap<(u64, u32), Window>,
     armed: u64,
+}
+
+/// Who owns a session's windows. Peer sessions have no local pidfd; they are
+/// reclaimed when their control/data streams close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+    Local { pid: u32 },
+    Remote,
 }
 
 /// One manager instance's shared-memory regions and the windows granted from them.
@@ -329,24 +358,54 @@ impl Local {
             Region::Staging => self.staging_size,
         }
     }
+    /// Base pointer and full mapped length of a region. Valid for the life of the
+    /// mapping and stable across allocations.
+    pub fn region_mapping(&self, region: Region) -> (*mut u8, usize) {
+        match region {
+            Region::Arena => self.arena.mapping(),
+            Region::Staging => self.staging.mapping(),
+        }
+    }
+    pub fn arena_used(&self) -> usize {
+        self.arena.used()
+    }
+    pub fn staging_used(&self) -> usize {
+        self.staging.used()
+    }
 
     /// Records the peer pidfd. `ESRCH` means the process already exited; any other
     /// error leaves the connection unconfirmed so its windows stay quarantined.
     pub fn accept(&mut self, connection: u64, pid: u32) -> Result<()> {
+        self.accept_with(connection, SessionKind::Local { pid })
+    }
+
+    /// Registers a manager-to-manager session. It has no local pidfd; a peer's
+    /// windows are reclaimed by `close`/`peer_lost`.
+    pub fn accept_remote(&mut self, connection: u64) -> Result<()> {
+        self.accept_with(connection, SessionKind::Remote)
+    }
+
+    fn accept_with(&mut self, connection: u64, kind: SessionKind) -> Result<()> {
         if self.connections.contains_key(&connection) {
-            return Err(invalid(format!("duplicate connection {connection}")));
+            return Ok(());
         }
-        if pid == 0 {
-            return Err(invalid("peer pid 0"));
-        }
-        let (pidfd, exited) = match open_pidfd(pid) {
-            Pidfd::Open(fd) => (Some(fd), false),
-            Pidfd::Exited => (None, true),
-            Pidfd::Unknown => (None, false),
+        let (pid, pidfd, exited) = match kind {
+            SessionKind::Local { pid } => {
+                if pid == 0 {
+                    return Err(invalid("peer pid 0"));
+                }
+                match open_pidfd(pid) {
+                    Pidfd::Open(fd) => (Some(pid), Some(fd), false),
+                    Pidfd::Exited => (Some(pid), None, true),
+                    Pidfd::Unknown => (Some(pid), None, false),
+                }
+            }
+            SessionKind::Remote => (None, None, false),
         };
         self.connections.insert(
             connection,
             Connection {
+                kind,
                 pid,
                 pidfd,
                 exited,
@@ -364,9 +423,22 @@ impl Local {
     pub fn close(&mut self, connection: u64) {
         if let Some(record) = self.connections.get_mut(&connection) {
             record.closed = true;
-            if record.exited {
+            if record.exited || record.kind == SessionKind::Remote {
+                record.exited = true;
+                record.reported = true;
                 record.windows.clear();
             }
+        }
+        self.connections
+            .retain(|_, record| !(record.closed && record.exited && record.reported));
+    }
+
+    /// Releases a peer's windows when its control/data streams end.
+    pub fn peer_lost(&mut self, connection: u64) {
+        if let Some(record) = self.connections.get_mut(&connection) {
+            record.closed = true;
+            record.exited = true;
+            record.windows.clear();
         }
         self.connections
             .retain(|_, record| !(record.closed && record.exited && record.reported));
@@ -434,33 +506,108 @@ impl Local {
         extent: &Arc<Extent>,
         within: usize,
     ) -> std::result::Result<WindowGrant, GrantError> {
+        self.grant_lease(
+            connection,
+            transfer,
+            index,
+            Direction::Get,
+            Region::Arena,
+            shape,
+            extent,
+            within,
+        )
+    }
+
+    /// Grants an exclusive writable window on part of an already reserved extent
+    /// (the record's arena extent).
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_put_extent(
+        &mut self,
+        connection: u64,
+        transfer: u64,
+        index: u32,
+        region: Region,
+        shape: WindowShape,
+        extent: &Arc<Extent>,
+        within: usize,
+    ) -> std::result::Result<WindowGrant, GrantError> {
+        self.grant_lease(
+            connection,
+            transfer,
+            index,
+            Direction::Put,
+            region,
+            shape,
+            extent,
+            within,
+        )
+    }
+
+    /// Grants a shared read lease on an already allocated extent in either region.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_get_extent(
+        &mut self,
+        connection: u64,
+        transfer: u64,
+        index: u32,
+        region: Region,
+        shape: WindowShape,
+        extent: &Arc<Extent>,
+        within: usize,
+    ) -> std::result::Result<WindowGrant, GrantError> {
+        self.grant_lease(
+            connection,
+            transfer,
+            index,
+            Direction::Get,
+            region,
+            shape,
+            extent,
+            within,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn grant_lease(
+        &mut self,
+        connection: u64,
+        transfer: u64,
+        index: u32,
+        direction: Direction,
+        region: Region,
+        shape: WindowShape,
+        extent: &Arc<Extent>,
+        within: usize,
+    ) -> std::result::Result<WindowGrant, GrantError> {
         let pid = self.pid(connection)?;
+        let who = Self::pid_text(pid);
         shape
             .validate(self.max_window_bytes)
-            .map_err(|error| GrantError::Invalid(format!("{error} (peer pid {pid})")))?;
-        self.check_credit(connection, Direction::Get)?;
-        self.check_new_window(connection, transfer, index, pid)?;
-        let length = usize::try_from(shape.length()).map_err(|_| {
-            GrantError::Invalid(format!("window length does not fit (peer pid {pid})"))
-        })?;
+            .map_err(|error| GrantError::Invalid(format!("{error} ({who})")))?;
+        self.check_credit(connection, direction)?;
+        self.check_new_window(connection, transfer, index, &who)?;
+        let length = usize::try_from(shape.length())
+            .map_err(|_| GrantError::Invalid(format!("window length does not fit ({who})")))?;
         if !within.is_multiple_of(PAGE_BYTES as usize) {
             return Err(GrantError::Invalid(format!(
-                "lease offset {within} is not {PAGE_BYTES}-aligned (peer pid {pid})"
+                "lease offset {within} is not {PAGE_BYTES}-aligned ({who})"
             )));
         }
-        let end = within.checked_add(length).ok_or_else(|| {
-            GrantError::Invalid(format!("lease range overflows (peer pid {pid})"))
-        })?;
+        let end = within
+            .checked_add(length)
+            .ok_or_else(|| GrantError::Invalid(format!("lease range overflows ({who})")))?;
         if end > extent.bytes().len() {
             return Err(GrantError::Invalid(format!(
-                "lease [{within}, +{length}) exceeds extent length {} (peer pid {pid})",
+                "lease [{within}, +{length}) exceeds extent length {} ({who})",
                 extent.bytes().len()
             )));
         }
-        let offset = extent.offset().checked_add(within).ok_or_else(|| {
-            GrantError::Invalid(format!("region offset overflows (peer pid {pid})"))
-        })? as u64;
-        check_range(self.arena_size, offset, shape.length(), pid)?;
+        let offset = extent
+            .offset()
+            .checked_add(within)
+            .ok_or_else(|| GrantError::Invalid(format!("region offset overflows ({who})")))?
+            as u64;
+        check_range_opt(self.region_size(region), offset, shape.length(), pid)?;
 
         extent.acquire();
         self.connections
@@ -470,7 +617,7 @@ impl Local {
             .insert(
                 (transfer, index),
                 Window {
-                    direction: Direction::Get,
+                    direction,
                     length,
                     within,
                     hold: Hold::Lease(extent.clone()),
@@ -483,7 +630,7 @@ impl Local {
             length: shape.length(),
             pages: shape.pages,
             row: shape.row,
-            region: Region::Arena,
+            region,
         })
     }
 
@@ -497,21 +644,21 @@ impl Local {
         shape: WindowShape,
     ) -> std::result::Result<WindowGrant, GrantError> {
         let pid = self.pid(connection)?;
+        let who = Self::pid_text(pid);
         shape
             .validate(self.max_window_bytes)
-            .map_err(|error| GrantError::Invalid(format!("{error} (peer pid {pid})")))?;
+            .map_err(|error| GrantError::Invalid(format!("{error} ({who})")))?;
         self.check_credit(connection, direction)?;
-        self.check_new_window(connection, transfer, index, pid)?;
-        let length = usize::try_from(shape.length()).map_err(|_| {
-            GrantError::Invalid(format!("window length does not fit (peer pid {pid})"))
-        })?;
+        self.check_new_window(connection, transfer, index, &who)?;
+        let length = usize::try_from(shape.length())
+            .map_err(|_| GrantError::Invalid(format!("window length does not fit ({who})")))?;
         let (size, extent) = match region {
             Region::Arena => (self.arena_size, self.arena.allocate(length)),
             Region::Staging => (self.staging_size, self.staging.allocate(length)),
         };
         let extent = extent.ok_or(GrantError::Budget)?;
         let offset = extent.offset() as u64;
-        check_range(size, offset, shape.length(), pid)?;
+        check_range_opt(size, offset, shape.length(), pid)?;
         self.connections
             .get_mut(&connection)
             .unwrap()
@@ -565,6 +712,7 @@ impl Local {
             Hold::Lease(extent) => {
                 Some(&extent.bytes()[window.within..window.within + window.length])
             }
+            Hold::None => None,
         }
     }
 
@@ -581,7 +729,27 @@ impl Local {
             .get_mut(&(transfer, index))?;
         match &mut window.hold {
             Hold::Allocated { extent } => Some(extent.bytes_mut()),
-            Hold::Lease(_) => None,
+            Hold::Lease(_) | Hold::None => None,
+        }
+    }
+
+    /// Removes a window allocated from a region and hands its extent to the caller
+    /// (for example to keep bytes alive until a staging write completes). Leases are
+    /// released and yield `None`.
+    pub fn take_allocated(&mut self, connection: u64, transfer: u64, index: u32) -> Option<Extent> {
+        let window = self
+            .connections
+            .get_mut(&connection)?
+            .windows
+            .remove(&(transfer, index))?;
+        let mut window = window;
+        match window.take_hold() {
+            Hold::Allocated { extent } => Some(extent),
+            Hold::Lease(extent) => {
+                extent.release();
+                None
+            }
+            Hold::None => None,
         }
     }
 
@@ -665,11 +833,18 @@ impl Local {
         Some(bytes)
     }
 
-    fn pid(&self, connection: u64) -> std::result::Result<u32, GrantError> {
+    fn pid(&self, connection: u64) -> std::result::Result<Option<u32>, GrantError> {
         self.connections
             .get(&connection)
             .map(|record| record.pid)
             .ok_or_else(|| GrantError::Invalid(format!("unknown connection {connection}")))
+    }
+
+    fn pid_text(pid: Option<u32>) -> String {
+        pid.map_or_else(
+            || "peer session".to_owned(),
+            |pid| format!("peer pid {pid}"),
+        )
     }
 
     fn check_credit(
@@ -698,7 +873,7 @@ impl Local {
         connection: u64,
         transfer: u64,
         index: u32,
-        pid: u32,
+        pid: &str,
     ) -> std::result::Result<(), GrantError> {
         if self.connections[&connection]
             .windows
@@ -1161,6 +1336,40 @@ mod tests {
         assert_eq!(&left.window_bytes(1, 1, 0).unwrap()[..4], b"AAAA");
         assert_eq!(&right.window_bytes(1, 1, 0).unwrap()[..4], b"BBBB");
         assert_eq!(a.length, b.length);
+    }
+
+    #[test]
+    fn remote_sessions_grant_without_a_local_pid() {
+        let name = instance("remote");
+        let (mut local, _cleanup) = local(&name, 8192, 8192);
+        local.accept_remote(1).unwrap();
+        local
+            .grant_put(1, 1, 0, Region::Arena, shape(1, false))
+            .unwrap();
+        assert_eq!(local.stats(1).unwrap().bytes, 4096);
+        local.close(1);
+        assert_eq!(local.held_bytes(), 0);
+        assert_eq!(local.arena().used(), 0);
+        assert!(local.stats(1).is_none());
+    }
+
+    #[test]
+    fn region_mapping_covers_the_region_and_writes_are_visible() {
+        let name = instance("mapping");
+        let (mut local, _cleanup) = local(&name, 64 * 1024, 64 * 1024);
+        local.accept(1, std::process::id()).unwrap();
+        let grant = local
+            .grant_put(1, 1, 0, Region::Staging, shape(1, false))
+            .unwrap();
+        let (pointer, length) = local.region_mapping(Region::Staging);
+        assert_eq!(length as u64, local.staging_size());
+        let (arena, arena_length) = local.region_mapping(Region::Arena);
+        assert_eq!(arena_length as u64, local.arena_size());
+        assert!(!arena.is_null() && !pointer.is_null());
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"map!".as_ptr(), pointer.add(grant.offset as usize), 4);
+        }
+        assert_eq!(&local.window_bytes(1, 1, 0).unwrap()[..4], b"map!");
     }
 
     #[test]

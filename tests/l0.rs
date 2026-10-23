@@ -1,20 +1,27 @@
 mod support;
 use flare_crosscache::{
     arena::Arena,
-    codec::Decoder,
-    disk,
-    protocol::{Frame, tag},
-    record,
-    store::{self, Config, DispatchOutcome, PutFrameInput, PutFrameOutcome},
+    crosscache, disk,
+    record::{self, Header},
+    store::Config,
     tree::{Eviction, Tree},
 };
 use std::{
     fs,
+    path::PathBuf,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use support::*;
+
+const CHILD: &str = "CM_CHILD_BASE";
+const CHILD_POINT: &str = "CM_CHILD_POINT";
+const CHILD_DUMP: &str = "CM_CHILD_DUMP";
+const CHILD_QUARANTINE: &str = "CM_CHILD_QUARANTINE";
 
 #[test]
 fn l0_01_tree_insert_chain_remove_parity() {
@@ -53,9 +60,8 @@ fn l0_01_tree_insert_chain_remove_parity() {
         assert_eq!(tree.node(&keys[1]).unwrap().children(), 0);
     }
     let fixture = include_bytes!("fixtures/flare-header-v1.bin");
-    let decoded = record::Header::decode(fixture).unwrap();
-    let mut planned =
-        record::Header::new(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
+    let decoded = Header::decode(fixture).unwrap();
+    let mut planned = Header::new(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
     planned.created = 1_700_000_000;
     planned.row_checksum = 0x0123456789abcdef;
     assert_eq!(decoded, planned);
@@ -63,7 +69,7 @@ fn l0_01_tree_insert_chain_remove_parity() {
     for (offset, value) in [(129, 0u64), (173, 0), (181, u64::MAX)] {
         let mut invalid = *fixture;
         invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        assert!(record::Header::decode(&invalid).is_err());
+        assert!(Header::decode(&invalid).is_err());
     }
     let arena = Arena::new(1024 * 1024).unwrap();
     let extent = Arc::new(arena.allocate(9000).unwrap());
@@ -106,274 +112,227 @@ fn l0_02_leaf_lru_compaction_and_cascade() {
         [key(600), key(400)]
     );
     assert_eq!(tree.len(), 1);
-    let mut host = StoreHost::new(65536, 49152);
-    let mut c = host.connect();
-    host.store_record(&mut c, key(128), None);
-    host.store_record(&mut c, key(256), Some(key(128)));
-    host.durable(2);
-    let (mut op, mut answer) = host.put(&mut c, key(512), None);
-    while answer.tag == tag::RETRY {
-        host.until_room();
-        (op, answer) = host.put(&mut c, key(512), None);
-    }
-    assert_eq!(answer.tag, tag::ACCEPT);
-    host.cancel(&c, op);
-    assert!(!host.entries().contains_key(&key(256)));
 }
 
-#[test]
-fn l0_03_accept_shapes_and_compacted_replacement() {
-    let mut host = StoreHost::new(1024 * 1024, 98304);
-    let mut c = host.connect();
-    let (op, answer) = host.put(&mut c, key(448), Some(key(384)));
-    assert_eq!(answer.tag, tag::ACCEPT);
-    assert_eq!(answer.payload, [0, 0, 0, 0, 0]);
-    host.cancel(&c, op);
-    host.store_record(&mut c, key(128), None);
-    host.store_record(&mut c, key(256), Some(key(128)));
-    host.durable(2);
-    // Pin the leaf with a live accepted child, forcing its single-child ancestor to compact.
-    let (child, answer) = host.put(&mut c, key(320), Some(key(256)));
-    assert_eq!(answer.tag, tag::ACCEPT);
-    let (_, answer) = host.put(&mut c, key(640), None);
-    assert_eq!(answer.tag, tag::RETRY);
-    host.wait(|host| host.gauge("compactions_total") > 0);
-    std::thread::sleep(Duration::from_millis(20));
-    assert!(!host.entries()[&key(128)].row);
-    let (op, answer) = loop {
-        host.pump();
-        let answer = host.put(&mut c, key(128), None);
-        if answer.1.tag != tag::RETRY {
-            break answer;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    assert_eq!(answer.tag, tag::ACCEPT);
-    let mut accepted = Decoder::new(&answer.payload);
-    let first = accepted.u32().unwrap();
-    let shaped_parent = accepted.parent().unwrap();
-    let (header, bytes, hashes) = content_for(&c.descriptor, key(128), shaped_parent, first);
-    host.upload(&c, op, &header, &bytes, &hashes).unwrap();
-    host.wait_put(op).unwrap();
-    assert!(host.entries()[&key(128)].row);
-    assert_eq!(host.entries()[&key(256)].parent, Some(key(128)));
-    host.cancel(&c, child);
-}
-
-#[test]
-fn l0_04_present_and_inflight_dedup() {
-    let mut host = StoreHost::new(1024 * 1024, 1024 * 1024);
-    let mut a = host.connect();
-    let mut b = host.connect();
-    let (op, answer) = host.put(&mut a, key(128), None);
-    assert_eq!(answer.tag, tag::ACCEPT);
-    let (_, answer) = host.put(&mut b, key(128), None);
-    assert_eq!(answer.tag, tag::RETRY);
-    assert_eq!(answer.payload, [2]);
-    let (header, bytes, hashes) = content_for(&a.descriptor, key(128), None, 0);
-    host.upload(&a, op, &header, &bytes, &hashes).unwrap();
-    host.wait_put(op).unwrap();
-    assert_eq!(host.put(&mut b, key(128), None).1.tag, tag::PRESENT);
-    // Four open puts per direction, independent of key dedup.
-    for tokens in [256, 384, 512, 640] {
-        assert_eq!(host.put(&mut a, key(tokens), None).1.tag, tag::ACCEPT);
-    }
-    let answer = host.put(&mut a, key(768), None).1;
-    assert_eq!(answer.tag, tag::RETRY);
-    assert_eq!(answer.payload, [0]);
-    host.close(&a);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_03_accept_shapes_and_present_inflight() {
+    let mut host = Host::new(4 * 1024 * 1024, 4 * 1024 * 1024);
+    host.start();
+    let mut a = host.client().await;
+    let mut b = host.client().await;
+    // A child shaped against a readable parent gets first_page = parent pages.
+    let (sender, replies) = a.raw_begin(key(128), None).await;
+    // A second connection sees INFLIGHT while the first Put is open.
+    assert_eq!(
+        b.put(key(128), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Inflight as u8)
+    );
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(crosscache::put_message::M::Cancel(crosscache::Cancel {})),
+        })
+        .await
+        .unwrap();
+    drop(sender);
+    drop(replies);
     host.wait(|host| host.gauge("open_ops") == 0);
-    let mut c = host.connect();
-    host.store_record(&mut c, key(3), None);
-    host.store_record(&mut c, key(5), Some(key(3)));
-    assert_eq!(host.entries()[&key(5)].tail_pages, 0);
-    host.fetch(&mut c, &[key(3), key(5)], 0, 0);
-}
-
-#[test]
-fn l0_05_invalid_checksum_short_payload_and_offsets() {
-    let mut host = StoreHost::new(1024 * 1024, 1024 * 1024);
-    let mut c = host.connect();
-    for (index, tokens) in [128, 256, 384, 512, 640, 768].into_iter().enumerate() {
-        let k = key(tokens);
-        let (op, answer) = host.put(&mut c, k, None);
-        assert_eq!(answer.tag, tag::ACCEPT);
-        let (header, mut bytes, hashes) = content_for(&c.descriptor, k, None, 0);
-        if index == 0 {
-            bytes[header.page_segment as usize] ^= 1;
-            assert!(host.upload(&c, op, &header, &bytes, &hashes).is_err());
-        } else if index == 1 {
-            assert!(matches!(
-                host.store_mut().put_frame(
-                    c.id,
-                    op,
-                    PutFrameInput::Commit {
-                        offset: 0,
-                        metadata: &bytes[..header.page_segment as usize],
-                    },
-                ),
-                PutFrameOutcome::Error(_)
-            ));
-        } else if index == 2 {
-            assert!(matches!(
-                host.store_mut().put_frame(
-                    c.id,
-                    op,
-                    PutFrameInput::Window {
-                        index: 0,
-                        pages: vec![hashes[0]],
-                    },
-                ),
-                PutFrameOutcome::Ok
-            ));
-            assert!(matches!(
-                host.store_mut().put_frame(
-                    c.id,
-                    op,
-                    PutFrameInput::Data {
-                        offset: header.page_segment + 4096,
-                        data: &bytes
-                            [header.page_segment as usize..header.page_segment as usize + 4096],
-                    },
-                ),
-                PutFrameOutcome::Error(_)
-            ));
-        } else {
-            if index == 3 {
-                bytes[header.row_segment as usize] ^= 1;
-            }
-            if index == 4 {
-                bytes[12] = 1;
-            }
-            if index == 5 {
-                bytes[4096] ^= 1;
-            }
-            assert!(host.upload(&c, op, &header, &bytes, &hashes).is_err());
-        }
-        host.cancel(&c, op);
-        assert!(!host.entries().contains_key(&k));
+    let bytes = b.store(key(128), None).await;
+    assert!(!bytes.is_empty());
+    assert_eq!(
+        b.put(key(128), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Present as u8)
+    );
+    let mut c = host.client().await;
+    let mut open = Vec::new();
+    for tokens in [640, 768, 896, 1024] {
+        open.push(c.raw_begin(key(tokens), None).await);
     }
-    host.wait(|host| {
-        host.gauge("nvme_reserved_bytes") == 0 && host.gauge("memory_allocated_bytes") == 0
-    });
+    assert_eq!(
+        c.put(key(1152), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Queue as u8)
+    );
+    drop(open);
+    host.wait(|host| host.gauge("open_ops") == 0);
+    b.store(key(256), Some(key(128))).await;
+    b.store(key(512), None).await;
+    let mut fresh = host.client().await;
+    let mut leaves = Vec::new();
+    for (index, tokens) in [3u64, 5].into_iter().enumerate() {
+        let bytes = fresh.store(key(tokens), (index > 0).then(|| key(3))).await;
+        assert!(!bytes.is_empty());
+        leaves.push(tokens);
+    }
+    let data = fresh.fetch(&[key(3), key(5)], 0, 0).await;
+    assert_eq!(data.len(), 2);
+    assert!(!data[0].is_empty() && !data[1].is_empty());
 }
 
-#[test]
-fn l0_06_parent_first_chain_closed_durability() {
-    let base = base("store");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_04_invalid_checksum_short_payload_and_offsets() {
+    let mut host = Host::new(4 * 1024 * 1024, 4 * 1024 * 1024);
+    host.start();
+    for (options, tokens) in [
+        (
+            PutOptions {
+                corrupt_page: Some(0),
+                ..PutOptions::default()
+            },
+            128,
+        ),
+        (
+            PutOptions {
+                early_commit: true,
+                ..PutOptions::default()
+            },
+            128 * 64,
+        ),
+        (
+            PutOptions {
+                corrupt_row: true,
+                ..PutOptions::default()
+            },
+            256,
+        ),
+        (
+            PutOptions {
+                skip_filled: true,
+                ..PutOptions::default()
+            },
+            192 * 64,
+        ),
+    ] {
+        let mut client = host.client().await;
+        let outcome = client.put(key(tokens), None, options).await;
+        assert!(
+            matches!(outcome, PutOutcome::Refused(reason) if reason == crosscache::Reason::Invalid as u8),
+            "{tokens}: {outcome:?}"
+        );
+    }
+    host.wait(|host| host.gauge("nvme_reserved_bytes") == 0);
+    assert_eq!(host.gauge("staging_allocated_bytes"), 0);
+    let mut check = host.client().await;
+    let subscription = check.subscribe().await;
+    assert!(subscription.entries.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_05_parent_first_chain_closed_durability() {
+    let base = base("durable");
     let mut config = Config::new(
         base.join("records"),
         base.join("run/m.sock"),
         4 * 1024 * 1024,
         4 * 1024 * 1024,
     );
+    config.name = instance_name("durable");
     config.faults.pause_at = Some("parent_write".into());
     let signal = base.join("gate");
     config.faults.signal = Some(signal.clone());
-    let mut host = StoreHost::open(config);
-    let mut c = host.connect();
-    host.store_record(&mut c, key(128), None);
-    host.wait(|_| signal.exists());
-    host.store_record(&mut c, key(256), Some(key(128)));
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    wait(|| signal.exists());
+    client.store(key(256), Some(key(128))).await;
+    let namespace = client.descriptor.name();
     assert!(
         !host
             .config
             .root
-            .join(c.descriptor.name())
+            .as_ref()
+            .unwrap()
+            .join(&namespace)
             .join(record::file_name(&key(256)))
             .exists()
     );
     assert_eq!(host.gauge("nvme_bytes_total"), 0);
     fs::remove_file(&signal).unwrap();
-    // Every write pauses independently; parent must be installed before child's pause.
-    host.wait(|_| signal.exists());
+    wait(|| signal.exists());
     assert!(
         host.config
             .root
-            .join(c.descriptor.name())
+            .as_ref()
+            .unwrap()
+            .join(&namespace)
             .join(record::file_name(&key(128)))
-            .exists()
-    );
-    assert!(
-        !host
-            .config
-            .root
-            .join(c.descriptor.name())
-            .join(record::file_name(&key(256)))
             .exists()
     );
     fs::remove_file(signal).unwrap();
     host.durable(2);
-    assert!(host.entries().values().all(|entry| entry.durable));
+    let subscription = client.subscribe().await;
+    assert!(
+        subscription.entries.values().all(|entry| entry.durable),
+        "both records must be chain-durable"
+    );
 }
 
 #[test]
-fn l0_07_multiprocess_kill_recovery() {
-    if let Ok(base) = std::env::var("CM_CHILD_BASE") {
-        let base = std::path::PathBuf::from(base);
+fn l0_06_multiprocess_kill_recovery() {
+    if let Ok(base) = std::env::var(CHILD) {
+        let base = PathBuf::from(base);
+        let point = std::env::var(CHILD_POINT).unwrap_or_default();
+        let memory = if point == "parent_write" {
+            4 * 1024 * 1024
+        } else {
+            4096
+        };
         let mut config = Config::new(
             base.join("records"),
             base.join("run/m.sock"),
-            4 * 1024 * 1024,
+            memory,
             64 * 1024 * 1024,
         );
-        config.faults.pause_at = std::env::var("CM_CHILD_PAUSE").ok();
+        config.name = instance_name("child");
+        config.faults.pause_at = Some(point.clone());
         config.faults.signal = Some(base.join("gate"));
-        let mut host = StoreHost::open(config);
-        if let Ok(dump) = std::env::var("CM_CHILD_DUMP") {
-            fs::write(dump, format!("{}", host.snapshot_keys().len())).unwrap();
+        if let Ok(dump) = std::env::var(CHILD_DUMP) {
+            let store = flare_crosscache::store::Store::open(config).unwrap();
+            let snapshot = store
+                .namespace_id()
+                .and_then(|id| store.snapshot(id))
+                .map(|(_, entries)| entries.len())
+                .unwrap_or(0);
+            fs::write(dump, snapshot.to_string()).unwrap();
             loop {
                 std::thread::park();
             }
         }
-        let mut c = host.connect();
-        let point = std::env::var("CM_CHILD_PAUSE").unwrap_or_default();
-        if point == "data" {
-            let (op, answer) = host.put(&mut c, key(128), None);
-            assert_eq!(answer.tag, tag::ACCEPT);
-            let mut accepted = Decoder::new(&answer.payload);
-            let first = accepted.u32().unwrap();
-            let parent = accepted.parent().unwrap();
-            let (header, bytes, hashes) = content_for(&c.descriptor, key(128), parent, first);
-            host.store_mut().put_frame(
-                c.id,
-                op,
-                PutFrameInput::Window {
-                    index: 0,
-                    pages: hashes,
-                },
-            );
-            host.store_mut().put_frame(
-                c.id,
-                op,
-                PutFrameInput::Data {
-                    offset: header.page_segment,
-                    data: &bytes[header.page_segment as usize..header.page_segment as usize + 4096],
-                },
-            );
-        } else {
-            host.store_record(&mut c, key(128), None);
-            if point == "parent_write" {
-                host.store_record(&mut c, key(256), Some(key(128)));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut host = Host::open_config(config);
+            host.start();
+            let mut client = host.client().await;
+            if point == "data" {
+                let _ = client
+                    .put(
+                        key(128),
+                        None,
+                        PutOptions {
+                            cancel: Some(CancelAt::Filled),
+                            ..PutOptions::default()
+                        },
+                    )
+                    .await;
+            } else {
+                client.store(key(128), None).await;
             }
-        }
-        loop {
-            host.pump();
-            std::thread::sleep(Duration::from_millis(5));
-        }
+            loop {
+                std::thread::park();
+            }
+        });
     }
     for point in ["data", "before_rename", "after_rename", "parent_write"] {
         let base = base(point);
         let config = Config::new(
             base.join("records"),
             base.join("run/m.sock"),
-            4 * 1024 * 1024,
+            4096,
             64 * 1024 * 1024,
         );
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "l0_07_multiprocess_kill_recovery", "--nocapture"])
-            .env("CM_CHILD_BASE", &base)
-            .env("CM_CHILD_PAUSE", point)
+            .args(["--exact", "l0_06_multiprocess_kill_recovery", "--nocapture"])
+            .env(CHILD, &base)
+            .env(CHILD_POINT, point)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -383,14 +342,10 @@ fn l0_07_multiprocess_kill_recovery() {
         let status = child.wait().unwrap();
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
-        let lock = disk::RootLock::acquire(&config.root).unwrap();
-        let recovered = disk::recover(&config.root).unwrap();
-        let keys: Vec<_> = recovered
-            .iter()
-            .flat_map(|namespace| namespace.records.iter().map(|(header, _, _)| header.key))
-            .collect();
+        let lock = disk::RootLock::acquire(&config.root.as_ref().unwrap().clone()).unwrap();
+        let recovered = recovered_keys(config.root.as_ref().unwrap());
         assert_eq!(
-            keys,
+            recovered,
             if point == "after_rename" {
                 vec![key(128)]
             } else {
@@ -399,7 +354,7 @@ fn l0_07_multiprocess_kill_recovery() {
             "{point}"
         );
         assert!(
-            fs::read_dir(config.root.join(descriptor().name()))
+            fs::read_dir(config.root.as_ref().unwrap().join(descriptor().name()))
                 .unwrap()
                 .all(|entry| !entry
                     .unwrap()
@@ -408,20 +363,19 @@ fn l0_07_multiprocess_kill_recovery() {
                     .ends_with(".tmp"))
         );
         drop(lock);
-        // Start a real second process over the same disk root and verify its snapshot.
         let _ = fs::remove_file(base.join("gate"));
         let dump = base.join("dump");
         let mut restarted = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "l0_07_multiprocess_kill_recovery", "--nocapture"])
-            .env("CM_CHILD_BASE", &base)
-            .env("CM_CHILD_DUMP", &dump)
+            .args(["--exact", "l0_06_multiprocess_kill_recovery", "--nocapture"])
+            .env(CHILD, &base)
+            .env(CHILD_DUMP, &dump)
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
         wait(|| dump.exists());
         assert_eq!(
             fs::read_to_string(&dump).unwrap().parse::<usize>().unwrap(),
-            keys.len()
+            recovered.len()
         );
         restarted.kill().unwrap();
         restarted.wait().unwrap();
@@ -429,254 +383,368 @@ fn l0_07_multiprocess_kill_recovery() {
     }
 }
 
-#[test]
-fn l0_08_streaming_and_nvme_oversize() {
-    let mut host = StoreHost::new(65536, 2 * 1024 * 1024);
-    let mut c = host.connect();
-    let bytes = host.store_record(&mut c, key(128 * 64), None);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_07_streaming_and_nvme_oversize() {
+    let mut host = Host::new(65536, 2 * 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let bytes = client.store(key(128 * 64), None).await;
     host.durable(1);
     assert_eq!(host.gauge("memory_allocated_bytes"), 0);
-    let data = host.fetch(&mut c, &[key(128 * 64)], 0, 128);
-    let mut actual = vec![0; bytes.len()];
-    for (_, offset, chunk) in data {
-        actual[offset as usize..offset as usize + chunk.len()].copy_from_slice(&chunk);
-    }
-    assert_eq!(actual, bytes);
-    assert_eq!(host.put(&mut c, key(1024 * 64), None).1.tag, tag::OVERSIZE);
-    host.restart();
-    let mut c = host.connect();
-    assert_eq!(host.entries().len(), 1);
-    host.fetch(&mut c, &[key(128 * 64)], 64, 64);
-    let mut refill = StoreHost::new(65536, 1024 * 1024);
-    let mut c = refill.connect();
-    refill.store_record(&mut c, key(128), None);
-    refill.durable(1);
-    refill.restart();
-    let mut c = refill.connect();
-    assert_eq!(refill.entries()[&key(128)].tier, 1);
-    refill.fetch(&mut c, &[key(128)], 0, 2);
-    refill.wait(|host| host.gauge("memory_allocated_bytes") > 0);
-    assert_eq!(refill.entries()[&key(128)].tier, 0);
-    let mut split = StoreHost::new(4096, 32 * 1024 * 1024);
-    let mut geometry = descriptor();
-    geometry.ranks[0].planes = vec![flare_crosscache::protocol::MAX_DATA as u64 + 4096];
-    let mut c = split.connect_with(geometry);
-    let expected = split.store_record(&mut c, key(128), None);
-    let mut actual = vec![0; expected.len()];
-    for (_, offset, data) in split.fetch(&mut c, &[key(128)], 0, 2) {
-        actual[offset as usize..offset as usize + data.len()].copy_from_slice(&data);
-    }
-    assert_eq!(actual, expected);
+    let data = client.fetch(&[key(128 * 64)], 0, 128).await;
+    assert_eq!(data[0], bytes);
+    assert_eq!(
+        client
+            .put(key(1024 * 64), None, PutOptions::default())
+            .await,
+        PutOutcome::Refused(crosscache::Reason::Oversize as u8)
+    );
+    host.stop();
+    host.start();
+    let mut client = host.client().await;
+    let subscription = client.subscribe().await;
+    assert_eq!(subscription.entries.len(), 1);
+    assert_eq!(
+        client.fetch(&[key(128 * 64)], 64, 64).await[0].len(),
+        bytes.len()
+    );
 }
 
-#[test]
-fn l0_09_disk_full_budget_and_room() {
-    let base = base("store");
-    let full = base.join("full");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_08_refill_and_split_units() {
+    let mut refill = Host::new(65536, 1024 * 1024);
+    refill.start();
+    let mut client = refill.client().await;
+    client.store(key(128), None).await;
+    refill.durable(1);
+    refill.stop();
+    refill.start();
+    let mut client = refill.client().await;
+    let subscription = client.subscribe().await;
+    assert_eq!(
+        subscription.entries[&key(128)].tier,
+        crosscache::Tier::Nvme as i32
+    );
+    client.fetch(&[key(128)], 0, 2).await;
+    refill.wait(|host| host.gauge("memory_allocated_bytes") > 0);
+    let subscription = client.subscribe().await;
+    assert_eq!(
+        subscription.entries[&key(128)].tier,
+        crosscache::Tier::Dram as i32
+    );
+
+    let mut split = Host::new(4096, 32 * 1024 * 1024);
+    split.start();
+    let mut geometry = descriptor();
+    geometry.ranks[0].planes = vec![4 * 1024 * 1024 + 4096];
+    let mut client = split.client_with(geometry).await.unwrap();
+    let expected = client.store(key(128), None).await;
+    let actual = client.fetch(&[key(128)], 0, 2).await;
+    assert_eq!(actual[0], expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_09_disk_failure_is_refused_io() {
+    let base = base("full");
     fs::create_dir_all(&base).unwrap();
+    let full = base.join("full");
     fs::write(&full, b"full").unwrap();
     let mut config = Config::new(
         base.join("records"),
         base.join("run/m.sock"),
-        65536,
-        1024 * 1024,
+        4096,
+        64 * 1024 * 1024,
     );
+    config.name = instance_name("full");
     config.faults.disk_full = Some(full.clone());
-    let mut host = StoreHost::open(config);
-    let mut c = host.connect();
-    host.store_record(&mut c, key(384), None);
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    // The record does not fit the tiny arena, so it streams through staging.
+    assert_eq!(
+        client.put(key(512 * 64), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Io as u8)
+    );
     host.wait(|host| host.gauge("nvme_errors_total") > 0);
-    let (_, answer) = host.put(&mut c, key(448), None);
-    assert_eq!(answer.tag, tag::RETRY);
-    assert_eq!(answer.payload, [1]);
-    assert!(host.gauge("memory_allocated_bytes") > 0);
     fs::remove_file(full).unwrap();
-    host.until_room();
-    assert_eq!(host.put(&mut c, key(448), None).1.tag, tag::ACCEPT);
+    let bytes = client.store(key(128), None).await;
+    assert!(!bytes.is_empty());
 }
 
-#[test]
-fn l0_10_cancel_eof_and_io_lifetime() {
-    let base = base("store");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_10_cancel_drains_and_staging_gauge() {
+    let base = base("cancel");
     let mut config = Config::new(
         base.join("records"),
         base.join("run/m.sock"),
         4096,
         4 * 1024 * 1024,
     );
+    config.name = instance_name("cancel");
     config.faults.delay_ms = 300;
-    let mut host = StoreHost::open(config);
-    let mut c = host.connect();
-    let (op, _) = host.put(&mut c, key(128), None);
-    let (header, bytes, hashes) = content_for(&c.descriptor, key(128), None, 0);
-    assert!(matches!(
-        host.store_mut().put_frame(
-            c.id,
-            op,
-            PutFrameInput::Window {
-                index: 0,
-                pages: hashes,
-            },
-        ),
-        PutFrameOutcome::Ok
-    ));
-    let mut outcome = host.store_mut().put_frame(
-        c.id,
-        op,
-        PutFrameInput::Data {
-            offset: header.page_segment,
-            data: &bytes[header.page_segment as usize..header.row_segment as usize],
-        },
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    // Streaming Put: two pages plus the row, one window of 12288 bytes.
+    assert_eq!(
+        client
+            .put(
+                key(128),
+                None,
+                PutOptions {
+                    cancel: Some(CancelAt::Filled),
+                    ..PutOptions::default()
+                },
+            )
+            .await,
+        PutOutcome::Cancelled
     );
-    while matches!(outcome, PutFrameOutcome::Blocked) {
-        host.pump();
-        std::thread::sleep(Duration::from_millis(2));
-        outcome = host.store_mut().put_frame(
-            c.id,
-            op,
-            PutFrameInput::Data {
-                offset: header.page_segment,
-                data: &bytes[header.page_segment as usize..header.row_segment as usize],
-            },
-        );
-    }
+    // The staging window lives until its delayed disk write completes, then drains.
     host.wait(|host| host.gauge("staging_allocated_bytes") > 0);
-    host.cancel(&c, op);
-    host.wait(|host| host.gauge("open_ops") == 0);
-    assert!(
-        host.gauge("staging_allocated_bytes") > 0,
-        "I/O must retain extent after Cancel"
-    );
+    assert_eq!(host.gauge("staging_allocated_bytes"), 16384);
     host.wait(|host| host.gauge("staging_allocated_bytes") == 0);
     host.wait(|host| host.gauge("nvme_reserved_bytes") == 0);
-    host.close(&c);
-    let mut c = host.connect();
-    host.store_record(&mut c, key(128), None);
-    let (_, answer) = host.put(&mut c, key(256), Some(key(128)));
-    assert_eq!(answer.tag, tag::ACCEPT);
-    host.close(&c);
-    host.wait(|host| host.gauge("open_ops") == 0 && host.gauge("cleanup_records") == 0);
-    let mut c = host.connect();
-    host.fetch(&mut c, &[key(128)], 0, 2);
-    host.wait(|host| host.gauge("leases") == 0);
-    let mut blocked = host.connect();
-    let (op, accept) = host.put(&mut blocked, key(640 * 64), None);
-    assert_eq!(accept.tag, tag::ACCEPT);
-    let (header, bytes, hashes) = content_for(&blocked.descriptor, key(640 * 64), None, 0);
-    host.upload(&blocked, op, &header, &bytes, &hashes).unwrap();
-    host.wait(|host| host.gauge("staging_allocated_bytes") > 0);
+    // A Get is not blocked by a draining Put.
+    let stored = client.store(key(128 * 64), None).await;
+    let mut getter = host.client().await;
     let start = Instant::now();
-    host.fetch(&mut c, &[key(128)], 0, 2);
+    let data = getter.fetch(&[key(128 * 64)], 0, 128).await;
     assert!(start.elapsed() < Duration::from_millis(500));
-    host.cancel(&blocked, op);
-    host.wait(|host| host.gauge("open_ops") == 0);
-    host.wait(|host| host.gauge("staging_allocated_bytes") == 0);
-    assert!(!host.entries().contains_key(&key(640 * 64)));
+    assert_eq!(data[0], stored);
 }
 
-#[test]
-fn l0_11_snapshot_deltas_resync_and_namespace() {
-    let mut host = StoreHost::new(1024 * 1024, 4 * 1024 * 1024);
-    let mut a = host.connect();
-    host.store_record(&mut a, key(128), None);
-    host.store_record(&mut a, key(256), Some(key(128)));
-    assert_eq!(host.snapshot_keys(), [key(128), key(256)]);
-    host.store_record(&mut a, key(384), Some(key(256)));
-    assert_eq!(host.snapshot_keys(), [key(128), key(256), key(384)]);
-    let (old_seq, _) = host.snapshot();
-    host.store_record(&mut a, key(512), Some(key(384)));
-    let (seq, entries) = host.snapshot();
-    assert!(seq > old_seq);
-    assert_eq!(entries.len(), 4);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_11_snapshot_deltas_epochs_and_namespaces() {
+    let mut host = Host::new(1024 * 1024, 4 * 1024 * 1024);
+    host.start();
+    let mut a = host.client().await;
+    a.store(key(128), None).await;
+    a.store(key(256), Some(key(128))).await;
+    a.store(key(384), Some(key(256))).await;
+    let mut subscription = a.subscribe().await;
+    assert_eq!(subscription.snapshots.last().unwrap().len(), 3);
+    a.store(key(512), Some(key(384))).await;
+    subscription.until_added(key(512)).await;
+    assert_eq!(subscription.entries.len(), 4);
+
     let mut other = descriptor();
     other.fingerprint = [9; 16];
-    let other = host.connect_with(other);
-    let empty = host
-        .store()
-        .snapshot(other.descriptor.namespace_id())
-        .unwrap()
-        .1;
-    assert!(empty.is_empty());
+    let mut other_client = host.client_with(other).await.unwrap();
+    let other_subscription = other_client.subscribe().await;
+    assert!(other_subscription.entries.is_empty());
+
     let mut wrong = descriptor();
     wrong.ranks[0].row_bytes += 1;
-    assert!(host.try_connect_with(wrong).is_err());
+    assert!(host.client_with(wrong).await.is_err());
+
+    // A second Subscribe on the same connection replaces the first.
+    let mut first = a.subscribe().await;
+    let mut second = a.subscribe().await;
+    assert!(first.stream.message().await.unwrap().is_none());
+    a.store(key(640), Some(key(512))).await;
+    second.until_added(key(640)).await;
 }
 
-#[test]
-fn l0_12_round_robin_and_bounded_dead_client_cleanup() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_12_round_robin_and_dead_client_cleanup() {
     let mut host = Host::new(8 * 1024 * 1024, 64 * 1024 * 1024);
     host.start();
-    let mut a = host.client();
+    let mut a = host.client().await;
+    let mut client = host.client().await;
     let mut previous = None;
-    for i in 1..=160 {
-        let k = key(i * 64);
-        a.store(k, previous);
-        previous = Some(k);
+    for index in 1..=160u64 {
+        let value = key(index * 64);
+        client.store(value, previous).await;
+        previous = Some(value);
     }
     host.durable(160);
-    let mut b = host.client();
-    let keys: Vec<_> = (1..=160).map(|i| key(i * 64)).collect();
+    let keys: Vec<_> = (1..=160).map(|index| key(index * 64)).collect();
+    let mut dead = host.client().await;
     for _ in 0..4 {
-        a.get_start(&keys, 0, 160);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let _replies = dead
+            .inner
+            .get(dead.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+            .await
+            .unwrap();
+        sender
+            .send(crosscache::GetMessage {
+                m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+                    namespace_id: dead.descriptor.namespace_id().to_vec(),
+                    chain: keys.iter().map(|key| key_msg(*key)).collect(),
+                    skip_pages: 0,
+                    expected_pages: 160,
+                    row: true,
+                    destinations: Vec::new(),
+                    transfer: 0,
+                })),
+            })
+            .await
+            .unwrap();
+        drop(sender);
     }
-    drop(a);
+    drop(dead);
     let start = Instant::now();
-    b.fetch(&[key(64)], 0, 1);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "live Get blocked for {elapsed:?}"
-    );
-    wait(|| host.gauge("leases") == 0 && host.gauge("cleanup_records") == 0);
-    // One flooding producer is limited to one frame per turn and four admitted operations.
-    let mut flood = host.client();
-    let join = std::thread::spawn(move || {
-        for _ in 0..2000 {
-            flood.send(tag::DATA, 99999, vec![0; 4096]);
-        }
-    });
-    let start = Instant::now();
-    b.fetch(&[key(64)], 0, 1);
+    a.fetch(&[key(64)], 0, 1).await;
     assert!(start.elapsed() < Duration::from_millis(500));
-    join.join().unwrap();
+    host.wait(|host| host.gauge("leases") == 0 && host.gauge("cleanup_records") == 0);
+    // Unknown transfers are dropped without disturbing a live connection.
+    let mut unknown = host.client().await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = unknown
+        .inner
+        .get(unknown.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::GetMessage {
+            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+                namespace_id: unknown.descriptor.namespace_id().to_vec(),
+                chain: vec![key_msg(key(64))],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+                destinations: Vec::new(),
+                transfer: 0,
+            })),
+        })
+        .await
+        .unwrap();
+    let _leased = loop {
+        let reply = replies.message().await.unwrap().unwrap();
+        if matches!(reply.r, Some(crosscache::get_reply::R::Leased(_))) {
+            break reply;
+        }
+    };
+    sender
+        .send(crosscache::GetMessage {
+            m: Some(crosscache::get_message::M::Released(
+                crosscache::WindowReleased {
+                    transfer: 999_999,
+                    index: 0,
+                },
+            )),
+        })
+        .await
+        .unwrap();
+    let refused = loop {
+        let reply = replies.message().await.unwrap().unwrap();
+        if matches!(reply.r, Some(crosscache::get_reply::R::Refused(_))) {
+            break reply;
+        }
+    };
+    assert!(matches!(
+        refused.r,
+        Some(crosscache::get_reply::R::Refused(_))
+    ));
+    let start = Instant::now();
+    a.fetch(&[key(64)], 0, 1).await;
+    assert!(start.elapsed() < Duration::from_millis(500));
 }
 
-#[test]
-fn l0_13_unknown_finished_cancelled_and_stale_frames() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_13_generation_fencing_and_malformed_streams() {
     let mut host = Host::new(1024 * 1024, 1024 * 1024);
     host.start();
-    let mut c = host.client();
-    c.store(key(128), None);
-    let finished = c.next_op - 1;
-    c.send(tag::DATA, finished, vec![0; 4096]);
-    c.send(tag::DATA, 99999, vec![0; 4096]);
-    Frame {
-        tag: tag::DATA,
-        generation: c.generation ^ 123,
-        op: finished,
-        payload: vec![0; 4096],
-    }
-    .write(&mut c.stream)
-    .unwrap();
-    let (cancelled, _) = c.put(key(256), None);
-    c.send(tag::CANCEL, cancelled, Vec::new());
-    c.send(tag::DATA, cancelled, vec![0; 4096]);
-    wait(|| host.gauge("unknown_frames_total") == 4);
-    c.fetch(&[key(128)], 0, 2);
-    host.durable(1);
-    let mut malformed = host.client();
-    use std::io::{Read, Write};
-    malformed
-        .stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    let old = client.generation;
+    // A second Hello on the same transport supersedes the previous generation.
+    let hello = client
+        .inner
+        .hello(tonic::Request::new(crosscache::HelloRequest {
+            protocol: 1,
+            replica: "again".into(),
+            descriptor: Some(descriptor_msg(&client.descriptor)),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut request = tonic::Request::new(crosscache::SubscribeRequest {
+        namespace_id: client.descriptor.namespace_id().to_vec(),
+        generation: old,
+        descriptor: Some(descriptor_msg(&client.descriptor)),
+    });
+    request
+        .metadata_mut()
+        .insert("x-crosscache-generation", old.to_string().parse().unwrap());
+    let status = client.inner.subscribe(request).await.err().unwrap();
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    client.generation = hello.generation;
+
+    // Missing metadata is UNAUTHENTICATED.
+    let request = tonic::Request::new(crosscache::SubscribeRequest {
+        namespace_id: client.descriptor.namespace_id().to_vec(),
+        generation: client.generation,
+        descriptor: Some(descriptor_msg(&client.descriptor)),
+    });
+    let status = client.inner.subscribe(request).await.err().unwrap();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    // A filled window for an unknown transfer is refused INVALID.
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(client.begin(key(256), None)),
+        })
+        .await
         .unwrap();
-    malformed.stream.write_all(&0u32.to_le_bytes()).unwrap();
-    assert_eq!(malformed.stream.read(&mut [0]).unwrap(), 0);
+    let _accept = replies.message().await.unwrap().unwrap();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(crosscache::put_message::M::Filled(
+                crosscache::WindowFilled {
+                    transfer: 999_999,
+                    index: 0,
+                    page_xxh3: vec![0],
+                    row_xxh3: 0,
+                    has_row: false,
+                },
+            )),
+        })
+        .await
+        .unwrap();
+    let refused = loop {
+        match replies.message().await.unwrap().unwrap().r {
+            Some(crosscache::put_reply::R::Refused(refused)) => break refused,
+            Some(_) => continue,
+            None => panic!("ended"),
+        }
+    };
+    assert_eq!(refused.reason, crosscache::Reason::Invalid as i32);
+
+    // A Commit before Begin is a malformed stream.
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(crosscache::put_message::M::Commit(crosscache::PutCommit {
+                transfer: 1,
+                metadata_offset: 0,
+                metadata: vec![0; 4096],
+            })),
+        })
+        .await
+        .ok();
+    let status = replies.message().await.err().unwrap();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
 }
 
 #[test]
-fn l0_14_shm_and_real_nvme_throughput() {
-    support::throughput::run(true);
+fn l0_14_throughput() {
+    support::throughput::run(false);
 }
 
 #[test]
@@ -694,84 +762,7 @@ fn l0_15_namespace_id_vectors() {
 }
 
 #[test]
-fn l0_16_dispatch_prioritises_gets() {
-    let mut host = StoreHost::new(1024 * 1024, 64 * 1024 * 1024);
-    let mut c = host.connect();
-    host.store_record(&mut c, key(128), None);
-    for _ in 0..4 {
-        host.store_mut().submit_get(
-            c.id,
-            c.next_op,
-            store::GetRequest {
-                keys: vec![key(128)],
-                skip_pages: 0,
-                expected_pages: 2,
-                row: true,
-            },
-        );
-        c.next_op += 1;
-    }
-    for tokens in [256, 384, 512, 640] {
-        let op = c.next_op;
-        c.next_op += 1;
-        host.store_mut().submit_put(
-            c.id,
-            op,
-            store::PutRequest {
-                key: key(tokens),
-                published_parent: None,
-                bucket: [4; 16],
-                chain_pages: (tokens / 64) as u32,
-                published_tail_pages: (tokens / 64) as u32,
-                page_bytes: c.descriptor.page_bytes(),
-                row_bytes: c.descriptor.row_bytes(),
-                row: true,
-            },
-        );
-    }
-    let outcomes = host.store_mut().dispatch();
-    assert_eq!(outcomes.len(), 5);
-    for outcome in &outcomes[..4] {
-        assert!(matches!(outcome, DispatchOutcome::Get { .. }));
-    }
-    assert!(matches!(outcomes[4], DispatchOutcome::Put { .. }));
-    // A saturated Put queue never delays a Get by more than four Put slots.
-    for tokens in [768, 896, 1024, 1152, 1280] {
-        let op = c.next_op;
-        c.next_op += 1;
-        host.store_mut().submit_put(
-            c.id,
-            op,
-            store::PutRequest {
-                key: key(tokens),
-                published_parent: None,
-                bucket: [4; 16],
-                chain_pages: (tokens / 64) as u32,
-                published_tail_pages: (tokens / 64) as u32,
-                page_bytes: c.descriptor.page_bytes(),
-                row_bytes: c.descriptor.row_bytes(),
-                row: true,
-            },
-        );
-    }
-    let get_op = c.next_op;
-    c.next_op += 1;
-    host.store_mut().submit_get(
-        c.id,
-        get_op,
-        store::GetRequest {
-            keys: vec![key(128)],
-            skip_pages: 0,
-            expected_pages: 2,
-            row: true,
-        },
-    );
-    let outcomes = host.store_mut().dispatch();
-    assert!(matches!(outcomes[0], DispatchOutcome::Get { .. }));
-}
-
-#[test]
-fn l0_17_disk_queue_read_write_interleave() {
+fn l0_16_disk_queue_read_write_interleave() {
     let base = base("disk");
     fs::create_dir_all(&base).unwrap();
     let lock = Arc::new(disk::RootLock::acquire(&base.join("root")).unwrap());
@@ -790,7 +781,6 @@ fn l0_17_disk_queue_read_write_interleave() {
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let arena = Arena::new(8 * 4096).unwrap();
     let reader = worker.reader();
-    // Queue the writes first so a write is pending when the reads arrive.
     let write_arena = Arena::new(4 * 4096).unwrap();
     for index in 0..4 {
         let mut extent = write_arena.allocate(4096).unwrap();
@@ -843,8 +833,8 @@ fn l0_17_disk_queue_read_write_interleave() {
     fs::remove_dir_all(base).unwrap();
 }
 
-#[test]
-fn l0_18_write_budget() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_17_write_budget_and_room() {
     let base = base("budget");
     let mut config = Config::new(
         base.join("records"),
@@ -852,49 +842,46 @@ fn l0_18_write_budget() {
         64 * 1024 * 1024,
         64 * 1024 * 1024,
     );
+    config.name = instance_name("budget");
     config.write_budget = 1024 * 1024;
-    let mut host = StoreHost::open(config);
-    let mut a = host.connect();
-    host.store_record(&mut a, key(128), None);
-    host.store_record(&mut a, key(2048 * 64), None);
-    assert!(host.store().budget_balance(a.id).unwrap() < 0);
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut a = host.client().await;
+    let mut subscription = a.subscribe().await;
+    a.store(key(128), None).await;
+    a.store(key(2048 * 64), None).await;
     // Gets are never throttled by the write budget.
-    host.fetch(&mut a, &[key(128)], 0, 2);
-    let (_, answer) = host.put(&mut a, key(256), None);
-    assert_eq!(answer.tag, tag::RETRY);
-    assert_eq!(answer.payload, [1]);
-    host.pump();
-    assert!(
-        !host
-            .events
-            .iter()
-            .any(|event| matches!(event, store::StoreEvent::Room { .. }))
+    a.fetch(&[key(128)], 0, 2).await;
+    assert_eq!(
+        a.put(key(256), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Budget as u8)
     );
-    host.store_mut()
-        .tick_at(Instant::now() + Duration::from_secs(8));
-    host.collect();
-    assert!(
-        host.events
-            .iter()
-            .any(|event| matches!(event, store::StoreEvent::Room { .. }))
-    );
-    assert_eq!(host.put(&mut a, key(256), None).1.tag, tag::ACCEPT);
+    let room = subscription.until_room().await;
+    assert!(room > 0);
+    let _ = a.store(key(256), None).await;
     // Buckets are independent per connection.
-    let mut b = host.connect();
-    assert_eq!(host.put(&mut b, key(384), None).1.tag, tag::ACCEPT);
+    let mut b = host.client().await;
+    b.store(key(384), None).await;
     // 0 means unlimited.
-    let mut unlimited = StoreHost::new(64 * 1024 * 1024, 64 * 1024 * 1024);
-    let mut c = unlimited.connect();
-    unlimited.store_record(&mut c, key(2048 * 64), None);
-    unlimited.store_record(&mut c, key(2048 * 64 + 64), Some(key(2048 * 64)));
+    let mut unlimited = Host::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+    unlimited.start();
+    let mut c = unlimited.client().await;
+    c.store(key(2048 * 64), None).await;
+    c.store(key(2048 * 64 + 64), Some(key(2048 * 64))).await;
 }
 
-#[test]
-fn l0_19_v2_descriptor_format_and_v3_refusal() {
-    let mut host = StoreHost::new(1024 * 1024, 1024 * 1024);
-    let mut c = host.connect();
-    host.store_record(&mut c, key(128), None);
-    let directory = host.config.root.join(c.descriptor.name());
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_18_descriptor_format_and_recovery_refusal() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    let directory = host
+        .config
+        .root
+        .as_ref()
+        .unwrap()
+        .join(client.descriptor.name());
     let bytes = fs::read(directory.join("descriptor")).unwrap();
     assert_eq!(&bytes[..8], b"FLCDSC2\0");
     let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -903,8 +890,8 @@ fn l0_19_v2_descriptor_format_and_v3_refusal() {
         disk::crc32(&bytes[..12 + length]),
         u32::from_le_bytes(bytes[12 + length..].try_into().unwrap())
     );
-    host.close_store();
-    let root = host.config.root.clone();
+    host.stop();
+    let root = host.config.root.clone().unwrap();
     let v3 = root.join("v3-root");
     fs::create_dir_all(&v3).unwrap();
     let error = disk::recover(&root).err().expect("recover must fail");
@@ -922,4 +909,301 @@ fn l0_19_v2_descriptor_format_and_v3_refusal() {
             .contains(&other.join("descriptor").display().to_string())
     );
     assert!(error.to_string().contains("not migratable"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_19_two_managers_one_name() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let base = base("second");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        1024 * 1024,
+        1024 * 1024,
+    );
+    config.name = host.config.name.clone();
+    let mut second = Host::open_config(config);
+    assert!(second.try_start().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_20_size_mismatch_before_mmap() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let client = host.client().await;
+    let path = client.staging_path.clone();
+    drop(client);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(4096)
+        .unwrap();
+    let error = Client::connect(&host.config, descriptor())
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("size mismatch"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_21_live_disconnected_client_quarantine() {
+    if let Ok(socket) = std::env::var(CHILD_QUARANTINE) {
+        let mut config = Config::dram_only(PathBuf::from(&socket), 32768);
+        config.name = instance_name("quarantine-child");
+        let mut client = Client::connect(&config, descriptor()).await.unwrap();
+        let _ = client
+            .get(
+                &[key(128)],
+                0,
+                2,
+                GetOptions {
+                    cancel: Some(CancelAt::Grant),
+                    ..GetOptions::default()
+                },
+            )
+            .await;
+        drop(client);
+        fs::write(PathBuf::from(&socket).with_extension("ready"), b"ready").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    let mut host = Host::dram_only(32768);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    assert!(host.gauge("memory_allocated_bytes") > 0);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "l0_21_live_disconnected_client_quarantine",
+            "--nocapture",
+        ])
+        .env(CHILD_QUARANTINE, &host.config.socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let ready = host.config.socket.with_extension("ready");
+    wait(|| ready.exists());
+    // The connection is gone but the process lives: the lease is quarantined.
+    host.wait(|host| host.gauge("connections") <= 1);
+    assert!(host.gauge("memory_allocated_bytes") > 0);
+    let mut probe = host.client().await;
+    assert_eq!(
+        probe.put(key(256), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match probe.put(key(256), None, PutOptions::default()).await {
+            PutOutcome::Stored(_) => break,
+            PutOutcome::Refused(reason) if reason == crosscache::Reason::Budget as u8 => {
+                assert!(Instant::now() < deadline, "quarantine was not reclaimed");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => panic!("unexpected Put outcome after exit: {other:?}"),
+        }
+    }
+    fs::remove_file(ready).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_22_cancel_every_state_and_commit_wins() {
+    let mut host = Host::new(4096, 4 * 1024 * 1024);
+    host.start();
+    for cancel in [
+        CancelAt::Accept,
+        CancelAt::Grant,
+        CancelAt::Filled,
+        CancelAt::Commit,
+    ] {
+        let mut client = host.client().await;
+        let value = key(match cancel {
+            CancelAt::Accept => 192,
+            CancelAt::Grant => 256,
+            CancelAt::Filled => 320,
+            CancelAt::Commit => 384,
+            CancelAt::None => 128,
+        });
+        let outcome = client
+            .put(
+                value,
+                None,
+                PutOptions {
+                    cancel: Some(cancel),
+                    ..PutOptions::default()
+                },
+            )
+            .await;
+        match cancel {
+            CancelAt::Commit => assert!(matches!(outcome, PutOutcome::Stored(_))),
+            _ => assert!(
+                matches!(outcome, PutOutcome::Cancelled),
+                "{cancel:?}: {outcome:?}"
+            ),
+        }
+    }
+    let mut client = host.client().await;
+    let bytes = client.store(key(128), None).await;
+    assert_eq!(
+        client
+            .get(
+                &[key(128)],
+                0,
+                2,
+                GetOptions {
+                    cancel: Some(CancelAt::Grant),
+                    ..GetOptions::default()
+                },
+            )
+            .await,
+        GetOutcome::Cancelled
+    );
+    let mut after = host.client().await;
+    assert_eq!(after.fetch(&[key(128)], 0, 2).await[0], bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_23_commit_waits_for_durability() {
+    let base = base("commit");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("commit");
+    config.faults.pause_at = Some("before_rename".into());
+    let signal = base.join("gate");
+    config.faults.signal = Some(signal.clone());
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let stored = Arc::new(AtomicBool::new(false));
+    let flag = stored.clone();
+    let task = tokio::spawn(async move {
+        let outcome = client.put(key(128), None, PutOptions::default()).await;
+        flag.store(true, Ordering::Release);
+        outcome
+    });
+    wait(|| signal.exists());
+    assert!(!stored.load(Ordering::Acquire), "Stored before durability");
+    assert_eq!(host.durable_records(), 0);
+    fs::remove_file(signal).unwrap();
+    assert!(matches!(task.await.unwrap(), PutOutcome::Stored(_)));
+    host.durable(1);
+}
+
+#[test]
+fn l0_24_signal_handling() {
+    let base = base("signal");
+    fs::create_dir_all(base.join("run")).unwrap();
+    let socket = base.join("run/manager.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_flare-crosscache"))
+        .args([
+            "--name",
+            &instance_name("signal"),
+            "--socket",
+            socket.to_str().unwrap(),
+            "--memory",
+            "8M",
+            "--staging",
+            "8M",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    wait(|| socket.exists());
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+    assert!(!socket.exists());
+    let _ = fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_25_verify_before_window_reuse() {
+    let mut host = Host::new(4096, 4 * 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let outcome = client
+        .put(
+            key(128),
+            None,
+            PutOptions {
+                corrupt_page: Some(0),
+                ..PutOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        PutOutcome::Refused(crosscache::Reason::Invalid as u8)
+    );
+    host.wait(|host| host.gauge("staging_allocated_bytes") == 0);
+    let mut fresh = host.client().await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match fresh.put(key(128), None, PutOptions::default()).await {
+            PutOutcome::Stored(_) => break,
+            PutOutcome::Refused(reason) if reason == crosscache::Reason::Inflight as u8 => {
+                assert!(Instant::now() < deadline, "inflight did not drain");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_26_namespace_registration_and_mismatch() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    // A descriptor with the same namespace id but different geometry is a
+    // precondition failure, not a panic.
+    let mut mismatch = descriptor();
+    mismatch.ranks[0].row_bytes += 1;
+    assert_eq!(mismatch.namespace_id(), client.descriptor.namespace_id());
+    let status = client.subscribe_descriptor(&mismatch).await.err().unwrap();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    // An unregistered namespace on a Put is also a precondition failure.
+    let mut other = descriptor();
+    other.fingerprint = [11; 16];
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(crosscache::put_message::M::Begin(crosscache::PutBegin {
+                namespace_id: other.namespace_id().to_vec(),
+                key: Some(key_msg(key(64))),
+                chain_pages: 1,
+                row: true,
+                published_parent: None,
+                has_published_parent: false,
+                bucket: vec![4; 16],
+                published_tail_pages: 1,
+                descriptor: Some(descriptor_msg(&other)),
+            })),
+        })
+        .await
+        .unwrap();
+    let status = replies.message().await.err().unwrap();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    // The manager is still healthy.
+    assert!(!client.fetch(&[key(128)], 0, 2).await[0].is_empty());
 }

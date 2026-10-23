@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -50,6 +50,8 @@ pub struct DiskExtent {
     pub path: PathBuf,
     retired: AtomicBool,
     file: std::sync::Mutex<Option<Arc<File>>>,
+    // The extent itself owns one reference; readers and jobs take additional ones.
+    references: AtomicUsize,
 }
 impl DiskExtent {
     pub fn new(path: PathBuf) -> Self {
@@ -57,6 +59,7 @@ impl DiskExtent {
             path,
             retired: AtomicBool::new(false),
             file: std::sync::Mutex::new(None),
+            references: AtomicUsize::new(1),
         }
     }
     pub fn reader(&self) -> Result<Arc<File>> {
@@ -71,6 +74,29 @@ impl DiskExtent {
     }
     pub fn retire(&self) {
         self.retired.store(true, Ordering::Release);
+    }
+    pub fn acquire(&self) {
+        self.references.fetch_add(1, Ordering::AcqRel);
+    }
+    pub fn release(&self) {
+        let mut current = self.references.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.references.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+    pub fn references(&self) -> usize {
+        self.references.load(Ordering::Acquire)
     }
 }
 impl Drop for DiskExtent {
@@ -143,6 +169,23 @@ pub enum Task {
         temporary: Arc<DiskExtent>,
         header: Header,
     },
+    Read {
+        id: u64,
+        file: Arc<File>,
+        offset: u64,
+        buffer: Extent,
+    },
+}
+
+impl Task {
+    fn id(&self) -> u64 {
+        match self {
+            Self::Publish { id, .. }
+            | Self::Chunk { id, .. }
+            | Self::Compact { id, .. }
+            | Self::Read { id, .. } => *id,
+        }
+    }
 }
 
 pub struct Completion {
@@ -150,6 +193,7 @@ pub struct Completion {
     pub result: Result<()>,
     pub bytes: u64,
     pub elapsed: Duration,
+    pub data: Option<Extent>,
 }
 
 pub struct ReadTask {
@@ -188,7 +232,7 @@ pub struct Worker {
 }
 impl Worker {
     pub fn start(faults: Faults, lock: Arc<RootLock>) -> Self {
-        let (sender, writes) = mpsc::sync_channel(8);
+        let (sender, writes) = mpsc::sync_channel::<Task>(8);
         let (read_sender, reads) = mpsc::sync_channel::<ReadTask>(8);
         let (done, receiver) = mpsc::sync_channel(16);
         let state_thread = thread::current();
@@ -214,18 +258,27 @@ impl Worker {
                     if let Ok(task) = writes.try_recv() {
                         read_streak = 0;
                         let started = Instant::now();
-                        let id = match &task {
-                            Task::Publish { id, .. }
-                            | Task::Chunk { id, .. }
-                            | Task::Compact { id, .. } => *id,
+                        let id = task.id();
+                        let (result, data) = match task {
+                            Task::Read {
+                                file,
+                                offset,
+                                buffer,
+                                ..
+                            } => {
+                                let mut buffer = buffer;
+                                let result = read_into(&file, offset, &mut buffer);
+                                (result.map(|()| 0), Some(buffer))
+                            }
+                            task => (execute(task, &faults), None),
                         };
-                        let result = execute(task, &faults);
                         let bytes = result.as_ref().copied().unwrap_or(0);
                         let mut completion = Completion {
                             id,
                             result: result.map(|_| ()),
                             bytes,
                             elapsed: started.elapsed(),
+                            data,
                         };
                         loop {
                             match done.try_send(completion) {
@@ -393,6 +446,7 @@ fn execute(task: Task, faults: &Faults) -> Result<u64> {
             )?;
             Ok(header.row_segment + ENVELOPE_BYTES)
         }
+        Task::Read { .. } => Err(invalid("read task routed to the write executor")),
     }
 }
 

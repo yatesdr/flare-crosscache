@@ -164,6 +164,11 @@ impl Arena {
     pub fn capacity(&self) -> usize {
         self.0.length
     }
+    /// Base pointer and full mapped length of the region. Valid for the life of the
+    /// mapping and stable across allocations.
+    pub fn mapping(&self) -> (*mut u8, usize) {
+        (self.0.pointer.as_ptr(), self.0.length)
+    }
 }
 
 impl Extent {
