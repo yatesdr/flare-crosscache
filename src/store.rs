@@ -1062,41 +1062,45 @@ impl Store {
                 return;
             }
         }
-        let charge = record_charge(&header, true);
-        if !self.make_room(charge) {
-            for key in &pins {
-                let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
-            }
-            self.metrics.retry_budget += 1;
-            self.local.arm_budget(connection, charge);
-            self.reject_put(&events, crosscache::Reason::Budget as u8);
-            return;
-        }
-        let memory = if charge - disk::ENVELOPE_BYTES <= self.memory.capacity() as u64 {
+        let memory_charge = record_charge(&header, true);
+        let disk_charge = record_charge(&header, false);
+        let memory = if memory_charge - disk::ENVELOPE_BYTES <= self.memory.capacity() as u64 {
             self.memory_room(length as usize, self.config.root.is_some())
         } else {
             None
         };
         let (memory, streaming, reservation) = match memory {
-            Some(extent) => (Some(Arc::new(extent)), None, charge),
-            None if self.config.root.is_some() => (None, Some(()), disk::ENVELOPE_BYTES),
+            Some(extent) => (Some(Arc::new(extent)), None, memory_charge),
+            // A streamed record still occupies its disk record plus whichever
+            // staging windows are live; reserve the disk record now.
+            None if self.config.root.is_some() => (None, Some(()), disk_charge),
             None => {
                 for key in &pins {
                     let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                 }
                 self.metrics.retry_budget += 1;
-                self.local.arm_budget(connection, charge);
+                self.local.arm_budget(connection, memory_charge);
                 self.reject_put(&events, crosscache::Reason::Budget as u8);
                 return;
             }
         };
-        if !self.admit(connection, charge) {
+        if !self.make_room(reservation) {
             drop(memory);
             for key in &pins {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
             self.metrics.retry_budget += 1;
-            self.local.arm_budget(connection, charge);
+            self.local.arm_budget(connection, reservation);
+            self.reject_put(&events, crosscache::Reason::Budget as u8);
+            return;
+        }
+        if !self.admit(connection, reservation) {
+            drop(memory);
+            for key in &pins {
+                let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
+            }
+            self.metrics.retry_budget += 1;
+            self.local.arm_budget(connection, reservation);
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }

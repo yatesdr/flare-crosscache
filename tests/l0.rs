@@ -1427,3 +1427,64 @@ async fn l0_31_timed_out_publication_finishes_instead_of_orphaning() {
     assert_eq!(subscription.entries.len(), 1);
     assert!(subscription.entries.contains_key(&key(128)));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_32_streaming_reservation_includes_the_disk_record() {
+    let mut host = Host::new(4096, 64 * 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let (sender, replies) = client.raw_begin(key(128), None).await;
+    // key(128) is 2 pages + row: page_segment 8192, row_segment 16384,
+    // row 4096, so envelope + 20480 = 24576 is reserved before any staging.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.gauge("nvme_reserved_bytes") < 24576 {
+        assert!(
+            Instant::now() < deadline,
+            "streaming reservation was undercharged"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(crosscache::put_message::M::Cancel(crosscache::Cancel {})),
+        })
+        .await
+        .unwrap();
+    drop(sender);
+    drop(replies);
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.gauge("nvme_reserved_bytes") >= 24576 {
+        assert!(
+            Instant::now() < deadline,
+            "streaming reservation was not released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_33_write_budget_uses_the_streaming_charge() {
+    let base = base("stream-budget");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("stream-budget");
+    config.write_budget = 1024 * 1024;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let mut subscription = client.subscribe().await;
+    // 8 MiB streamed record: admitted with a negative balance.
+    client.store(key(2048 * 64), None).await;
+    assert_eq!(
+        client.put(key(256), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+    );
+    let room = subscription.until_room().await;
+    assert!(room > 0);
+    client.store(key(256), None).await;
+}
