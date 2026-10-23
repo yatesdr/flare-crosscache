@@ -18,7 +18,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     thread,
@@ -58,6 +58,16 @@ pub struct PeerStream {
     commands: mpsc::Sender<StoreCommand>,
     runtime: tokio::runtime::Handle,
     generations: Arc<Mutex<HashMap<u64, Generation>>>,
+    over_limit: bool,
+    _slot: ConnectionSlot,
+}
+
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl AsyncRead for PeerStream {
@@ -66,6 +76,11 @@ impl AsyncRead for PeerStream {
         context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.over_limit {
+            // A clean EOF closes the excess transport without failing the
+            // whole incoming stream.
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.inner).poll_read(context, buffer)
     }
 }
@@ -76,6 +91,12 @@ impl AsyncWrite for PeerStream {
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.over_limit {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection limit",
+            )));
+        }
         Pin::new(&mut self.inner).poll_write(context, buffer)
     }
     fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -206,6 +227,7 @@ pub fn entry_to_proto(entry: &store::EntryData) -> crosscache::CatalogEntry {
 fn map_hello_error(error: io::Error) -> Status {
     match error.kind() {
         io::ErrorKind::AlreadyExists => Status::failed_precondition(error.to_string()),
+        io::ErrorKind::WouldBlock => Status::resource_exhausted(error.to_string()),
         io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
             Status::invalid_argument(error.to_string())
         }
@@ -1111,6 +1133,7 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let incoming_commands = commands.clone();
     let incoming_generations = generations.clone();
     let counter = Arc::new(AtomicU64::new(1));
+    let connections = Arc::new(AtomicUsize::new(0));
     let async_stop = stop.clone();
     let run_stop = stop.clone();
     let result = runtime.block_on(async move {
@@ -1127,8 +1150,11 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 ));
             }
             let connection = counter.fetch_add(1, Ordering::Relaxed);
+            let open = connections.fetch_add(1, Ordering::AcqRel) + 1;
             Ok(PeerStream {
                 inner: stream,
+                over_limit: open > store::MAX_CONNECTIONS,
+                _slot: ConnectionSlot(connections.clone()),
                 info: PeerInfo {
                     connection,
                     pid: credentials.pid().unwrap_or(0) as u32,

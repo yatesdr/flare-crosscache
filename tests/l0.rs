@@ -1563,3 +1563,35 @@ async fn l0_35_generation_fencing_reaches_the_owner_thread() {
     let mut fresh = host.client().await;
     fresh.store(key(256), None).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_36_connection_limit_is_enforced() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut clients = Vec::new();
+    for _ in 0..64 {
+        clients.push(host.client().await);
+    }
+    assert!(
+        host.client_with(descriptor()).await.is_err(),
+        "the 65th connection must be refused"
+    );
+    // Dropping one transport frees its slot.
+    clients.pop();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match host.client_with(descriptor()).await {
+            Ok(client) => {
+                clients.push(client);
+                break;
+            }
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "connection slot was not released"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}

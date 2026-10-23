@@ -662,6 +662,12 @@ impl Store {
         pid: u32,
         descriptor: Descriptor,
     ) -> Result<u64> {
+        if !self.sessions.contains_key(&connection) && self.sessions.len() >= MAX_CONNECTIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "connection limit reached",
+            ));
+        }
         if replica.is_empty() || replica.len() > 256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
