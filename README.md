@@ -8,7 +8,7 @@ The client contract is [PROTOCOL.md](PROTOCOL.md), protocol version 1.
 ## Build and run
 
 Use Rust 1.87 or newer (validated with 1.94.1 on Linux). Dependencies are `libc`
-and `xxhash-rust`; there is no async runtime.
+and `twox-hash`; there is no async runtime.
 
 ```sh
 cargo build --release --locked
@@ -107,21 +107,24 @@ snapshots/deltas/Resync/namespaces; round-robin service and bounded cleanup;
 generation/op fencing; and throughput. Fault gates exist only in the library's
 test configuration and are not exposed by the executable.
 
-Throughput output reports exact Flare-record bytes, elapsed seconds and MiB/s.
-The Put interval includes client payload construction/checksums, IPC, validation,
-and waiting for chain durability. Get includes IPC and client byte collection;
-exact-byte comparison follows timing. These are end-to-end L0 CPU measurements,
-not raw NVMe rates or the L1 GPU/socket bandwidth gate. Run 2's Flare client and
-L1–L3 GPU/integration validation are separate work.
+The throughput group uses a separate manager process and one client, three
+560 MiB payloads per mode, 64 KiB pages and 4 MiB Data frames. It verifies every
+page and row checksum during Get and compares exact bytes afterward. Put ends
+at Stored; chain durability has a separate timer. Payload construction and
+allocation happen before timing. The DRAM path must reach a median 3 GB/s in
+both directions. Streaming tmpfs and NVMe results are reported separately.
+The test needs at least 2 GiB free in `/dev/shm`; use a 4 GiB container shm mount.
+Test containers need .--shm-size=4g`.
+
+```sh
+CM_NVME_SCRATCH=/nvme/cm-scratch cargo run --release --locked --example throughput
+```
+
+See [PERFORMANCE.md](PERFORMANCE.md) for before/after results, profiling and
+measurement boundaries. These are CPU transport measurements. Run 2's Flare
+client and L1–L3 GPU/integration validation remain separate work.
 
 Validated on a Linux NVMe host with Rust 1.94.1: 14 L0 groups passed, 0 failed, 0 ignored;
-rustfmt and clippy (`-D warnings`) clean. Each throughput transfer contained
-16,818,176 Flare-record bytes:
-
-| Storage | Put MiB/s | Get MiB/s |
-|---|---:|---:|
-| `/dev/shm` | 333.50 | 1377.58 |
-| NVMe (`CM_NVME_SCRATCH`) | 271.68 | 496.01 |
-
-The subprocess cases issue real SIGKILL at partial Data, before rename, after
-rename and during the parent write, and kill a replica holding a parent pin.
+rustfmt and clippy (`-D warnings`) clean. The subprocess cases issue real
+SIGKILL at partial Data, before rename, after rename and during the parent
+write, and kill a replica holding a parent pin.
