@@ -1522,6 +1522,10 @@ impl Store {
             }
             Err(GrantError::Credits) => false,
             Err(GrantError::Budget) => {
+                // A window refusal is a Put BUDGET too: arm Room with the
+                // extent this window still needs.
+                let requirement = disk::ENVELOPE_BYTES + plan.length.max(4096).next_power_of_two();
+                self.local.arm_budget(connection, requirement);
                 self.fail_put(
                     connection,
                     transfer,
@@ -4041,12 +4045,23 @@ impl Store {
                 .sessions
                 .get(&connection)
                 .is_some_and(|session| session.budget.balance() >= 0);
+            // The armed value is envelope-inclusive; compare the extent
+            // allocation it needs, not the charge, with region capacity.
+            let allocation = bytes
+                .saturating_sub(disk::ENVELOPE_BYTES)
+                .max(4096)
+                .next_power_of_two();
+            let free = (self.memory.capacity() - self.memory.used()) as u64;
+            let memory_ok = allocation <= self.memory.capacity() as u64
+                && (self.memory.can_allocate(allocation as usize)
+                    || free + self.evictable_memory() >= allocation);
             let capacity = if self.config.root.is_some() {
+                let staging_ok = allocation <= self.staging.capacity() as u64
+                    && self.staging.can_allocate(allocation as usize);
                 self.charge_total().saturating_add(bytes) <= self.config.nvme
+                    && (memory_ok || staging_ok)
             } else {
-                bytes <= self.memory.capacity() as u64
-                    && (self.memory.can_allocate(bytes as usize)
-                        || self.evictable_memory() >= bytes)
+                memory_ok
             };
             if budget_ok && capacity {
                 if let Some(bytes) = self.local.take_room(connection) {
@@ -5107,6 +5122,92 @@ mod tests {
         config.staging = 8 * 1024 * 1024;
         let store = Store::open(config).unwrap();
         (store, PathBuf::from("/dev/shm/flare-crosscache").join(name))
+    }
+
+    fn store_with_root(label: &str, memory: usize) -> (Store, PathBuf, PathBuf) {
+        let name = format!(
+            "cm-unit-{}-{label}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let mut config = Config::new(
+            base.join("records"),
+            base.join("manager.sock"),
+            memory,
+            64 << 20,
+        );
+        config.name = name.clone();
+        config.staging = 8 * 1024 * 1024;
+        let store = Store::open(config).unwrap();
+        let directory = PathBuf::from("/dev/shm/flare-crosscache").join(name);
+        (store, base, directory)
+    }
+
+    #[test]
+    fn room_admits_an_arena_sized_reservation() {
+        let (mut store, directory) = store("room-size");
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let capacity = store.memory.capacity() as u64;
+        store
+            .local
+            .arm_budget(1, crate::disk::ENVELOPE_BYTES + capacity);
+        store.room();
+        assert!(
+            store
+                .events
+                .iter()
+                .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn window_budget_arms_room() {
+        let (mut store, base, directory) = store_with_root("room-window", 4096);
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        // Hold all of staging so the first streaming window cannot be granted.
+        let hold = store.staging.allocate(8 * 1024 * 1024).unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 128,
+                    digest: [6; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 2,
+                published_tail_pages: 2,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch_trace();
+        store.pump_grants();
+        let armed = store.local.armed_budget(1);
+        assert!(armed.is_some(), "window BUDGET did not arm Room");
+        drop(hold);
+        store.events.clear();
+        store.room();
+        assert!(
+            store
+                .events
+                .iter()
+                .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
