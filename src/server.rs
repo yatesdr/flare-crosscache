@@ -7,6 +7,7 @@ use crate::{
     record::{self, Descriptor, Header},
     tree::{Eviction, Tree},
 };
+use std::hash::Hasher;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
@@ -28,7 +29,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
-use xxhash_rust::xxh3::Xxh3;
+use twox_hash::XxHash3_64;
 
 const MAX_CONNECTIONS: usize = 64;
 const CLEANUP_BATCH: usize = 16;
@@ -86,7 +87,7 @@ struct Put {
     cursor: u64,
     window_end: u64,
     window_hashes: Vec<u64>,
-    page_hash: Xxh3,
+    page_hash: Option<XxHash3_64>,
     row_hash: Option<u64>,
     row_started: bool,
     committed: bool,
@@ -122,6 +123,8 @@ struct Connection {
     socket: UnixStream,
     ops: HashMap<u64, Open>,
     held: Option<Frame>,
+    blocked: bool,
+    recycle: SyncSender<Vec<u8>>,
     refused: u64,
     dead: bool,
     pid: u32,
@@ -402,12 +405,18 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                             )
                         });
                         state.current_failed = false;
-                        if let Err(error) = state.frame(id, &mut connection, frame) {
+                        connection.blocked = false;
+                        if let Err(error) = state.frame(id, &mut connection, &frame) {
                             let _ = error;
                             connection.dead = true;
                         }
                         connection.dead |= state.current_failed;
                         state.current = None;
+                        if connection.blocked {
+                            connection.held = Some(frame);
+                        } else if frame.payload.len() > 4096 {
+                            let _ = connection.recycle.try_send(frame.payload);
+                        }
                     }
                     let expired: Vec<u64> = connection
                         .ops
@@ -440,7 +449,7 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
             metrics_at = Instant::now();
         }
         if !active {
-            thread::sleep(Duration::from_micros(200));
+            thread::park_timeout(Duration::from_micros(200));
         }
     }
     for connection in state.connections.values() {
@@ -500,6 +509,7 @@ impl State {
         let id = self.counter;
         let generation = self.boot ^ id;
         let (events, reader) = mpsc::sync_channel(1);
+        let (recycle, buffers) = mpsc::sync_channel(2);
         let (writer, output) = mpsc::sync_channel(8);
         let mut read_socket = socket.try_clone()?;
         let mut write_socket = socket.try_clone()?;
@@ -507,13 +517,23 @@ impl State {
         let writer_events = self.writer_sender.clone();
         let staging = self.staging.clone();
         let writer_lock = self.lock.clone();
+        let state_thread = thread::current();
         thread::spawn(move || {
-            while let Ok(frame) = Frame::read(&mut read_socket) {
+            while let Ok((mut frame, length)) = Frame::read_header(&mut read_socket) {
+                if length > 4096 {
+                    frame.payload = buffers.try_recv().unwrap_or_default();
+                }
+                frame.payload.resize(length - 17, 0);
+                if read_socket.read_exact(&mut frame.payload).is_err() {
+                    break;
+                }
                 if events.send(ReadEvent::Frame(frame)).is_err() {
                     return;
                 }
+                state_thread.unpark();
             }
             let _ = events.send(ReadEvent::Closed);
+            state_thread.unpark();
         });
         thread::spawn(move || {
             let _lock = writer_lock;
@@ -538,6 +558,8 @@ impl State {
                 socket,
                 ops: HashMap::new(),
                 held: None,
+                blocked: false,
+                recycle,
                 refused: 0,
                 dead: false,
                 pid,
@@ -577,7 +599,7 @@ impl State {
         }
         self.send(connection, tag::RETRY, op, vec![reason]);
     }
-    fn frame(&mut self, id: u64, connection: &mut Connection, frame: Frame) -> Result<()> {
+    fn frame(&mut self, id: u64, connection: &mut Connection, frame: &Frame) -> Result<()> {
         if connection.namespace.is_none() {
             if frame.tag != tag::HELLO || frame.op == 0 {
                 return Err(invalid("expected Hello"));
@@ -636,7 +658,7 @@ impl State {
             }
         }
     }
-    fn hello(&mut self, connection: &mut Connection, frame: Frame) -> Result<()> {
+    fn hello(&mut self, connection: &mut Connection, frame: &Frame) -> Result<()> {
         let parsed = (|| {
             let mut decoder = Decoder::new(&frame.payload);
             if decoder.u32()? != protocol::VERSION {
@@ -772,7 +794,7 @@ impl State {
             }
         }
     }
-    fn put(&mut self, connection: &mut Connection, frame: Frame) -> Result<()> {
+    fn put(&mut self, connection: &mut Connection, frame: &Frame) -> Result<()> {
         let mut decoder = Decoder::new(&frame.payload);
         let key = decoder.key()?;
         let published_parent = decoder.parent()?;
@@ -911,7 +933,7 @@ impl State {
                     cursor,
                     window_end: cursor,
                     window_hashes: Vec::new(),
-                    page_hash: Xxh3::new(),
+                    page_hash: None,
                     row_hash: None,
                     row_started: false,
                     committed: false,
@@ -1091,7 +1113,7 @@ impl State {
         }
         true
     }
-    fn put_frame(&mut self, id: u64, connection: &mut Connection, frame: Frame) -> Result<()> {
+    fn put_frame(&mut self, id: u64, connection: &mut Connection, frame: &Frame) -> Result<()> {
         let name = connection.namespace.clone().unwrap();
         let open = connection.ops.get_mut(&frame.op).unwrap();
         let Operation::Put(put) = &mut open.operation else {
@@ -1124,7 +1146,7 @@ impl State {
                 decoder.end()?;
                 put.window_hashes = hashes;
                 put.window_end = put.cursor + u64::from(pages) * put.header.page_record_bytes();
-                put.page_hash = Xxh3::new();
+                put.page_hash = None;
             }
             tag::ROW => {
                 if put.row_started
@@ -1138,7 +1160,7 @@ impl State {
                 decoder.end()?;
                 put.row_started = true;
                 put.window_end = put.header.length_with_row();
-                put.page_hash = Xxh3::new();
+                put.page_hash = None;
             }
             tag::DATA => {
                 let offset = decoder.u64()?;
@@ -1171,11 +1193,11 @@ impl State {
                             .location
                             .durable
                     }) {
-                        connection.held = Some(frame);
+                        connection.blocked = true;
                         return Ok(());
                     }
                     let Some(mut extent) = self.staging.allocate(count) else {
-                        connection.held = Some(frame);
+                        connection.blocked = true;
                         return Ok(());
                     };
                     extent.bytes_mut().copy_from_slice(data);
@@ -1199,7 +1221,7 @@ impl State {
                             );
                         }
                         Err(TrySendError::Full(_)) => {
-                            connection.held = Some(frame);
+                            connection.blocked = true;
                             return Ok(());
                         }
                         Err(TrySendError::Disconnected(_)) => {
@@ -1222,11 +1244,19 @@ impl State {
                     let unit_offset = (put.cursor - base) % unit_bytes;
                     let bytes =
                         (unit_bytes - unit_offset).min((data.len() - cursor) as u64) as usize;
-                    put.page_hash.update(&data[cursor..cursor + bytes]);
+                    let slice = &data[cursor..cursor + bytes];
+                    let hash = if unit_offset == 0 && bytes as u64 == unit_bytes {
+                        Some(record::checksum(slice))
+                    } else {
+                        put.page_hash
+                            .get_or_insert_with(XxHash3_64::default)
+                            .write(slice);
+                        (unit_offset + bytes as u64 == unit_bytes)
+                            .then(|| put.page_hash.take().unwrap().finish())
+                    };
                     put.cursor += bytes as u64;
                     cursor += bytes;
-                    if (put.cursor - base).is_multiple_of(unit_bytes) {
-                        let hash = put.page_hash.digest();
+                    if let Some(hash) = hash {
                         let expected = if put.row_started {
                             put.row_hash.unwrap()
                         } else {
@@ -1241,7 +1271,7 @@ impl State {
                         if !put.row_started {
                             put.checksums.push(hash);
                         }
-                        put.page_hash = Xxh3::new();
+                        put.page_hash = None;
                     }
                 }
                 self.config.faults.checkpoint("data");
@@ -1358,7 +1388,7 @@ impl State {
         self.result(connection, tag::STORED, op, Ok(()));
         Ok(())
     }
-    fn get(&mut self, connection: &mut Connection, frame: Frame) -> Result<()> {
+    fn get(&mut self, connection: &mut Connection, frame: &Frame) -> Result<()> {
         let parsed = (|| {
             if connection
                 .ops
@@ -2191,14 +2221,15 @@ fn stream_get(
                     let window_bytes = 64 * record.header.page_record_bytes();
                     count = count.min((window_bytes - done as u64 % window_bytes) as usize);
                 }
-                let mut payload = Encoder::default();
-                payload.u32(index as u32);
-                payload.u64(position);
-                if let Some(memory) = &record.memory {
-                    payload.bytes(&memory.bytes()[position as usize..position as usize + count]);
+                let mut prefix = [0; 12];
+                prefix[..4].copy_from_slice(&(index as u32).to_le_bytes());
+                prefix[4..].copy_from_slice(&position.to_le_bytes());
+                let mut buffer;
+                let data = if let Some(memory) = &record.memory {
+                    &memory.bytes()[position as usize..position as usize + count]
                 } else {
                     let start = Instant::now();
-                    let mut buffer = loop {
+                    buffer = loop {
                         if let Some(buffer) = staging.allocate(count) {
                             break buffer;
                         }
@@ -2212,18 +2243,12 @@ fn stream_get(
                         buffer.bytes_mut(),
                         disk::ENVELOPE_BYTES + position,
                     )?;
-                    payload.bytes(buffer.bytes());
-                }
+                    buffer.bytes()
+                };
                 if offset == 0 {
-                    metadata.extend_from_slice(&payload.0[12..]);
+                    metadata.extend_from_slice(data);
                 }
-                Frame {
-                    tag: tag::DATA,
-                    generation,
-                    op,
-                    payload: payload.0,
-                }
-                .write(socket)?;
+                Frame::write_parts(socket, tag::DATA, generation, op, &prefix, data)?;
                 let _ = events.send(WriterEvent::Progress(id, op));
                 done += count;
             }

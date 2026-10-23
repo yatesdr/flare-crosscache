@@ -404,10 +404,16 @@ impl Client {
     }
     pub fn data(&mut self, op: u64, offset: u64, bytes: &[u8]) {
         for (index, chunk) in bytes.chunks(protocol::MAX_DATA).enumerate() {
-            let mut p = Encoder::default();
-            p.u64(offset + (index * protocol::MAX_DATA) as u64);
-            p.bytes(chunk);
-            self.send(tag::DATA, op, p.0);
+            let position = offset + (index * protocol::MAX_DATA) as u64;
+            Frame::write_parts(
+                &mut self.stream,
+                tag::DATA,
+                self.generation,
+                op,
+                &position.to_le_bytes(),
+                chunk,
+            )
+            .unwrap();
         }
     }
     pub fn store(&mut self, key: Key, parent: Option<Key>) -> Vec<u8> {

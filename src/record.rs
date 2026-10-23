@@ -524,5 +524,5 @@ pub fn parse_file_name(name: &str) -> Option<Key> {
 }
 
 pub fn checksum(bytes: &[u8]) -> u64 {
-    xxhash_rust::xxh3::xxh3_64(bytes)
+    twox_hash::XxHash3_64::oneshot(bytes)
 }

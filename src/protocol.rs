@@ -2,7 +2,7 @@ use crate::{
     Key, Result, invalid,
     record::{Descriptor, RankSizes},
 };
-use std::io::{Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 pub const VERSION: u32 = 1;
 pub const MAX_DATA: usize = 4 * 1024 * 1024;
@@ -45,33 +45,82 @@ pub struct Frame {
 
 impl Frame {
     pub fn read(reader: &mut impl Read) -> Result<Self> {
-        let mut length = [0; 4];
-        reader.read_exact(&mut length)?;
-        let length = u32::from_le_bytes(length) as usize;
+        let mut frame = Self {
+            tag: 0,
+            generation: 0,
+            op: 0,
+            payload: Vec::new(),
+        };
+        frame.read_into(reader)?;
+        Ok(frame)
+    }
+    pub fn read_into(&mut self, reader: &mut impl Read) -> Result<()> {
+        let (header, length) = Self::read_header(reader)?;
+        self.tag = header.tag;
+        self.generation = header.generation;
+        self.op = header.op;
+        self.payload.resize(length - 17, 0);
+        reader.read_exact(&mut self.payload)
+    }
+    pub fn read_header(reader: &mut impl Read) -> Result<(Self, usize)> {
+        let mut header = [0; 21];
+        reader.read_exact(&mut header)?;
+        let length = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
         if !(17..=MAX_FRAME).contains(&length) {
             return Err(invalid("frame length"));
         }
-        let mut bytes = vec![0; length];
-        reader.read_exact(&mut bytes)?;
-        Ok(Self {
-            tag: bytes[0],
-            generation: u64::from_le_bytes(bytes[1..9].try_into().unwrap()),
-            op: u64::from_le_bytes(bytes[9..17].try_into().unwrap()),
-            payload: bytes[17..].to_vec(),
-        })
+        Ok((
+            Self {
+                tag: header[4],
+                generation: u64::from_le_bytes(header[5..13].try_into().unwrap()),
+                op: u64::from_le_bytes(header[13..21].try_into().unwrap()),
+                payload: Vec::new(),
+            },
+            length,
+        ))
     }
     pub fn write(&self, writer: &mut impl Write) -> Result<()> {
-        let length = 17 + self.payload.len();
-        if length > MAX_FRAME || self.op == 0 {
+        Self::write_parts(
+            writer,
+            self.tag,
+            self.generation,
+            self.op,
+            &[],
+            &self.payload,
+        )
+    }
+    pub fn write_parts(
+        writer: &mut impl Write,
+        tag: u8,
+        generation: u64,
+        op: u64,
+        prefix: &[u8],
+        data: &[u8],
+    ) -> Result<()> {
+        let length = 17 + prefix.len() + data.len();
+        if length > MAX_FRAME || op == 0 || prefix.len() > 12 {
             return Err(invalid("frame length or op"));
         }
-        let mut bytes = Vec::with_capacity(length + 4);
-        bytes.extend_from_slice(&(length as u32).to_le_bytes());
-        bytes.push(self.tag);
-        bytes.extend_from_slice(&self.generation.to_le_bytes());
-        bytes.extend_from_slice(&self.op.to_le_bytes());
-        bytes.extend_from_slice(&self.payload);
-        writer.write_all(&bytes)
+        let mut header = [0; 33];
+        header[..4].copy_from_slice(&(length as u32).to_le_bytes());
+        header[4] = tag;
+        header[5..13].copy_from_slice(&generation.to_le_bytes());
+        header[13..21].copy_from_slice(&op.to_le_bytes());
+        header[21..21 + prefix.len()].copy_from_slice(prefix);
+        let mut slices = [
+            IoSlice::new(&header[..21 + prefix.len()]),
+            IoSlice::new(data),
+        ];
+        let mut remaining = &mut slices[..];
+        while !remaining.is_empty() {
+            match writer.write_vectored(remaining) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "frame write")),
+                Ok(count) => IoSlice::advance_slices(&mut remaining, count),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 
