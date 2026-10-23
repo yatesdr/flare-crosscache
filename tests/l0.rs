@@ -634,42 +634,5 @@ fn l0_13_unknown_finished_cancelled_and_stale_frames() {
 
 #[test]
 fn l0_14_shm_and_real_nvme_throughput() {
-    let scratch =
-        std::env::var_os("CM_NVME_SCRATCH").expect("CM_NVME_SCRATCH must name an NVMe scratch directory");
-    for (tier, root) in [
-        ("shm", std::path::PathBuf::from("/dev/shm")),
-        ("nvme", scratch.into()),
-    ] {
-        let mut host = Host::new(4096, 256 * 1024 * 1024);
-        host.config.root = root.join(format!("cm-throughput-{}", std::process::id()));
-        host.start();
-        let mut c = host.client();
-        let k = key(4096 * 64);
-        let start = Instant::now();
-        let bytes = c.store(k, None);
-        host.durable(1);
-        let put_seconds = start.elapsed().as_secs_f64();
-        let start = Instant::now();
-        let data = c.fetch(&[k], 0, 4096);
-        let get_seconds = start.elapsed().as_secs_f64();
-        let mut actual = vec![0; bytes.len()];
-        for (_, offset, chunk) in data {
-            actual[offset as usize..offset as usize + chunk.len()].copy_from_slice(&chunk);
-        }
-        assert_eq!(actual, bytes);
-        let size = bytes.len();
-        println!(
-            "L0 throughput {tier}: bytes={size} put_seconds={put_seconds:.6} get_seconds={get_seconds:.6} put_MiB_s={:.2} get_MiB_s={:.2}",
-            size as f64 / 1048576.0 / put_seconds,
-            size as f64 / 1048576.0 / get_seconds
-        );
-        assert!(
-            size as f64 / put_seconds > 5.0 * 1048576.0,
-            "Put throughput regression"
-        );
-        assert!(
-            size as f64 / get_seconds > 5.0 * 1048576.0,
-            "Get throughput regression"
-        );
-    }
+    support::throughput::run(true);
 }

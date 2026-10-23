@@ -468,6 +468,7 @@ impl Client {
     }
 }
 
+pub mod throughput;
 
 pub fn encode_header(header: &Header) -> [u8; 4096] {
     let mut encoder = Encoder::default();
