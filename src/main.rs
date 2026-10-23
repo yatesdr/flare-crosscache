@@ -1,4 +1,4 @@
-use flare_cache_manager::{
+use flare_crosscache::{
     Result, invalid,
     server::{self, Config},
 };
@@ -23,7 +23,7 @@ fn size(value: &str) -> Result<u64> {
 }
 fn main() {
     if let Err(error) = start() {
-        eprintln!("flare-cache-manager: {error}");
+        eprintln!("flare-crosscache: {error}");
         std::process::exit(1);
     }
 }
@@ -38,7 +38,7 @@ fn start() -> Result<()> {
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
             println!(
-                "flare-cache-manager [--root DIR] [--socket PATH] [--memory BYTES] [--nvme BYTES] [--staging BYTES] [--metrics HOST:PORT]\nSizes accept binary K, M, G, T suffixes. Linux only; same uid and gid as clients."
+                "flare-crosscache [--root DIR] [--socket PATH] [--memory BYTES] [--nvme BYTES] [--staging BYTES] [--metrics HOST:PORT]\nSizes accept binary K, M, G, T suffixes. Linux only; same uid and gid as clients."
             );
             return Ok(());
         }

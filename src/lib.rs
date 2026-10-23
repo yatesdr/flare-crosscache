@@ -1,4 +1,5 @@
 pub mod arena;
+pub mod crosscache;
 pub mod disk;
 pub mod protocol;
 pub mod record;

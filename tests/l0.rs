@@ -1,5 +1,5 @@
 mod support;
-use flare_cache_manager::{
+use flare_crosscache::{
     arena::Arena,
     disk,
     protocol::{self, Frame, tag},

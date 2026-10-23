@@ -1,12 +1,26 @@
 [package]
-name = "flare-cache-manager"
+name = "flare-crosscache"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.87"
 
 [dependencies]
+blake2 = "0.10"
 libc = "0.2"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+toml = "0.8"
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring"] }
+tonic-prost = "0.14"
 twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_64"] }
+
+[build-dependencies]
+prost-build = "0.14"
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+sha2 = "0.10"
 
 [profile.release]
 debug = 1

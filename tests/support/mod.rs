@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use flare_cache_manager::{
+use flare_crosscache::{
     Key, disk,
     protocol::{self, Decoder, Encoder, Frame, tag},
     record::{self, Descriptor, Header, RankSizes},
