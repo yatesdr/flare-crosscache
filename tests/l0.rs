@@ -1819,3 +1819,38 @@ async fn l0_41_streaming_windows_respect_the_nvme_cap() {
     let _ = client.store(key(3), None).await;
     assert!(host.gauge("nvme_reserved_bytes") <= 24 * 1024);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_42_cancel_before_dispatch_withdraws_the_put() {
+    let mut host = Host::new(1024 * 1024, 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(client.begin(key(128), None)),
+        })
+        .await
+        .unwrap();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(crosscache::put_message::M::Cancel(crosscache::Cancel {})),
+        })
+        .await
+        .unwrap();
+    while let Ok(Ok(Some(_))) =
+        tokio::time::timeout(Duration::from_millis(200), replies.message()).await
+    {}
+    drop(sender);
+    drop(replies);
+    host.wait(|host| host.gauge("open_ops") == 0);
+    let mut fresh = host.client().await;
+    // The withdrawn Put must not leave INFLIGHT behind.
+    let _ = fresh.store(key(128), None).await;
+}

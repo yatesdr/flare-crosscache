@@ -3163,6 +3163,31 @@ impl Store {
 
     fn cancel(&mut self, connection: u64, transfer: u64) {
         self.metrics.cancels += 1;
+        // A Begin that has not reached dispatch yet must be withdrawn too.
+        let mut removed_pending = false;
+        if let Some(queue) = self.pending_puts.get_mut(&connection) {
+            if let Some(index) = queue.iter().position(|put| put.transfer == transfer) {
+                queue.remove(index);
+                removed_pending = true;
+            }
+            if queue.is_empty() {
+                self.pending_puts.remove(&connection);
+                self.put_order.retain(|id| *id != connection);
+            }
+        }
+        if let Some(queue) = self.pending_gets.get_mut(&connection) {
+            if let Some(index) = queue.iter().position(|get| get.transfer == transfer) {
+                queue.remove(index);
+                removed_pending = true;
+            }
+            if queue.is_empty() {
+                self.pending_gets.remove(&connection);
+                self.get_order.retain(|id| *id != connection);
+            }
+        }
+        if removed_pending {
+            return;
+        }
         let Some(open) = self
             .sessions
             .get_mut(&connection)
@@ -5330,6 +5355,54 @@ mod tests {
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/flare-crosscache").join(name));
+    }
+
+    #[test]
+    fn cancel_removes_a_queued_begin() {
+        let (mut store, directory) = store("cancel-queued");
+        let value = descriptor();
+        store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 128,
+                    digest: [8; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 2,
+                published_tail_pages: 2,
+                row: true,
+            },
+            put_events,
+        );
+        store.cancel(1, 1);
+        assert!(store.dispatch_trace().is_empty());
+        let (get_events, _get_receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_get(
+            1,
+            2,
+            GetRequest {
+                keys: vec![Key {
+                    consumed_tokens: 64,
+                    digest: [4; 16],
+                }],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+            },
+            get_events,
+        );
+        store.cancel(1, 2);
+        assert!(store.dispatch_trace().is_empty());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
