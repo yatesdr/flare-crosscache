@@ -170,6 +170,8 @@ pub struct Put {
     pins: VecDeque<Key>,
     replacement: bool,
     reservation: u64,
+    physical: u64,
+    window_charge: u64,
     events: tokio::sync::mpsc::Sender<Result<PutAnswer>>,
     outbox: VecDeque<Result<PutAnswer>>,
 }
@@ -486,6 +488,7 @@ pub struct Store {
     next_transfer: u64,
     read_backlog: VecDeque<(NamespaceId, u64, Task)>,
     detached_puts: HashMap<(u64, u64), Put>,
+    armed_allocations: HashMap<u64, u64>,
     forward_events: Vec<ForwardEvent>,
 }
 
@@ -547,6 +550,7 @@ impl Store {
             next_transfer: 1,
             read_backlog: VecDeque::new(),
             detached_puts: HashMap::new(),
+            armed_allocations: HashMap::new(),
             forward_events: Vec::new(),
         };
         let mut recovered_age = Vec::new();
@@ -1013,15 +1017,17 @@ impl Store {
             self.reject_put(&events, crosscache::Reason::Invalid as u8);
             return;
         }
-        let old = self.namespaces[&id].tree.node(&request.key).cloned();
+        let initial_old = self.namespaces[&id].tree.node(&request.key).cloned();
         if self.namespaces[&id].inflight.contains(&request.key)
-            || old.as_ref().is_some_and(|node| !node.row && node.pinned())
+            || initial_old
+                .as_ref()
+                .is_some_and(|node| !node.row && node.pinned())
         {
             self.metrics.retry_inflight += 1;
             self.reject_put(&events, crosscache::Reason::Inflight as u8);
             return;
         }
-        if old.as_ref().is_some_and(|node| node.row) {
+        if initial_old.as_ref().is_some_and(|node| node.row) {
             self.metrics.present += 1;
             self.reject_put(&events, crosscache::Reason::Present as u8);
             return;
@@ -1029,6 +1035,124 @@ impl Store {
         if Self::put_count(&self.sessions[&connection]) >= OPEN_PUTS {
             self.metrics.retry_queue += 1;
             self.reject_put(&events, crosscache::Reason::Queue as u8);
+            return;
+        }
+        let initial_bucket = match &initial_old {
+            Some(node) => {
+                if node.bucket != request.bucket {
+                    self.reject_put(&events, crosscache::Reason::Invalid as u8);
+                    return;
+                }
+                node.bucket
+            }
+            None => request.bucket,
+        };
+        let initial_parent = match &initial_old {
+            Some(node) => node.parent,
+            None => request.published_parent.filter(|parent| {
+                self.namespaces[&id]
+                    .tree
+                    .node(parent)
+                    .is_some_and(|node| node.row)
+            }),
+        };
+        let initial_first =
+            initial_parent.map_or(0, |parent| parent.consumed_tokens / descriptor.page_tokens);
+        let Some(initial_tail) = request
+            .chain_pages
+            .checked_sub(u32::try_from(initial_first).unwrap_or(u32::MAX))
+        else {
+            self.reject_put(&events, crosscache::Reason::Invalid as u8);
+            return;
+        };
+        let child_header = match Header::new(
+            &descriptor,
+            request.key,
+            initial_parent,
+            initial_bucket,
+            initial_tail,
+        ) {
+            Ok(header) => header,
+            Err(_) => {
+                self.reject_put(&events, crosscache::Reason::Invalid as u8);
+                return;
+            }
+        };
+        let root_header = match Header::new(
+            &descriptor,
+            request.key,
+            None,
+            initial_bucket,
+            request.chain_pages,
+        ) {
+            Ok(header) => header,
+            Err(_) => {
+                self.reject_put(&events, crosscache::Reason::Invalid as u8);
+                return;
+            }
+        };
+        // If the root shape fits, a reservation eviction may remove the
+        // selected parent and the Put is reshaped to a root. If the root
+        // cannot fit, the parent must survive and is protected during the
+        // reservation instead.
+        let root_fits = if self.config.root.is_some() {
+            disk::ENVELOPE_BYTES.saturating_add(root_header.length_with_row()) <= self.config.nvme
+        } else {
+            root_header.length_with_row() <= self.memory.capacity() as u64
+        };
+        let worst = if root_fits {
+            &root_header
+        } else {
+            &child_header
+        };
+        let worst_length = worst.length_with_row();
+        if self.config.root.is_some() {
+            if disk::ENVELOPE_BYTES.saturating_add(worst_length) > self.config.nvme {
+                self.metrics.oversize += 1;
+                self.reject_put(&events, crosscache::Reason::Oversize as u8);
+                return;
+            }
+        } else if worst_length > self.memory.capacity() as u64 {
+            self.metrics.oversize += 1;
+            self.reject_put(&events, crosscache::Reason::Oversize as u8);
+            return;
+        }
+        let worst_window = planned_window_charge(worst, self.config.max_window_bytes);
+        let worst_physical = record_charge(worst, true)
+            .max(record_charge(worst, false).saturating_add(worst_window));
+        let protected: Vec<Key> = if root_fits {
+            Vec::new()
+        } else {
+            initial_parent
+                .into_iter()
+                .chain(initial_old.is_some().then_some(request.key))
+                .collect()
+        };
+        for key in &protected {
+            if self.namespaces.get_mut(&id).unwrap().tree.pin(key).is_err() {
+                for key in &protected {
+                    let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
+                }
+                self.reject_put(&events, crosscache::Reason::Invalid as u8);
+                return;
+            }
+        }
+        let reserved = self.make_room(worst_physical);
+        for key in &protected {
+            let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
+        }
+        if !reserved {
+            self.metrics.retry_budget += 1;
+            self.arm(connection, worst_physical, worst_window);
+            self.reject_put(&events, crosscache::Reason::Budget as u8);
+            return;
+        }
+        // Revalidate: eviction may have removed the selected parent or the
+        // replacement target.
+        let old = self.namespaces[&id].tree.node(&request.key).cloned();
+        if old.as_ref().is_some_and(|node| node.row) {
+            self.metrics.present += 1;
+            self.reject_put(&events, crosscache::Reason::Present as u8);
             return;
         }
         let replacement = old.is_some();
@@ -1067,39 +1191,23 @@ impl Store {
             }
         };
         let length = header.length_with_row();
-        if self.config.root.is_some() {
-            if disk::ENVELOPE_BYTES.saturating_add(length) > self.config.nvme {
-                self.metrics.oversize += 1;
-                self.reject_put(&events, crosscache::Reason::Oversize as u8);
-                return;
-            }
-        } else if length > self.memory.capacity() as u64 {
-            self.metrics.oversize += 1;
-            self.reject_put(&events, crosscache::Reason::Oversize as u8);
-            return;
-        }
-        let mut pins: VecDeque<Key> = parent
+        let pins: VecDeque<Key> = parent
             .into_iter()
             .chain(replacement.then_some(request.key))
             .collect();
         for key in &pins {
             if self.namespaces.get_mut(&id).unwrap().tree.pin(key).is_err() {
-                pins.make_contiguous().iter().for_each(|_| {});
+                for key in &pins {
+                    let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
+                }
                 self.reject_put(&events, crosscache::Reason::Invalid as u8);
                 return;
             }
         }
         let memory_charge = record_charge(&header, true);
         let disk_charge = record_charge(&header, false);
-        // The write budget covers the live staging window as well as the disk
-        // record for a streamed Put.
-        let window_charge = self
-            .config
-            .max_window_bytes
-            .max(header.page_record_bytes())
-            .max(header.row_record_bytes())
-            .max(4096)
-            .next_power_of_two();
+        let window_charge = planned_window_charge(&header, self.config.max_window_bytes);
+        let physical = disk_charge.saturating_add(window_charge);
         let mut admission = memory_charge;
         let memory = if memory_charge - disk::ENVELOPE_BYTES <= self.memory.capacity() as u64 {
             self.memory_room(length as usize, self.config.root.is_some())
@@ -1111,7 +1219,7 @@ impl Store {
             // A streamed record still occupies its disk record plus whichever
             // staging windows are live; reserve the disk record now.
             None if self.config.root.is_some() => {
-                admission = disk_charge + window_charge;
+                admission = physical;
                 (None, Some(()), disk_charge)
             }
             None => {
@@ -1119,28 +1227,27 @@ impl Store {
                     let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                 }
                 self.metrics.retry_budget += 1;
-                self.local.arm_budget(connection, memory_charge);
+                self.arm(
+                    connection,
+                    memory_charge,
+                    memory_charge - disk::ENVELOPE_BYTES,
+                );
                 self.reject_put(&events, crosscache::Reason::Budget as u8);
                 return;
             }
         };
-        if !self.make_room(reservation) {
-            drop(memory);
-            for key in &pins {
-                let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
-            }
-            self.metrics.retry_budget += 1;
-            self.local.arm_budget(connection, reservation);
-            self.reject_put(&events, crosscache::Reason::Budget as u8);
-            return;
-        }
         if !self.admit(connection, admission) {
             drop(memory);
             for key in &pins {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
             self.metrics.retry_budget += 1;
-            self.local.arm_budget(connection, admission);
+            let allocation = if streaming.is_some() {
+                window_charge
+            } else {
+                memory_charge - disk::ENVELOPE_BYTES
+            };
+            self.arm(connection, admission, allocation);
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }
@@ -1191,6 +1298,8 @@ impl Store {
             pins,
             replacement,
             reservation,
+            physical,
+            window_charge,
             events,
             outbox: VecDeque::new(),
         };
@@ -1287,6 +1396,15 @@ impl Store {
             self.delta(id, 2, node.key);
         }
         true
+    }
+
+    fn arm(&mut self, connection: u64, total: u64, allocation: u64) {
+        let current = self.local.armed_budget(connection).unwrap_or(0);
+        if total >= current {
+            self.local.arm_budget(connection, total);
+            self.armed_allocations
+                .insert(connection, allocation.max(4096).next_power_of_two());
+        }
     }
 
     fn make_room(&mut self, bytes: u64) -> bool {
@@ -1496,8 +1614,17 @@ impl Store {
         if memory.is_none() {
             let window = plan.length.max(4096).next_power_of_two();
             if self.charge_total().saturating_add(window) > self.config.nvme {
-                self.local
-                    .arm_budget(connection, disk::ENVELOPE_BYTES + window);
+                let complete = self
+                    .sessions
+                    .get(&connection)
+                    .and_then(|session| session.ops.get(&transfer))
+                    .and_then(|open| match &open.operation {
+                        Operation::Put(put) => Some((put.physical, put.window_charge)),
+                        Operation::Get(_) => None,
+                    });
+                let (physical, window_charge) =
+                    complete.unwrap_or((disk::ENVELOPE_BYTES + window, window));
+                self.arm(connection, physical, window_charge);
                 self.fail_put(
                     connection,
                     transfer,
@@ -1552,8 +1679,19 @@ impl Store {
             Err(GrantError::Budget) => {
                 // A window refusal is a Put BUDGET too: arm Room with the
                 // extent this window still needs.
-                let requirement = disk::ENVELOPE_BYTES + plan.length.max(4096).next_power_of_two();
-                self.local.arm_budget(connection, requirement);
+                let complete = self
+                    .sessions
+                    .get(&connection)
+                    .and_then(|session| session.ops.get(&transfer))
+                    .and_then(|open| match &open.operation {
+                        Operation::Put(put) => Some((put.physical, put.window_charge)),
+                        Operation::Get(_) => None,
+                    });
+                let (physical, window_charge) = complete.unwrap_or((
+                    disk::ENVELOPE_BYTES + plan.length.max(4096).next_power_of_two(),
+                    plan.length.max(4096).next_power_of_two(),
+                ));
+                self.arm(connection, physical, window_charge);
                 self.fail_put(
                     connection,
                     transfer,
@@ -3306,6 +3444,7 @@ impl Store {
     }
 
     fn connection_closed(&mut self, connection: u64) {
+        self.armed_allocations.remove(&connection);
         self.local.close(connection);
         self.subscriptions.remove(&connection);
         self.pending_gets.remove(&connection);
@@ -4177,21 +4316,25 @@ impl Store {
                 .sessions
                 .get(&connection)
                 .is_some_and(|session| session.budget.balance() >= 0);
-            // The armed value is envelope-inclusive; compare the extent
-            // allocation it needs, not the charge, with region capacity.
-            let allocation = bytes
-                .saturating_sub(disk::ENVELOPE_BYTES)
-                .max(4096)
-                .next_power_of_two();
+            // The armed value is the complete physical requirement; the
+            // allocation is the actual extent or window it needs.
+            let allocation = self
+                .armed_allocations
+                .get(&connection)
+                .copied()
+                .unwrap_or_else(|| {
+                    bytes
+                        .saturating_sub(disk::ENVELOPE_BYTES)
+                        .max(4096)
+                        .next_power_of_two()
+                });
             let free = (self.memory.capacity() - self.memory.used()) as u64;
             let memory_ok = allocation <= self.memory.capacity() as u64
                 && (self.memory.can_allocate(allocation as usize)
                     || free + self.evictable_memory() >= allocation);
             let capacity = if self.config.root.is_some() {
-                // A streamed record only needs room for one window to retry.
-                let staging_need = allocation.min(self.config.max_window_bytes.max(4096));
-                let staging_ok = staging_need <= self.staging.capacity() as u64
-                    && self.staging.can_allocate(staging_need as usize);
+                let staging_ok = allocation <= self.staging.capacity() as u64
+                    && self.staging.can_allocate(allocation as usize);
                 self.charge_total().saturating_add(bytes) <= self.config.nvme
                     && (memory_ok || staging_ok)
             } else {
@@ -4199,6 +4342,7 @@ impl Store {
             };
             if budget_ok && capacity {
                 if let Some(bytes) = self.local.take_armed(connection) {
+                    self.armed_allocations.remove(&connection);
                     self.events.push(StoreEvent::Room { connection, bytes });
                 }
             }
@@ -4900,6 +5044,17 @@ fn plan_put_grants(header: &Header, first_page: u32, max_window: u64) -> Vec<Pla
     grants
 }
 
+fn planned_window_charge(header: &Header, max_window: u64) -> u64 {
+    let first = header
+        .parent
+        .map_or(0, |parent| parent.consumed_tokens / header.page_tokens) as u32;
+    plan_put_grants(header, first, max_window)
+        .iter()
+        .map(|grant| grant.length.max(4096).next_power_of_two())
+        .max()
+        .unwrap_or(4096)
+}
+
 fn plan_get_record_grants(
     header: &Header,
     first_page: u32,
@@ -5309,16 +5464,57 @@ mod tests {
             .hello(1, "l0".into(), std::process::id(), value)
             .unwrap();
         // A record far larger than staging can still stream one window at a
-        // time, so Room must not require the whole record to fit.
+        // time, so Room must not require the whole record to fit: the armed
+        // total is the record, the allocation is the window.
         store
             .local
             .arm_budget(1, crate::disk::ENVELOPE_BYTES + 16 * 1024 * 1024);
+        store.armed_allocations.insert(1, 4 * 1024 * 1024);
         store.room();
         assert!(
             store
                 .events
                 .iter()
                 .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn room_does_not_offer_an_oversized_unit_it_cannot_fit() {
+        let (mut store, base, directory) = store_with_root("room-unit", 4096);
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        store.arm(
+            1,
+            crate::disk::ENVELOPE_BYTES + 16 * 1024 * 1024,
+            16 * 1024 * 1024,
+        );
+        store.room();
+        assert!(
+            !store
+                .events
+                .iter()
+                .any(|event| matches!(event, StoreEvent::Room { .. })),
+            "a 16 MiB unit cannot fit the 8 MiB staging region"
+        );
+        store.local.take_armed(1);
+        store.armed_allocations.remove(&1);
+        store.arm(
+            1,
+            crate::disk::ENVELOPE_BYTES + 8 * 1024 * 1024,
+            8 * 1024 * 1024,
+        );
+        store.room();
+        assert!(
+            store
+                .events
+                .iter()
+                .any(|event| matches!(event, StoreEvent::Room { .. }))
         );
         drop(store);
         let _ = fs::remove_dir_all(base);
@@ -5477,8 +5673,18 @@ mod tests {
         );
         store.dispatch_trace();
         store.pump_grants();
-        let armed = store.local.armed_budget(1);
-        assert!(armed.is_some(), "window BUDGET did not arm Room");
+        let (physical, window_charge) = {
+            let operation = &store.sessions[&1].ops[&1].operation;
+            let Operation::Put(put) = operation else {
+                panic!("expected Put");
+            };
+            (put.physical, put.window_charge)
+        };
+        assert_eq!(store.local.armed_budget(1), Some(physical));
+        assert_eq!(
+            store.armed_allocations.get(&1).copied(),
+            Some(window_charge.max(4096).next_power_of_two())
+        );
         drop(hold);
         store.events.clear();
         store.room();
@@ -5511,7 +5717,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_admission_charges_a_staging_window() {
+    fn streaming_admission_uses_the_planned_window() {
         let name = format!(
             "cm-unit-{}-budget-staging-{}",
             std::process::id(),
@@ -5547,13 +5753,30 @@ mod tests {
                 published_tail_pages: 2,
                 row: true,
             },
+            events.clone(),
+        );
+        store.dispatch_trace();
+        // The planned window is 12288 bytes (size class 16384), not the
+        // negotiated 4 MiB maximum, so the first Put stays in budget.
+        assert!(store.budget_balance(1).unwrap() >= 0);
+        store.submit_put(
+            1,
+            2,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 192,
+                    digest: [8; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 3,
+                published_tail_pages: 3,
+                row: true,
+            },
             events,
         );
         store.dispatch_trace();
-        assert!(
-            store.budget_balance(1).unwrap() < 0,
-            "staging window must count against the write budget"
-        );
+        assert!(store.budget_balance(1).unwrap() >= 0);
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/flare-crosscache").join(name));

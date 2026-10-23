@@ -1926,3 +1926,70 @@ async fn l0_44_wrong_namespace_get_is_refused_invalid() {
     // The session is still usable for its own namespace.
     assert!(!client.fetch(&[key(128)], 0, 2).await[0].is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_45_reserve_before_pin_with_four_open_puts() {
+    let base = base("reserve-pin");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        8 * 1024 * 1024,
+        9 * 1024 * 1024,
+    );
+    config.name = instance_name("reserve-pin");
+    config.staging = 8 * 1024 * 1024;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut descriptor = descriptor();
+    descriptor.ranks[0].row_bytes = 4096 * 1023;
+    let mut client = host.client_with(descriptor).await.unwrap();
+    client.store(key(64), None).await;
+    host.durable(1);
+    // Four open child Puts, as Flare keeps. Before reserve-before-pin all
+    // four pinned the parent and BUDGETed; at least the first must be admitted
+    // now that the reservation may evict and reshape.
+    let mut streams = Vec::new();
+    for index in 0..4u64 {
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let replies = client
+            .inner
+            .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+            .await
+            .unwrap()
+            .into_inner();
+        sender
+            .send(crosscache::PutMessage {
+                m: Some(client.begin(key(128 + index * 64), Some(key(64)))),
+            })
+            .await
+            .unwrap();
+        streams.push((sender, replies));
+    }
+    let mut accepts = 0;
+    let mut budget = 0;
+    for (_, replies) in streams.iter_mut() {
+        loop {
+            match replies.message().await.unwrap().unwrap().r {
+                Some(crosscache::put_reply::R::Accept(_)) => {
+                    accepts += 1;
+                    break;
+                }
+                Some(crosscache::put_reply::R::Refused(refused))
+                    if refused.reason == crosscache::Reason::Budget as i32 =>
+                {
+                    budget += 1;
+                    break;
+                }
+                Some(crosscache::put_reply::R::Grant(_)) => continue,
+                Some(_) => break,
+                None => break,
+            }
+        }
+    }
+    assert!(
+        accepts >= 1,
+        "no child Put was admitted (accepts={accepts}, budget={budget})"
+    );
+    drop(streams);
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
