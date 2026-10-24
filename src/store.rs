@@ -222,7 +222,6 @@ fn release_slot_job(put: &mut Put, job: u64) {
 enum RootChoice {
     Store(Extent),
     Wait(PutRequirement, Vec<Key>),
-    Oversize,
 }
 
 pub struct Put {
@@ -1233,7 +1232,13 @@ impl Store {
                     None if rootless => {
                         let root_pins: Vec<Key> =
                             replacement.then_some(request.key).into_iter().collect();
-                        match self.rootless_fallback(&root_header, root_pins, arena_bytes) {
+                        match self.rootless_fallback(
+                            &child_header,
+                            &selected_pins,
+                            &root_header,
+                            root_pins,
+                            arena_bytes,
+                        ) {
                             RootChoice::Store(extent) => {
                                 let requirement = PutRequirement::arena(extent.capacity() as u64);
                                 memory = Some(Arc::new(extent));
@@ -1245,11 +1250,6 @@ impl Store {
                                 self.metrics.retry_budget += 1;
                                 self.arm(connection, requirement, protected, None);
                                 self.reject_put(&events, proto::Reason::Budget as u8);
-                                return;
-                            }
-                            RootChoice::Oversize => {
-                                self.metrics.oversize += 1;
-                                self.reject_put(&events, proto::Reason::Oversize as u8);
                                 return;
                             }
                         }
@@ -1474,21 +1474,24 @@ impl Store {
     }
 
     /// Rootless fallback when the arena cannot hold the child beside its
-    /// parent: store the whole chain as one record instead, reporting the root
-    /// extent when the allocator can provide it or the requirement a retry has
-    /// to wait for. The caller has already refused records whose own extent
-    /// cannot fit the arena, so the full-chain record is the only remaining
-    /// shape; when that cannot fit either, no Room can ever arrive and the Put
-    /// is OVERSIZE.
+    /// parent: try to store the whole chain as one record, otherwise report
+    /// what the retry has to wait for. The caller has already refused a child
+    /// whose own extent exceeds the arena, so the child's shape is
+    /// structurally possible; a wait can succeed once unrelated records leave,
+    /// and only the child's own requirement and its protected parent are
+    /// waited on.
     fn rootless_fallback(
         &mut self,
+        child: &Header,
+        child_pins: &[Key],
         root: &Header,
         root_pins: Vec<Key>,
         arena_bytes: u64,
     ) -> RootChoice {
         let requirement = self.put_requirement(root, arena_bytes);
         if requirement.streaming {
-            return RootChoice::Oversize;
+            let waiting = self.put_requirement(child, arena_bytes);
+            return RootChoice::Wait(waiting, child_pins.to_vec());
         }
         match self.memory_room_excluding(root.length_with_row() as usize, false, &root_pins) {
             Some(extent) => RootChoice::Store(extent),
@@ -1894,8 +1897,33 @@ impl Store {
         }
     }
 
+    /// Releases the Put windows still granted when an operation ends without
+    /// filling them. Filled windows returned theirs on WindowFilled; anything
+    /// left holds a lease on the record's arena extent. Get windows are not
+    /// released here: they stay valid after Done or a refusal until the client
+    /// releases them, because it may still be copying the bytes out.
+    fn release_put_windows(&mut self, connection: u64, transfer: u64) {
+        let indexes = self
+            .sessions
+            .get_mut(&connection)
+            .and_then(|session| session.ops.get_mut(&transfer))
+            .map(|open| match &mut open.operation {
+                Operation::Put(put) => {
+                    let indexes: Vec<u32> = put.windows.granted.keys().copied().collect();
+                    put.windows.granted.clear();
+                    indexes
+                }
+                Operation::Get(_) => Vec::new(),
+            })
+            .unwrap_or_default();
+        for index in indexes {
+            let _ = self.local.release(connection, transfer, index);
+        }
+    }
+
     fn fail_put(&mut self, connection: u64, transfer: u64, reason: u8, error: io::Error) {
         self.metrics.puts_error += 1;
+        self.release_put_windows(connection, transfer);
         if let Some(open) = self
             .sessions
             .get_mut(&connection)
@@ -3522,6 +3550,7 @@ impl Store {
         if removed_pending {
             return;
         }
+        self.release_put_windows(connection, transfer);
         let Some(open) = self
             .sessions
             .get_mut(&connection)

@@ -100,7 +100,9 @@ stream ends with `Stored{bytes}` (the record length) or `Refused`.
 `Present` is a successful deduplication: no bytes are transferred and the
 record is available. A replica may send `Cancel` before it has sent `Commit`;
 after `Commit` the operation runs to `Stored` or a refusal. A window's credit
-returns when its `WindowFilled` is accepted or when the operation ends.
+returns when its `WindowFilled` is accepted. Unfilled windows are released when
+the operation ends, so a replica must stop writing to a window once it cancels
+or receives a terminal reply.
 
 ## Get stream
 
@@ -117,6 +119,12 @@ a window out, the replica must send `WindowReleased{transfer, index}`; that
 returns the credit and lets the manager reuse the window. `GetDone` arrives only
 after every record and window has been delivered and released. `Cancel` may be
 sent at any time.
+
+A window already granted to a `Get` stays valid after `GetDone`, a refusal or a
+cancellation until the replica releases it: the replica may still be copying its
+bytes out. The manager keeps those bytes allocated, including after the peer
+connection is gone, until the granting process exits. A replica that abandons a
+restore must still release its windows or close the connection.
 
 The replica validates the namespace, geometry, key, parent, metadata and every
 page and row checksum before using the restored bytes. A short stream, a stale
@@ -179,8 +187,9 @@ survive manager restarts and are recovered into the disk tier.
 
 - Call `Hello` before any other RPC, keep the generation for the connection's
   lifetime, and rebuild the session on `ABORTED` or a transport failure.
-- Map both region files after `Hello`, use only granted windows, and never
-  retain a window after `WindowReleased` or the end of its operation.
+- Map both region files after `Hello`, use only granted windows, never use a Put
+  window after its `WindowFilled` is sent or the operation ends, and never use
+  a Get window after releasing it.
 - Validate every restored record before use and fail closed to recompute.
 - Retry only transient reasons, and only after `Room` or an availability change.
 - Discard catalog events from a superseded generation or subscription epoch.

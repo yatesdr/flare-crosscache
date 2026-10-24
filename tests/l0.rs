@@ -2195,20 +2195,26 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_51_rootless_child_that_needs_its_parent_is_refused_oversize() {
-    // The 32 KiB arena holds a two-page parent, and the parent's rounded
-    // extent fills it. The child's four-page tail needs the same 32 KiB next
-    // to the pinned parent while its six-page full-chain fallback needs
-    // 64 KiB, so no shape can be admitted: OVERSIZE.
+async fn l0_51_rootless_child_waiting_for_its_parent_earns_no_room() {
+    // The 32 KiB arena holds a two-page parent. The four-page-tail child
+    // needs 32 KiB while its six-page root needs 64 KiB, so only the parent
+    // surviving can admit it; Room must not count that parent as reclaimable.
     let mut host = Host::dram_only(32 * 1024);
     host.start();
     let mut client = host.client().await;
     client.store(key(128), None).await;
+    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(384), Some(key(128)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered for an allocation that needs the protected parent"
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }
@@ -2855,4 +2861,70 @@ async fn l0_60_restore_is_not_refused_when_the_nvme_budget_is_full() {
         host.gauge("nvme_reserved_bytes")
     );
     assert_eq!(client.fetch(&[key(512 * 64)], 0, 512).await[0], streamed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_61_rootless_temporary_pressure_waits_instead_of_oversize() {
+    // A 48 KiB arena: a 16 KiB parent and a 32 KiB child fit together once
+    // nothing else is held. An unrelated 32 KiB record, accepted but never
+    // committed, occupies the arena, so the child cannot be allocated now and
+    // its six-page full-chain fallback would need 64 KiB. That is temporary
+    // pressure, not an impossible shape: the Put waits for Room, and the retry
+    // succeeds as soon as the unrelated operation ends.
+    let mut host = Host::dram_only(48 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(64), None).await;
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let mut replies = client
+        .inner
+        .clone()
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(proto::PutMessage {
+            m: Some(client.begin(key(3 * 64), None)),
+        })
+        .await
+        .unwrap();
+    let accept = replies.message().await.unwrap().unwrap();
+    assert!(
+        matches!(accept.r, Some(proto::put_reply::R::Accept(_))),
+        "{accept:?}"
+    );
+
+    let child = key(6 * 64);
+    assert_eq!(
+        client
+            .put(child, Some(key(64)), PutOptions::default())
+            .await,
+        PutOutcome::Refused(proto::Reason::Budget as u8)
+    );
+
+    // End the unrelated Put; its extent returns and the retry is admitted.
+    sender
+        .send(proto::PutMessage {
+            m: Some(proto::put_message::M::Cancel(proto::Cancel {})),
+        })
+        .await
+        .unwrap();
+    drop(sender);
+    drop(replies);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client
+            .put(child, Some(key(64)), PutOptions::default())
+            .await
+        {
+            PutOutcome::Stored(_) => break,
+            PutOutcome::Refused(reason) if reason == proto::Reason::Budget as u8 => {
+                assert!(Instant::now() < deadline, "the retry never earned room");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => panic!("unexpected retry outcome: {other:?}"),
+        }
+    }
 }
