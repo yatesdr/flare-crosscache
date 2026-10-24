@@ -2184,20 +2184,28 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_51_rootless_child_that_cannot_fit_beside_its_parent_is_oversize() {
+async fn l0_51_rootless_child_that_cannot_fit_beside_its_parent_waits() {
     // The 32 KiB arena holds a two-page parent, whose rounded extent fills
-    // it. The four-page-tail child also needs 32 KiB, so the two can never
-    // share the arena, and the six-page full-chain fallback needs 64 KiB. No
-    // shape can ever be admitted: OVERSIZE, not a Room that never arrives.
+    // it, so the four-page-tail child cannot be admitted while the parent
+    // stays. That shortage depends on what must stay resident, not on the
+    // child's own shape, so it is a Budget rather than an OVERSIZE; no Room
+    // arrives and nothing is stored.
     let mut host = Host::dram_only(32 * 1024);
     host.start();
     let mut client = host.client().await;
     client.store(key(128), None).await;
+    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(384), Some(key(128)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered for an allocation that needs the protected parent"
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }
@@ -3048,30 +3056,38 @@ async fn l0_64_refuses_a_record_whose_admission_charge_cannot_fit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_65_rootless_tail_counts_every_retained_ancestor() {
+async fn l0_65_rootless_tail_shortage_waits_without_room() {
     // A 64 KiB arena holds a five-page root and a five-page tail. The next
     // four-page tail needs 32 KiB beside both retained ancestors (96 KiB in
-    // total), and the whole-chain fallback needs 128 KiB, so no shape can ever
-    // fit: the refusal is OVERSIZE, not a Room that never arrives.
+    // total), which depends on what must stay resident rather than on the
+    // record's own shape: it is a Budget, and no Room can arrive.
     let mut host = Host::dram_only(64 * 1024);
     host.start();
     let mut client = host.client().await;
     client.store(key(5 * 64), None).await;
     client.store(key(10 * 64), Some(key(5 * 64))).await;
+    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(14 * 64), Some(key(10 * 64)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered for an allocation the retained chain can never free"
+    );
+    host.wait(|host| host.gauge("open_ops") == 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_66_protected_parent_charge_is_counted_at_admission() {
-    // The parent's reservation and the child's together exceed --nvme. The
-    // parent is protected by this admission and cannot even compact, so no
-    // eviction can make room: the refusal is OVERSIZE rather than a Room that
-    // can never arrive.
+async fn l0_66_protected_parent_shortage_is_a_budget() {
+    // The parent's reservation and the child's together exceed --nvme, and
+    // the parent is protected by this admission. That is a capacity shortage
+    // caused by what must stay resident, not by the record's own charge: it
+    // is a Budget with no Room, and nothing is stored.
     let base = base("protected-ancestry");
     let mut config = Config::new(
         base.join("records"),
@@ -3084,10 +3100,18 @@ async fn l0_66_protected_parent_charge_is_counted_at_admission() {
     host.start();
     let mut client = host.client().await;
     client.store(key(5 * 64), None).await;
+    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(10 * 64), Some(key(5 * 64)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered for a charge the protected parent keeps occupied"
+    );
+    host.wait(|host| host.gauge("open_ops") == 0);
 }

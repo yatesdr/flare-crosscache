@@ -1071,59 +1071,6 @@ impl Store {
         })));
     }
 
-    /// Arena extents of a record's retained ancestry. A node with a child is
-    /// never removed, so every ancestor's extent stays resident while the
-    /// child is admitted; a rootless arena must hold all of them together.
-    fn retained_ancestry_extent(&self, id: NamespaceId, key: Option<Key>) -> u64 {
-        let Some(namespace) = self.namespaces.get(&id) else {
-            return 0;
-        };
-        let mut total = 0u64;
-        let mut next = key;
-        while let Some(key) = next {
-            let Some(node) = namespace.tree.node(&key) else {
-                break;
-            };
-            if let Some(extent) = &node.location.memory {
-                total = total.saturating_add(extent.capacity() as u64);
-            }
-            next = node.parent;
-        }
-        total
-    }
-
-    /// The durable charge a record's ancestry can never give up while the
-    /// record is admitted. Ancestors are never removed; the pinned parent of
-    /// this admission cannot even compact, and any other ancestor can at most
-    /// drop its row, so its floor is the envelope plus its page segment.
-    fn retained_ancestry_charge(
-        &self,
-        id: NamespaceId,
-        key: Option<Key>,
-        pinned: Option<Key>,
-    ) -> u64 {
-        let Some(namespace) = self.namespaces.get(&id) else {
-            return 0;
-        };
-        let mut total = 0u64;
-        let mut next = key;
-        while let Some(key) = next {
-            let Some(node) = namespace.tree.node(&key) else {
-                break;
-            };
-            let floor = if Some(key) == pinned {
-                node.location.bytes
-            } else if node.location.disk.is_some() && node.row && node.children() == 1 {
-                disk::ENVELOPE_BYTES.saturating_add(node.location.header.page_segment)
-            } else {
-                node.location.bytes
-            };
-            total = total.saturating_add(floor);
-            next = node.parent;
-        }
-        total
-    }
-
     fn begin_put(&mut self, pending: PendingPut) {
         let PendingPut {
             connection,
@@ -1241,20 +1188,13 @@ impl Store {
         let replacement = initial_old.is_some();
         let arena_bytes = self.memory.capacity() as u64;
         // The arena rounds every record extent up to a power of two. Without a
-        // root there is no disk to stream to, so the child can be stored only
-        // beside its published parent or as a whole-chain replacement for it.
-        // When it fits neither shape, no Room can ever arrive and the Put is
-        // OVERSIZE; otherwise a shortage is a Budget wait.
-        if rootless {
-            let extent = |header: &Header| header.length_with_row().max(4096).next_power_of_two();
-            let retained = self.retained_ancestry_extent(id, initial_parent);
-            if extent(&child_header).saturating_add(retained) > arena_bytes
-                && extent(&root_header) > arena_bytes
-            {
-                self.metrics.oversize += 1;
-                self.reject_put(&events, proto::Reason::Oversize as u8);
-                return;
-            }
+        // root there is no disk to stream to, so a record whose own extent
+        // cannot fit the arena can never be stored. Whether it fits beside
+        // what else must stay resident is a Room question, not OVERSIZE.
+        if rootless && child_header.length_with_row().max(4096).next_power_of_two() > arena_bytes {
+            self.metrics.oversize += 1;
+            self.reject_put(&events, proto::Reason::Oversize as u8);
+            return;
         }
         let selected_pins: Vec<Key> = initial_parent
             .into_iter()
@@ -1263,17 +1203,17 @@ impl Store {
         // Admission charges the durable budget with the shape's full
         // reservation: the envelope plus the rounded extent for a record the
         // arena keeps, and for a streamed record the envelope, the record and
-        // its mandatory two-window staging hold. A record that cannot fit even
-        // beside everything it must keep in place is OVERSIZE; a tighter
-        // budget is a Budget wait.
+        // its mandatory two-window staging hold. Only the record's own charge
+        // can make it OVERSIZE; a shortage caused by what else must stay
+        // resident is a Budget, and without Room the record is simply not
+        // stored.
         let extent = child_header.length_with_row().max(4096).next_power_of_two();
         let charge = if extent <= arena_bytes {
             disk::ENVELOPE_BYTES.saturating_add(extent)
         } else {
             self.put_requirement(&child_header, 0).charge
         };
-        let retained = self.retained_ancestry_charge(id, initial_parent, initial_parent);
-        if !rootless && retained.saturating_add(charge) > self.config.nvme {
+        if !rootless && charge > self.config.nvme {
             self.metrics.oversize += 1;
             self.reject_put(&events, proto::Reason::Oversize as u8);
             return;
