@@ -45,9 +45,8 @@ bucket and a Put is admitted only while its balance is non-negative, so the
 budget is admission control, not a device throttle: an admitted record is
 written at full speed, and the budget limits neither in-flight writes,
 compaction nor recovery. A low budget delays the admission, and therefore the
-durability, of later records, which in turn delays DRAM eviction of admitted
-ones; setting it around the device's sustained write rate keeps the write queue
-from growing.
+durability, of later records; setting it around the device's sustained write
+rate keeps the write queue from growing.
 
 The arena and staging are preallocated files in `/dev/shm/selene/<name>`, so
 the shared-memory mount must provide at least `--memory + --staging` for each
@@ -76,6 +75,11 @@ Room notification that arrives when capacity or the budget frees up.
 | `INVALID` | Malformed request, namespace-descriptor mismatch or geometry disagreement between a replica and the manager. | Alert. Check the protocol version and that replicas and manager use the same prepared package. |
 | `IO` | An NVMe read or write failed. | Alert on `cm_nvme_errors_total`; check the device and file system. |
 | `INFLIGHT` | A duplicate operation for the same prefix is in flight. | None; retry after it settles. |
+
+`OVERSIZE` describes only a record that can never fit on its own. A shortage
+that depends on what else must stay resident - the retained ancestry, a
+protected parent, another operation's lease - is `BUDGET`, and without `Room`
+the record is simply not stored.
 
 `QUOTA` and `UNSPECIFIED` are defined by the protocol but never produced by
 this manager.

@@ -176,6 +176,14 @@ The replica retries only after `Room` or another availability change; a steady
 | `IO` | A manager device operation failed. | Fail the operation and report the manager as unhealthy. |
 | `QUOTA`, `UNSPECIFIED` | Reserved; never produced by this manager. | Treat as a protocol error. |
 
+`OVERSIZE` is a structural impossibility of the record's own shape: its full
+admission charge - the envelope plus its rounded extent, or for a streamed
+record the envelope, the record and its two-window staging hold - exceeds a
+configured capacity. A shortage that depends on what else must stay resident
+(the retained ancestry, a protected parent, another operation's lease) is
+`BUDGET`. A replica retries only on `Room`, so a shortage that never clears
+simply leaves the record unstored.
+
 ## Checksums and durability
 
 Every page and row carries a 64-bit xxh3 checksum supplied by the writer with
