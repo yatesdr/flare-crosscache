@@ -2975,13 +2975,22 @@ async fn l0_63_a_paused_put_keeps_its_window_past_the_deadline() {
             None => panic!("the Put ended before a grant"),
         }
     };
-    // Stall until the manager fails the operation for no progress.
+    // Stall until the manager ends the operation for no progress: the stream
+    // task fails it with DEADLINE_EXCEEDED and the store timer refuses it with
+    // INVALID, and either may reach the client first.
     match tokio::time::timeout(Duration::from_secs(10), replies.message())
         .await
         .expect("the no-progress deadline did not fire")
     {
         Ok(None) => {}
-        Ok(Some(reply)) => panic!("unexpected reply after the deadline: {reply:?}"),
+        Ok(Some(reply)) => {
+            let refused = matches!(
+                &reply.r,
+                Some(proto::put_reply::R::Refused(refused))
+                    if refused.reason == proto::Reason::Invalid as i32
+            );
+            assert!(refused, "unexpected reply after the deadline: {reply:?}");
+        }
         Err(status) => assert!(status.message().contains("no progress"), "{status:?}"),
     }
     // Resume writing into the window; the extent must not be reusable.
