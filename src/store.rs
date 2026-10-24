@@ -2261,16 +2261,9 @@ impl Store {
             }
             Next::Read { file } => {
                 let length = usize::try_from(plan.length).unwrap_or(usize::MAX);
-                let window = length.max(4096).next_power_of_two() as u64;
-                if self.charge_total().saturating_add(window) > self.config.nvme {
-                    self.fail_get(
-                        connection,
-                        transfer,
-                        proto::Reason::Budget as u8,
-                        invalid("staging capacity"),
-                    );
-                    return false;
-                }
+                // Restore windows are transient staging traffic: reads do not
+                // grow the durable set, so they are bounded by the staging
+                // region alone and never by the NVMe budget.
                 let Some(extent) = self.staging.allocate(length) else {
                     self.fail_get(
                         connection,
@@ -3078,16 +3071,8 @@ impl Store {
             let (offset, buffer, kind) = if let Some(extent) = fill {
                 (disk::ENVELOPE_BYTES, extent, ReadKind::Fill)
             } else {
-                let window = meta_length.max(4096).next_power_of_two() as u64;
-                if self.charge_total().saturating_add(window) > self.config.nvme {
-                    self.fail_get(
-                        connection,
-                        transfer,
-                        proto::Reason::Budget as u8,
-                        invalid("staging capacity"),
-                    );
-                    return;
-                }
+                // Metadata windows are staging traffic too; a full durable
+                // budget must not refuse a restore.
                 let Some(extent) = self.staging.allocate(meta_length) else {
                     self.fail_get(
                         connection,

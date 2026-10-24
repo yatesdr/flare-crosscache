@@ -34,8 +34,8 @@ never be admitted, so admission refuses it `OVERSIZE`.
 record. It must exceed the largest record a replica can publish; otherwise the
 Put is refused `OVERSIZE`. Size it for the durable working set, and keep it
 above `--memory`: DRAM eviction requires durability, so a full NVMe budget
-stops DRAM from making room. Restores also charge their in-flight windows
-against this budget, so leave headroom above the durable set.
+stops DRAM from making room. Restore windows are transient staging traffic and
+are never charged to this budget, so a full cache does not refuse restores.
 
 `--write-budget` is a token bucket in bytes per second with a burst of
 `max(rate, 1 MiB)`; `0` (the default) is unlimited. A Put is admitted only
@@ -82,7 +82,7 @@ the gauge proportions against the configured budgets, not absolute values.
 | `cm_nvme_bytes_total`, `cm_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes; write rate far from `--write-budget`. |
 | `cm_memory_allocated_bytes` | Arena bytes in use. | Near `--memory`, especially with rising evictions. |
 | `cm_staging_allocated_bytes` | Staging bytes in use. | Near `--staging`; streamed transfers are waiting. |
-| `cm_nvme_reserved_bytes` | Durable charge including envelopes. | Near `--nvme`: DRAM eviction stops when durability cannot be admitted. |
+| `cm_nvme_reserved_bytes` | Bytes reserved against `--nvme`: durable records plus in-flight staging reservations. | Near `--nvme`: DRAM eviction stops when durability cannot be admitted. |
 | `cm_pending_puts`, `cm_pending_gets` | Operations queued across connections. | Sustained non-zero: clients outrun the manager. |
 | `cm_evictions_total`, `cm_compactions_total` | DRAM evictions and row compactions. | Evictions frequent enough that the hot set does not stay resident. |
 | `cm_hits_total{namespace,tier}`, `cm_records`, `cm_bytes` | Per-namespace hits and inventory. | Hit rate collapse, or a namespace that no longer matches a deployed package. |

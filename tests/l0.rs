@@ -2828,3 +2828,31 @@ async fn l0_59_refuses_a_streamed_record_whose_staging_hold_cannot_fit() {
         PutOutcome::Stored(_)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_60_restore_is_not_refused_when_the_nvme_budget_is_full() {
+    // One streamed record and two arena records fill the durable budget close
+    // to --nvme. A restore window is transient staging traffic, not a durable
+    // reservation, so the disk read must still be served.
+    let base = base("restore-budget");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        1024 * 1024,
+        3_200_000,
+    );
+    config.name = instance_name("restore-budget");
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let streamed = client.store(key(512 * 64), None).await;
+    client.store(key(64 * 64), None).await;
+    client.store(key(64 * 64 + 1), None).await;
+    host.durable(3);
+    assert!(
+        host.gauge("nvme_reserved_bytes") > 3_000_000,
+        "the durable budget must be nearly full: {}",
+        host.gauge("nvme_reserved_bytes")
+    );
+    assert_eq!(client.fetch(&[key(512 * 64)], 0, 512).await[0], streamed);
+}
