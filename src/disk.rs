@@ -263,8 +263,8 @@ impl Worker {
                     if let Ok(mut task) = reads.try_recv() {
                         let result = read_into(&task.file, task.offset, &mut task.buffer);
                         read_streak += 1;
-                        let _ = task.ack.send((result, task.buffer));
                         faults.trace(b'R');
+                        let _ = task.ack.send((result, task.buffer));
                         acted = true;
                     } else if let Ok(task) = async_reads.try_recv() {
                         if let Task::Read {
@@ -284,11 +284,11 @@ impl Worker {
                                 elapsed: started.elapsed(),
                                 data: Some(buffer),
                             };
+                            faults.trace(b'R');
                             send_completion(&done, completion, &thread_stop);
                             state_thread.unpark();
                         }
                         read_streak += 1;
-                        faults.trace(b'R');
                         acted = true;
                     }
                 }
@@ -318,6 +318,7 @@ impl Worker {
                             elapsed: started.elapsed(),
                             data,
                         };
+                        faults.trace(b'W');
                         loop {
                             match done.try_send(completion) {
                                 Ok(()) => break,
@@ -332,7 +333,6 @@ impl Worker {
                             }
                         }
                         state_thread.unpark();
-                        faults.trace(b'W');
                         acted = true;
                     }
                 }
@@ -355,11 +355,11 @@ impl Worker {
                                 elapsed: started.elapsed(),
                                 data: Some(buffer),
                             };
+                            faults.trace(b'R');
                             send_completion(&done, completion, &thread_stop);
                             state_thread.unpark();
                         }
                         read_streak += 1;
-                        faults.trace(b'R');
                         acted = true;
                     }
                 }
@@ -368,8 +368,8 @@ impl Worker {
                         // No pending write: keep reading rather than idle.
                         let result = read_into(&task.file, task.offset, &mut task.buffer);
                         read_streak += 1;
-                        let _ = task.ack.send((result, task.buffer));
                         faults.trace(b'R');
+                        let _ = task.ack.send((result, task.buffer));
                         acted = true;
                     }
                 }
