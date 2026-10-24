@@ -25,8 +25,9 @@ DRAM; without `--root` it can never be admitted and is refused `OVERSIZE`.
 
 `--staging` is a bounded scratch region. Each streamed Put reserves a fixed
 hold of two of its largest windows (a page window is at most 4 MiB unless a
-single page is larger, and the row is a window of its own), and disk reads draw
-their windows from the same region. The minimum is 8 MiB and the default
+single page is larger; the row rides with the last page window when it fits and
+is otherwise a window of its own), and disk reads draw their windows from the
+same region. The minimum is 8 MiB and the default
 is 256 MiB; provision at least 8-16 MiB per concurrent streamed transfer. A
 streamed record whose two-window hold exceeds the whole staging region can
 never be admitted, so admission refuses it `OVERSIZE`.
@@ -41,10 +42,12 @@ are never charged to this budget, so a full cache does not refuse restores.
 `--write-budget` is a token bucket in bytes per second with a burst of
 `max(rate, 1 MiB)`; `0` (the default) is unlimited. Each connection has its own
 bucket and a Put is admitted only while its balance is non-negative, so the
-budget is admission control, not a device throttle: it does not rate-limit
-writes already in flight, compaction or recovery. A low budget delays
-durability, and therefore DRAM eviction; setting it around the device's
-sustained write rate keeps the write queue from growing.
+budget is admission control, not a device throttle: an admitted record is
+written at full speed, and the budget limits neither in-flight writes,
+compaction nor recovery. A low budget delays the admission, and therefore the
+durability, of later records, which in turn delays DRAM eviction of admitted
+ones; setting it around the device's sustained write rate keeps the write queue
+from growing.
 
 The arena and staging are preallocated files in `/dev/shm/selene/<name>`, so
 the shared-memory mount must provide at least `--memory + --staging` for each
@@ -53,9 +56,10 @@ manager. A container's default 64 MiB `/dev/shm` is far too small; use
 
 Tenancy separates cache keys, not memory: every replica runs with the manager's
 uid and maps the same arena and staging files, so any replica can read another
-tenant's mapped bytes. Do not rely on tenants as a security boundary; use
-separate managers (or separate users and hosts) when tenants must not see each
-other's data.
+tenant's mapped bytes. Tenants are not a security boundary, and separate
+managers under one uid do not change that - they map the same shared memory.
+When tenants must not see each other's data, give each trust boundary its own
+uid (with distinct instance names) or its own host.
 
 ## Refusal reasons
 
@@ -91,7 +95,7 @@ the gauge proportions against the configured budgets, not absolute values.
 | `cm_nvme_bytes_total`, `cm_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes; write rate far from `--write-budget`. |
 | `cm_memory_allocated_bytes` | Arena bytes in use. | Near `--memory`, especially with rising evictions. |
 | `cm_staging_allocated_bytes` | Staging bytes in use. | Near `--staging`; streamed transfers are waiting. |
-| `cm_nvme_reserved_bytes` | Bytes reserved against `--nvme`: durable record reservations plus bytes currently allocated in staging. | Near `--nvme`: DRAM eviction stops when durability cannot be admitted. |
+| `cm_nvme_reserved_bytes` | The rounded record reservations in force - durable or still only in DRAM - plus the staging bytes currently in use. | Near `--nvme`: DRAM eviction stops when durability cannot be admitted. |
 | `cm_pending_puts`, `cm_pending_gets` | Operations queued across connections. | Sustained non-zero: clients outrun the manager. |
 | `cm_evictions_total`, `cm_compactions_total` | DRAM evictions and row compactions. | Evictions frequent enough that the hot set does not stay resident. |
 | `cm_hits_total{namespace,tier}`, `cm_records`, `cm_bytes` | Per-namespace hits and inventory. | Hit rate collapse, or a namespace that no longer matches a deployed package. |
