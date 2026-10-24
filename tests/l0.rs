@@ -287,7 +287,9 @@ fn l0_06_multiprocess_kill_recovery() {
         config.faults.pause_at = Some(point.clone());
         config.faults.signal = Some(base.join("gate"));
         if let Ok(dump) = std::env::var(CHILD_DUMP) {
-            let store = selene::store::Store::open(config).unwrap();
+            let store = selene::store::Store::open(config).unwrap_or_else(|error| {
+                panic!("the snapshot child could not open the store: {error}")
+            });
             let snapshot = store
                 .namespace_id()
                 .and_then(|id| store.snapshot(id))
@@ -373,11 +375,16 @@ fn l0_06_multiprocess_kill_recovery() {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        wait(|| dump.exists());
-        assert_eq!(
-            fs::read_to_string(&dump).unwrap().parse::<usize>().unwrap(),
-            recovered.len()
-        );
+        // `exists` can be true before the child has written the snapshot, so wait for a
+        // value the file actually parses to.
+        let mut snapshot = None;
+        wait(|| {
+            snapshot = fs::read_to_string(&dump)
+                .ok()
+                .and_then(|text| text.parse::<usize>().ok());
+            snapshot.is_some()
+        });
+        assert_eq!(snapshot.unwrap(), recovered.len());
         restarted.kill().unwrap();
         restarted.wait().unwrap();
         fs::remove_dir_all(base).unwrap();
