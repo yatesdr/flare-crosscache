@@ -53,7 +53,8 @@ buffers also consume memory. NVMe admission includes the 4096-byte manager
 envelope and the complete padded Flare record. All namespaces share these
 budgets. Records whose rounded extent exceeds the arena stream through staging
 and also charge a fixed two-window staging hold; a record that fits the arena
-waits for DRAM room.
+waits for DRAM room, and streams as well when the arena cannot make room for
+it.
 
 A DRAM publication is acknowledged before NVMe durability. A manager crash can
 lose recently acknowledged records whose ancestor chains have not reached NVMe.
@@ -75,7 +76,7 @@ leases, open operations, cancellations, discarded frames and arena allocations.
 ```sh
 docker build -t selene .
 docker run --rm --name selene \
-  --user "$(id -u):$(id -g)" --pid=host --network=host --shm-size=16g \
+  --user "$(id -u):$(id -g)" --pid=host --network=host --ipc=host \
   -v /run/selene:/run/selene \
   -v /nvme/flare-cache:/var/lib/flare-cache \
   selene --root /var/lib/flare-cache --nvme 256G --memory 8G \
@@ -83,11 +84,13 @@ docker run --rm --name selene \
 ```
 
 Create `/run/selene` and the root directory with ownership matching the runtime
-uid/gid. The shared-memory mount must hold `--memory + --staging`, so the
-container needs `--shm-size` above the default 64 MiB. Share the socket
-directory and a PID namespace with the replicas so the peer pid matches
-`SO_PEERCRED`; the example uses the host PID namespace. No GPU flags, CUDA
-libraries, privileges, or network cache transport are required.
+uid/gid. The arena and staging live in `/dev/shm/selene` on the host, so the
+manager and every replica must share that mount: run all of them with
+`--ipc=host` as above, or bind-mount the same directory at `/dev/shm/selene`
+in each container. The host's `/dev/shm` must hold `--memory + --staging`.
+Share the socket directory and a PID namespace with the replicas so the peer
+pid matches `SO_PEERCRED`; the example uses the host PID namespace. No GPU
+flags, CUDA libraries, privileges, or network cache transport are required.
 
 ## Tests
 
@@ -118,13 +121,15 @@ round-robin service and bounded cleanup; generation/op fencing; and throughput.
 Fault gates exist only in the library's test configuration and are not exposed
 by the executable.
 
-The throughput group uses a separate manager process and one client, three
-560 MiB payloads per mode, 64 KiB pages and 4 MiB Data frames. It verifies every
-page and row checksum during Get and compares exact bytes afterward. Put ends
-at Stored; chain durability has a separate timer. Payload construction and
-allocation happen before timing. Streaming tmpfs and NVMe results are reported
-separately. The test needs at least 2 GiB free in `/dev/shm`; test containers
-need `--shm-size=4g`.
+The throughput group runs an in-process manager and one client across three
+modes - DRAM through shared memory, staged streaming through shared memory, and
+staged streaming on NVMe - with 128 64 KiB pages (about 8 MiB) per record and
+six samples per mode, the first a warm-up. It compares the exact fetched bytes
+and requires a DRAM median of at least 1 GB/s in both directions; the streamed
+modes report their medians without a floor. Set `CM_NVME_SCRATCH` to a
+disposable directory on a local NVMe file system for the NVMe mode. The test
+needs room for the DRAM record in `/dev/shm`; test containers need
+`--shm-size=4g`.
 
 ```sh
 CM_NVME_SCRATCH=/nvme/cm-scratch cargo run --release --locked --example throughput
