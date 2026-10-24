@@ -1305,8 +1305,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cleanup_stops_a_running_owner_and_removes_the_socket_first() {
+    fn cleanup_shuts_down_a_stalled_owner_with_a_full_queue() {
         use std::sync::atomic::AtomicBool as Flag;
+        use std::sync::mpsc as std_mpsc;
 
         let base = std::env::temp_dir().join(format!("selene-cleanup-{}", std::process::id()));
         let config = crate::store::Config::new(
@@ -1322,8 +1323,9 @@ mod tests {
         let worker_socket = socket.clone();
         let root = config.root.clone().unwrap();
         let (commands, mut receiver) = mpsc::channel::<StoreCommand>(1);
-        let removed_first = Arc::new(Flag::new(false));
-        let observed = removed_first.clone();
+        let (gate_tx, gate_rx) = std_mpsc::channel::<()>();
+        let (gated_tx, gated_rx) = std_mpsc::channel::<()>();
+        let (removed_tx, removed_rx) = std_mpsc::channel::<bool>();
         let mut cleanup = Cleanup {
             stop: Arc::new(Flag::new(false)),
             commands: commands.clone(),
@@ -1334,24 +1336,52 @@ mod tests {
         };
         cleanup.owner = Some(thread::spawn(move || {
             let mut store = Some(store);
+            let mut gated = false;
             while let Some(command) = receiver.blocking_recv() {
                 if matches!(command, StoreCommand::Shutdown) {
-                    // The socket must be gone while the store (and its locks) still live.
-                    observed.store(!worker_socket.exists(), Ordering::Release);
+                    let _ = removed_tx.send(!worker_socket.exists());
                     break;
+                }
+                if !gated {
+                    // Hold the queue full until the test releases this thread.
+                    gated = true;
+                    let _ = gated_tx.send(());
+                    let _ = gate_rx.recv_timeout(Duration::from_secs(10));
                 }
             }
             drop(store.take());
         }));
-        // A full queue would have dropped a non-blocking shutdown.
+        // The owner holds the first command, so the second one fills the queue and keeps it
+        // full for longer than a bounded retry would wait.
+        commands.try_send(StoreCommand::Tick).unwrap();
+        gated_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the owner took the first command");
         commands.try_send(StoreCommand::Tick).unwrap();
         drop(commands);
-        drop(cleanup);
-        assert!(!socket.exists(), "cleanup removes the socket");
-        assert!(
-            removed_first.load(Ordering::Acquire),
+        let finished = Arc::new(Flag::new(false));
+        let flag = finished.clone();
+        let worker = thread::spawn(move || {
+            drop(cleanup);
+            flag.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_millis(150));
+        gate_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !finished.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleanup did not finish: the owner never saw Shutdown"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            removed_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
             "the socket is removed before the store drops"
         );
+        assert!(!socket.exists());
         assert!(
             crate::disk::RootLock::acquire(&root).is_ok(),
             "the owner released the root lock"
