@@ -1807,10 +1807,12 @@ async fn l0_41_streaming_windows_respect_the_nvme_cap() {
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
-    // The disk record fits the cap but its first staging window does not.
+    // The record's streamed admission charge (envelope, record and the
+    // two-window staging hold) can never fit the cap, so it is refused
+    // outright rather than waiting for a Room that cannot arrive.
     assert_eq!(
         client.put(key(128), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
     );
     assert!(host.gauge("nvme_reserved_bytes") <= 24 * 1024);
     // A row-only record whose window does fit still streams.
@@ -2044,9 +2046,10 @@ async fn l0_47_dram_only_evicts_the_parent_to_store_the_root() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_48_streaming_reserves_both_grantable_windows() {
     // 128 pages and a 4 KiB row: 528 KiB of disk record plus a fixed 1 MiB
-    // hold for two of the 512 KiB trailing windows. A 1,100 KiB budget
-    // cannot take the complete requirement even though the older charge of
-    // disk plus the largest window (1,040 KiB) would have fitted.
+    // hold for two of the 512 KiB trailing windows. A 1,100 KiB budget can
+    // never take the complete requirement even though the older charge of
+    // disk plus the largest window (1,040 KiB) would have fitted, so the
+    // record is refused OVERSIZE rather than waiting for a Room.
     let tight = base("two-windows-small");
     let mut config = Config::new(
         tight.join("records"),
@@ -2058,7 +2061,6 @@ async fn l0_48_streaming_reserves_both_grantable_windows() {
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
-    let mut subscription = client.subscribe().await;
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
     let mut replies = client
         .inner
@@ -2075,18 +2077,12 @@ async fn l0_48_streaming_reserves_both_grantable_windows() {
     let first = replies.message().await.unwrap().unwrap();
     match first.r {
         Some(proto::put_reply::R::Refused(refused)) => {
-            assert_eq!(refused.reason, proto::Reason::Budget as i32);
+            assert_eq!(refused.reason, proto::Reason::Oversize as i32);
         }
         other => panic!("Put was accepted before its reservation fitted: {other:?}"),
     }
     drop(sender);
     drop(replies);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered for a requirement larger than the budget"
-    );
 
     let fitted = base("two-windows-fit");
     let mut config = Config::new(
@@ -2147,7 +2143,6 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
-    let mut subscription = client.subscribe().await;
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
     let mut replies = client
         .inner
@@ -2164,18 +2159,12 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
     let first = replies.message().await.unwrap().unwrap();
     match first.r {
         Some(proto::put_reply::R::Refused(refused)) => {
-            assert_eq!(refused.reason, proto::Reason::Budget as i32);
+            assert_eq!(refused.reason, proto::Reason::Oversize as i32);
         }
         other => panic!("Put was accepted before the hold fitted: {other:?}"),
     }
     drop(sender);
     drop(replies);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered for a requirement larger than the budget"
-    );
 
     let fitted = base("trailing-window-fit");
     let mut config = Config::new(
@@ -3063,6 +3052,32 @@ async fn l0_65_rootless_tail_counts_every_retained_ancestor() {
     assert_eq!(
         client
             .put(key(14 * 64), Some(key(10 * 64)), PutOptions::default())
+            .await,
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_66_protected_parent_charge_is_counted_at_admission() {
+    // The parent's reservation and the child's together exceed --nvme. The
+    // parent is protected by this admission and cannot even compact, so no
+    // eviction can make room: the refusal is OVERSIZE rather than a Room that
+    // can never arrive.
+    let base = base("protected-ancestry");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        64 * 1024,
+        64 * 1024,
+    );
+    config.name = instance_name("protected-ancestry");
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(5 * 64), None).await;
+    assert_eq!(
+        client
+            .put(key(10 * 64), Some(key(5 * 64)), PutOptions::default())
             .await,
         PutOutcome::Refused(proto::Reason::Oversize as u8)
     );

@@ -1092,6 +1092,38 @@ impl Store {
         total
     }
 
+    /// The durable charge a record's ancestry can never give up while the
+    /// record is admitted. Ancestors are never removed; the pinned parent of
+    /// this admission cannot even compact, and any other ancestor can at most
+    /// drop its row, so its floor is the envelope plus its page segment.
+    fn retained_ancestry_charge(
+        &self,
+        id: NamespaceId,
+        key: Option<Key>,
+        pinned: Option<Key>,
+    ) -> u64 {
+        let Some(namespace) = self.namespaces.get(&id) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        let mut next = key;
+        while let Some(key) = next {
+            let Some(node) = namespace.tree.node(&key) else {
+                break;
+            };
+            let floor = if Some(key) == pinned {
+                node.location.bytes
+            } else if node.location.disk.is_some() && node.row && node.children() == 1 {
+                disk::ENVELOPE_BYTES.saturating_add(node.location.header.page_segment)
+            } else {
+                node.location.bytes
+            };
+            total = total.saturating_add(floor);
+            next = node.parent;
+        }
+        total
+    }
+
     fn begin_put(&mut self, pending: PendingPut) {
         let PendingPut {
             connection,
@@ -1228,18 +1260,20 @@ impl Store {
             .into_iter()
             .chain(replacement.then_some(request.key))
             .collect();
-        // Admission charges the durable budget with the shape's reservation:
-        // the envelope plus the rounded extent for a record the arena keeps,
-        // and the envelope plus the record for one that streams. A charge that
-        // can never fit is OVERSIZE; a tighter budget is a Budget wait, and a
-        // streamed window that does not fit the budget stays a Budget too.
+        // Admission charges the durable budget with the shape's full
+        // reservation: the envelope plus the rounded extent for a record the
+        // arena keeps, and for a streamed record the envelope, the record and
+        // its mandatory two-window staging hold. A record that cannot fit even
+        // beside everything it must keep in place is OVERSIZE; a tighter
+        // budget is a Budget wait.
         let extent = child_header.length_with_row().max(4096).next_power_of_two();
         let charge = if extent <= arena_bytes {
             disk::ENVELOPE_BYTES.saturating_add(extent)
         } else {
-            disk::ENVELOPE_BYTES.saturating_add(child_header.length_with_row())
+            self.put_requirement(&child_header, 0).charge
         };
-        if !rootless && charge > self.config.nvme {
+        let retained = self.retained_ancestry_charge(id, initial_parent, initial_parent);
+        if !rootless && retained.saturating_add(charge) > self.config.nvme {
             self.metrics.oversize += 1;
             self.reject_put(&events, proto::Reason::Oversize as u8);
             return;
