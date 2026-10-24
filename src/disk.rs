@@ -113,6 +113,10 @@ pub struct Faults {
     pub signal: Option<PathBuf>,
     pub disk_full: Option<PathBuf>,
     pub delay_ms: u64,
+    /// Ordered record of serviced tasks: `R` for a read, `W` for a task from
+    /// the write channel. Used to observe the worker's own scheduling order
+    /// without racing completion receivers.
+    pub trace: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
 }
 impl Faults {
     pub(crate) fn checkpoint(&self, point: &str) {
@@ -123,6 +127,11 @@ impl Faults {
                     thread::sleep(Duration::from_millis(2));
                 }
             }
+        }
+    }
+    fn trace(&self, kind: u8) {
+        if let Some(trace) = &self.trace {
+            trace.lock().unwrap().push(kind);
         }
     }
     fn before_io(&self) -> Result<()> {
@@ -255,6 +264,7 @@ impl Worker {
                         let result = read_into(&task.file, task.offset, &mut task.buffer);
                         read_streak += 1;
                         let _ = task.ack.send((result, task.buffer));
+                        faults.trace(b'R');
                         acted = true;
                     } else if let Ok(task) = async_reads.try_recv() {
                         if let Task::Read {
@@ -278,6 +288,7 @@ impl Worker {
                             state_thread.unpark();
                         }
                         read_streak += 1;
+                        faults.trace(b'R');
                         acted = true;
                     }
                 }
@@ -321,6 +332,7 @@ impl Worker {
                             }
                         }
                         state_thread.unpark();
+                        faults.trace(b'W');
                         acted = true;
                     }
                 }
@@ -347,6 +359,7 @@ impl Worker {
                             state_thread.unpark();
                         }
                         read_streak += 1;
+                        faults.trace(b'R');
                         acted = true;
                     }
                 }
@@ -356,6 +369,7 @@ impl Worker {
                         let result = read_into(&task.file, task.offset, &mut task.buffer);
                         read_streak += 1;
                         let _ = task.ack.send((result, task.buffer));
+                        faults.trace(b'R');
                         acted = true;
                     }
                 }

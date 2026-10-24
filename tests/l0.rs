@@ -836,8 +836,10 @@ fn l0_16_disk_queue_read_write_interleave() {
     let base = base("disk");
     fs::create_dir_all(&base).unwrap();
     let lock = Arc::new(disk::RootLock::acquire(&base.join("root")).unwrap());
+    let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
     let faults = disk::Faults {
-        delay_ms: 2,
+        delay_ms: 10,
+        trace: Some(trace.clone()),
         ..disk::Faults::default()
     };
     let worker = disk::Worker::start(faults, lock);
@@ -848,7 +850,6 @@ fn l0_16_disk_queue_read_write_interleave() {
     }
     fs::write(&source, &bytes).unwrap();
     let file = Arc::new(disk::open_read(&source).unwrap());
-    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let arena = Arena::new(8 * 4096).unwrap();
     let reader = worker.reader();
     let write_arena = Arena::new(4 * 4096).unwrap();
@@ -868,27 +869,28 @@ fn l0_16_disk_queue_read_write_interleave() {
             .unwrap();
     }
     let mut readers = Vec::new();
-    for index in 0..8 {
+    for _ in 0..8 {
         let reader = reader.clone();
         let file = file.clone();
-        let log = log.clone();
         let extent = arena.allocate(4096).unwrap();
         readers.push(std::thread::spawn(move || {
             reader.read(&file, 0, extent).unwrap();
-            log.lock().unwrap().push((index, b'R'));
         }));
     }
     for _ in 0..4 {
-        let completion = worker.receiver.recv().unwrap();
-        log.lock().unwrap().push((completion.id, b'W'));
+        worker.receiver.recv().unwrap();
     }
     for reader in readers {
         reader.join().unwrap();
     }
-    let log = log.lock().unwrap();
+    // The worker records its own service order, so the observation cannot be
+    // reordered by reader or completion-receiver scheduling.
+    let trace = trace.lock().unwrap();
+    assert_eq!(trace.iter().filter(|kind| **kind == b'R').count(), 8);
+    assert_eq!(trace.iter().filter(|kind| **kind == b'W').count(), 4);
     let mut run = 0;
     let mut saw_write = false;
-    for &(_, kind) in log.iter() {
+    for &kind in trace.iter() {
         if kind == b'R' {
             run += 1;
             assert!(
