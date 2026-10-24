@@ -259,6 +259,11 @@ pub struct Local {
     connections: HashMap<u64, Connection>,
 }
 
+/// Names the startup step and path an error came from.
+fn step_error(step: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{step} {}: {error}", path.display()))
+}
+
 impl Local {
     /// Owns `/dev/shm/selene/<instance>`: takes the exclusive lock, reclaims
     /// everything a crashed owner left behind and creates fresh, preallocated
@@ -271,9 +276,10 @@ impl Local {
     ) -> Result<Self> {
         validate_instance(instance)?;
         let root = Path::new(SHM_ROOT);
-        create_private_directory(root)?;
+        create_private_directory(root).map_err(|error| step_error("create", root, error))?;
         let directory = root.join(instance);
-        create_private_directory(&directory)?;
+        create_private_directory(&directory)
+            .map_err(|error| step_error("create", &directory, error))?;
 
         let lock_path = directory.join("lock");
         let lock = OpenOptions::new()
@@ -283,7 +289,8 @@ impl Local {
             .truncate(false)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .mode(0o660)
-            .open(&lock_path)?;
+            .open(&lock_path)
+            .map_err(|error| step_error("open", &lock_path, error))?;
         if unsafe { libc::fchmod(lock.as_raw_fd(), 0o660) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -295,16 +302,18 @@ impl Local {
             ));
         }
 
-        let reclaimed = reclaim_stale(&directory)?;
+        let reclaimed = reclaim_stale(&directory)
+            .map_err(|error| step_error("reclaim in", &directory, error))?;
         if reclaimed > 0 {
             eprintln!("selene: reclaimed stale instance '{instance}' ({reclaimed} files)");
         }
 
         let boot_nonce = boot_nonce()?;
-        let (arena_path, arena_size) =
-            create_region(&directory, "arena", &boot_nonce, arena_bytes)?;
+        let (arena_path, arena_size) = create_region(&directory, "arena", &boot_nonce, arena_bytes)
+            .map_err(|error| step_error("create the arena in", &directory, error))?;
         let (staging_path, staging_size) =
-            create_region(&directory, "staging", &boot_nonce, staging_bytes)?;
+            create_region(&directory, "staging", &boot_nonce, staging_bytes)
+                .map_err(|error| step_error("create staging in", &directory, error))?;
         let arena = Arena::open(&arena_path, arena_size)?;
         let staging = Arena::open(&staging_path, staging_size)?;
 

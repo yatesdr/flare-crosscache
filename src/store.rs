@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -585,6 +585,14 @@ pub struct Store {
     forward_events: Vec<ForwardEvent>,
 }
 
+/// Names the startup step and path an error came from.
+fn step_error(step: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{step} at {}: {error}", path.display()),
+    )
+}
+
 impl Store {
     pub fn open(config: Config) -> Result<Self> {
         if config.memory < 4096 || config.staging < 8 * 1024 * 1024 {
@@ -599,10 +607,16 @@ impl Store {
         let lock = config
             .root
             .as_ref()
-            .map(|root| disk::RootLock::acquire(root).map(Arc::new))
+            .map(|root| {
+                disk::RootLock::acquire(root)
+                    .map(Arc::new)
+                    .map_err(|error| step_error("lock the root", root, error))
+            })
             .transpose()?;
         let recovered = match (&config.root, &lock) {
-            (Some(root), Some(_)) => disk::recover(root)?,
+            (Some(root), Some(_)) => {
+                disk::recover(root).map_err(|error| step_error("recover", root, error))?
+            }
             _ => Vec::new(),
         };
         let local = Local::open(
@@ -610,7 +624,14 @@ impl Store {
             config.memory,
             config.staging,
             config.max_window_bytes,
-        )?;
+        )
+        .map_err(|error| {
+            step_error(
+                "open shared memory in",
+                Path::new(crate::local::SHM_ROOT),
+                error,
+            )
+        })?;
         let memory = local.arena();
         let staging = local.staging();
         let mut nonce = [0; 8];
