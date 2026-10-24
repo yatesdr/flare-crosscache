@@ -260,8 +260,9 @@ pub struct Local {
 }
 
 impl Local {
-    /// Owns `/dev/shm/selene/<instance>`: takes the exclusive lock, removes
-    /// stale `arena-*`/`staging-*` files and creates fresh, preallocated regions.
+    /// Owns `/dev/shm/selene/<instance>`: takes the exclusive lock, reclaims
+    /// everything a crashed owner left behind and creates fresh, preallocated
+    /// regions.
     pub fn open(
         instance: &str,
         arena_bytes: usize,
@@ -296,7 +297,10 @@ impl Local {
             ));
         }
 
-        unlink_stale(&directory)?;
+        let reclaimed = reclaim_stale(&directory)?;
+        if reclaimed > 0 {
+            eprintln!("selene: reclaimed stale instance '{instance}' ({reclaimed} files)");
+        }
 
         let boot_nonce = boot_nonce()?;
         let (arena_path, arena_size) =
@@ -923,20 +927,26 @@ fn boot_nonce() -> Result<String> {
     Ok(nonce)
 }
 
-fn unlink_stale(directory: &Path) -> Result<()> {
+/// Removes every stale entry a crashed owner left in the instance directory.
+///
+/// Ownership is the held flock, never the directory's existence: by the time
+/// this runs the lock is held, so anything except the lock file itself is
+/// debris from a manager that died without cleaning up. Directories are left
+/// alone; this instance's directory only ever holds the lock and region files.
+fn reclaim_stale(directory: &Path) -> Result<usize> {
+    let mut removed = 0;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("arena-") || name.starts_with("staging-") {
-            match fs::remove_file(entry.path()) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+        if entry.file_name() == "lock" || entry.file_type()?.is_dir() {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 /// Creates a fresh region file, sets 0660 and `fallocate`s it to its full size.
@@ -1106,11 +1116,13 @@ mod tests {
         }
         fs::write(directory.join("arena-0123456789abcdef"), b"stale").unwrap();
         fs::write(directory.join("staging-0123456789abcdef"), b"stale").unwrap();
+        fs::write(directory.join("leftover.tmp"), b"stale").unwrap();
         let second = Local::open(&name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024).unwrap();
         let _cleanup = Cleanup(directory.clone());
         assert!(!directory.join("arena-0123456789abcdef").exists());
         assert!(!directory.join("staging-0123456789abcdef").exists());
         assert!(!directory.join(format!("arena-{old_nonce}")).exists());
+        assert!(!directory.join("leftover.tmp").exists());
         assert_ne!(second.boot_nonce(), old_nonce);
         assert!(directory.join("lock").exists());
         assert!(second.arena_path().exists());

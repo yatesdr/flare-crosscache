@@ -2708,3 +2708,62 @@ async fn l0_56_dram_only_arena_boundary_ignores_the_envelope() {
         PutOutcome::Refused(proto::Reason::Oversize as u8)
     );
 }
+
+#[test]
+fn l0_57_sigkill_never_blocks_a_restart_on_the_same_instance() {
+    let base = base("sigkill-restart");
+    fs::create_dir_all(base.join("run")).unwrap();
+    let socket = base.join("run/manager.sock");
+    let name = instance_name("sigkill-restart");
+    let spawn = |stderr: &str| {
+        Command::new(env!("CARGO_BIN_EXE_selene"))
+            .args([
+                "--name",
+                &name,
+                "--socket",
+                socket.to_str().unwrap(),
+                "--memory",
+                "8M",
+                "--staging",
+                "8M",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(fs::File::create(base.join(stderr)).unwrap()))
+            .spawn()
+            .unwrap()
+    };
+
+    let mut first = spawn("first.err");
+    wait(|| socket.exists());
+    unsafe {
+        libc::kill(first.id() as i32, libc::SIGKILL);
+    }
+    let status = first.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    // The killed manager leaves its socket, lock and region files behind. The
+    // flock alone decides ownership: the directory's existence must not refuse
+    // the restart, and the stale socket must be replaced.
+    assert!(
+        socket.exists(),
+        "the killed manager leaves its socket behind"
+    );
+    let mut restarted = spawn("second.err");
+    wait(|| std::os::unix::net::UnixStream::connect(&socket).is_ok());
+    assert!(
+        restarted.try_wait().unwrap().is_none(),
+        "the restarted manager must stay up"
+    );
+    unsafe {
+        libc::kill(restarted.id() as i32, libc::SIGTERM);
+    }
+    let status = restarted.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+    assert!(!socket.exists());
+    let log = fs::read_to_string(base.join("second.err")).unwrap();
+    assert!(
+        log.contains("reclaimed stale instance"),
+        "missing reclaim log: {log}"
+    );
+    let _ = fs::remove_dir_all(base);
+}
