@@ -2053,8 +2053,8 @@ async fn l0_47_dram_only_evicts_the_parent_to_store_the_root() {
 async fn l0_48_streaming_reserves_both_grantable_windows() {
     // 128 pages and a 4 KiB row: 528 KiB of disk record plus a fixed 1 MiB
     // hold for two of the 512 KiB trailing windows. A 1,100 KiB budget
-    // cannot take the complete requirement even though disk plus the first
-    // two planned windows (1,296 KiB) once did.
+    // cannot take the complete requirement even though the older charge of
+    // disk plus the largest window (1,040 KiB) would have fitted.
     let tight = base("two-windows-small");
     let mut config = Config::new(
         tight.join("records"),
@@ -2469,5 +2469,218 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
     let fetched = waiter.fetch(&[key(64)], 0, 1).await;
     assert_eq!(fetched[0], stored_again);
     assert!(!stored.is_empty());
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+async fn diagnostic_lease_all(
+    client: &mut Client,
+    keys: Vec<flare_crosscache::Key>,
+    pages: u32,
+) -> (
+    tokio::sync::mpsc::Sender<crosscache::GetMessage>,
+    tonic::Streaming<crosscache::GetReply>,
+    Vec<(u64, u32)>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .get(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::GetMessage {
+            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+                namespace_id: client.descriptor.namespace_id().to_vec(),
+                chain: keys.iter().map(|key| key_msg(*key)).collect(),
+                skip_pages: 0,
+                expected_pages: u64::from(pages),
+                row: true,
+                destinations: Vec::new(),
+                transfer: 0,
+            })),
+        })
+        .await
+        .unwrap();
+    let mut held = Vec::new();
+    while let Ok(Ok(Some(reply))) =
+        tokio::time::timeout(Duration::from_millis(100), replies.message()).await
+    {
+        match reply.r {
+            Some(crosscache::get_reply::R::Ready(grant)) => {
+                held.push((grant.transfer, grant.index));
+            }
+            Some(crosscache::get_reply::R::Refused(refused)) => {
+                panic!("diagnostic lease Get refused: {refused:?}")
+            }
+            Some(crosscache::get_reply::R::Done(_)) | None => break,
+            Some(_) => continue,
+        }
+    }
+    (sender, replies, held)
+}
+
+async fn diagnostic_release_all(
+    sender: tokio::sync::mpsc::Sender<crosscache::GetMessage>,
+    mut replies: tonic::Streaming<crosscache::GetReply>,
+    held: Vec<(u64, u32)>,
+) {
+    for (transfer, index) in held {
+        sender
+            .send(crosscache::GetMessage {
+                m: Some(crosscache::get_message::M::Released(
+                    crosscache::WindowReleased { transfer, index },
+                )),
+            })
+            .await
+            .unwrap();
+    }
+    while let Ok(Ok(Some(reply))) =
+        tokio::time::timeout(Duration::from_millis(100), replies.message()).await
+    {
+        if matches!(reply.r, Some(crosscache::get_reply::R::Done(_)) | None) {
+            break;
+        }
+    }
+    drop(sender);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_54_get_sources_survive_eviction_pressure() {
+    // Diagnostic: a Get's delivered bytes must be the bytes the manager
+    // verified when it read the record. Hold leases on every arena record,
+    // force a streamed Put, release the leases so the read refills the
+    // arena, and apply Put pressure while the slow read is in flight. Then
+    // repeat with a record too large for the arena so the header and the
+    // payload windows are read at different times.
+    let base = base("get-pressure");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        32 * 1024,
+        4 * 1024 * 1024,
+    );
+    config.name = instance_name("get-pressure");
+    config.faults.delay_ms = 150;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let first = client.store(key(64), None).await;
+    let second = client.store(key(128), Some(key(64))).await;
+    host.durable(2);
+    let (one_sender, one_replies, one) = diagnostic_lease_all(&mut client, vec![key(64)], 1).await;
+    let (two_sender, two_replies, two) = diagnostic_lease_all(&mut client, vec![key(128)], 1).await;
+    assert!(!one.is_empty() && !two.is_empty());
+    // Both arena records are pinned, so this three-page root streams to disk.
+    let streamed = client.store(key(192), None).await;
+    diagnostic_release_all(one_sender, one_replies, one).await;
+    diagnostic_release_all(two_sender, two_replies, two).await;
+    // The arena is now free for the read to verify and refill the record.
+    let mut reader = host.client().await;
+    let mut pressure = host.client().await;
+    let streamed_key = [key(192)];
+    let fetch = reader.fetch(&streamed_key, 0, 3);
+    let put = async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        pressure.store(key(256), None).await
+    };
+    let (fetched, pressed) = tokio::join!(fetch, put);
+    assert_eq!(fetched[0], streamed);
+    assert!(!pressed.is_empty());
+    assert!(!first.is_empty() && !second.is_empty());
+
+    // 128 pages do not fit the arena: the header is read once and each
+    // payload window later, while another Put adds eviction pressure.
+    let large = client.store(key(128 * 64), None).await;
+    let large_key = [key(128 * 64)];
+    let fetch = reader.fetch(&large_key, 0, 128);
+    let put = async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        pressure.store(key(384), None).await
+    };
+    let (fetched, pressed) = tokio::join!(fetch, put);
+    assert_eq!(fetched[0], large);
+    assert!(!pressed.is_empty());
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
+    // Diagnostic: after a Get is cancelled its tree pins are released, but
+    // the client still holds the granted window. Eviction pressure must not
+    // free or reuse that arena extent before the client reads it.
+    let mut host = Host::new(32 * 1024, 4 * 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let stored = client.store(key(64), None).await;
+    host.durable(1);
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .get(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::GetMessage {
+            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+                namespace_id: client.descriptor.namespace_id().to_vec(),
+                chain: vec![key_msg(key(64))],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+                destinations: Vec::new(),
+                transfer: 0,
+            })),
+        })
+        .await
+        .unwrap();
+    let (region, offset, length, record_offset) = loop {
+        match replies.message().await.unwrap().unwrap().r {
+            Some(crosscache::get_reply::R::Ready(grant)) => {
+                let memory = grant.memory.unwrap();
+                let region = if memory.region == crosscache::Region::Arena as i32 {
+                    Reg::Arena
+                } else {
+                    Reg::Staging
+                };
+                break (
+                    region,
+                    memory.offset,
+                    usize::try_from(memory.length).unwrap(),
+                    usize::try_from(grant.record_offset).unwrap(),
+                );
+            }
+            Some(crosscache::get_reply::R::Refused(refused)) => {
+                panic!("diagnostic Get refused: {refused:?}")
+            }
+            Some(_) => continue,
+            None => panic!("diagnostic Get ended before a window"),
+        }
+    };
+    sender
+        .send(crosscache::GetMessage {
+            m: Some(crosscache::get_message::M::Cancel(crosscache::Cancel {})),
+        })
+        .await
+        .unwrap();
+    while let Ok(Ok(Some(reply))) =
+        tokio::time::timeout(Duration::from_millis(200), replies.message()).await
+    {
+        if matches!(
+            reply.r,
+            Some(crosscache::get_reply::R::Done(_))
+                | Some(crosscache::get_reply::R::Refused(_))
+                | None
+        ) {
+            break;
+        }
+    }
+    // Pressure: a 32 KiB root cannot fit beside the leased 16 KiB extent, so
+    // eviction must either skip the lease or corrupt the client's window.
+    let pressed = client.store(key(128), None).await;
+    assert!(!pressed.is_empty());
+    let window = client.read(region, offset, length);
+    assert_eq!(window, stored[record_offset..record_offset + length]);
     host.wait(|host| host.gauge("open_ops") == 0);
 }

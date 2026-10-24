@@ -1546,13 +1546,11 @@ impl Store {
         true
     }
 
-    /// Arm Room with the requirement of the shape that was just refused. The
-    /// latest refusal wins: an older, permanently unserviceable requirement
-    /// must not keep Room from firing for one that now fits.
-    /// Arm Room with the requirement of the shape that was just refused and
-    /// the keys it needs to survive. The latest refusal replaces the previous
-    /// one, so an older, unserviceable requirement cannot keep Room tied to a
-    /// charge this operation no longer needs.
+    /// Arm Room with the requirement of the shape that was just refused, the
+    /// arena shape that may become possible later, and the keys the shape
+    /// needs to survive. The latest refusal replaces the previous one, so an
+    /// older, unserviceable requirement cannot keep Room tied to a charge this
+    /// operation no longer needs.
     fn arm(
         &mut self,
         connection: u64,
