@@ -42,7 +42,8 @@ still identical:
 - for every token present in both top-20 lists with logprob at least -5 nats,
   the logprob difference is recorded.
 
-A comparison reports the mean and maximum difference over those positions.
+A comparison reports the mean and maximum difference over those positions; the
+mean is the gate.
 
 **Compare the same shape on the same GPU.** Resuming a prefill after a prefix
 is a different execution shape from a full cold prefill, so a restore is
@@ -54,13 +55,14 @@ restore is judged against those, never against zero.
 GPU, topology and tier, and records their comparison as that row's floor. A
 measured row passes when
 
-- mean delta <= max(1.5 x floor mean, floor mean + 0.15), and
-- max delta <= max(2.0 x floor max, floor max + 1.5),
+- mean delta <= max(1.5 x floor mean, floor mean + 0.15),
 
-with an absolute 10-nat guard that fails any comparison outright (corruption or
-a wrong record). A fixed fallback envelope (mean 0.66, max 4.8) applies only
-when no floor could be measured. Top-5 differences and exact tokens are
-reported for diagnosis and are not gates.
+with an absolute 10-nat guard on any single difference (corruption or a wrong
+record; malformed or non-finite top-20 data fails outright). The row's maximum
+delta, top-5 difference fraction and exact tokens are recorded for diagnosis
+but are not gates: a per-row maximum over a few dozen positions against a
+three-seed floor is an extreme-value statistic and does not discriminate. A
+fixed fallback mean (0.66) applies only when no floor could be measured.
 
 ## Five-seed control
 
@@ -117,7 +119,7 @@ effect, not a serving cost.
 
 To be filled when the L3 matrix run completes. Each row reports the topology,
 context length and tier, the cold/cold floor measured in the same run, and the
-comparison's mean and max deltas against the gates above.
+comparison's mean and max deltas and the mean gate above.
 
 | Topology | Context | Tier | Floor mean/max | Row mean/max | Top-5 fraction | Result |
 |---|---|---|---|---|---|---|
