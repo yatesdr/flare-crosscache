@@ -1897,33 +1897,8 @@ impl Store {
         }
     }
 
-    /// Releases the Put windows still granted when an operation ends without
-    /// filling them. Filled windows returned theirs on WindowFilled; anything
-    /// left holds a lease on the record's arena extent. Get windows are not
-    /// released here: they stay valid after Done or a refusal until the client
-    /// releases them, because it may still be copying the bytes out.
-    fn release_put_windows(&mut self, connection: u64, transfer: u64) {
-        let indexes = self
-            .sessions
-            .get_mut(&connection)
-            .and_then(|session| session.ops.get_mut(&transfer))
-            .map(|open| match &mut open.operation {
-                Operation::Put(put) => {
-                    let indexes: Vec<u32> = put.windows.granted.keys().copied().collect();
-                    put.windows.granted.clear();
-                    indexes
-                }
-                Operation::Get(_) => Vec::new(),
-            })
-            .unwrap_or_default();
-        for index in indexes {
-            let _ = self.local.release(connection, transfer, index);
-        }
-    }
-
     fn fail_put(&mut self, connection: u64, transfer: u64, reason: u8, error: io::Error) {
         self.metrics.puts_error += 1;
-        self.release_put_windows(connection, transfer);
         if let Some(open) = self
             .sessions
             .get_mut(&connection)
@@ -3550,7 +3525,6 @@ impl Store {
         if removed_pending {
             return;
         }
-        self.release_put_windows(connection, transfer);
         let Some(open) = self
             .sessions
             .get_mut(&connection)

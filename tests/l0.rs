@@ -2866,11 +2866,13 @@ async fn l0_60_restore_is_not_refused_when_the_nvme_budget_is_full() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_61_rootless_temporary_pressure_waits_instead_of_oversize() {
     // A 48 KiB arena: a 16 KiB parent and a 32 KiB child fit together once
-    // nothing else is held. An unrelated 32 KiB record, accepted but never
-    // committed, occupies the arena, so the child cannot be allocated now and
-    // its six-page full-chain fallback would need 64 KiB. That is temporary
-    // pressure, not an impossible shape: the Put waits for Room, and the retry
-    // succeeds as soon as the unrelated operation ends.
+    // nothing else holds memory. An accepted but uncommitted Put holds an
+    // unrelated 32 KiB extent, so the child cannot be allocated now and its
+    // six-page full-chain fallback would need 64 KiB. That is temporary
+    // pressure, not an impossible shape, so the child is refused BUDGET: it
+    // may fit beside its parent once the other operation ends. (The extent
+    // stays leased until its writer's process exits, so this test asserts the
+    // classification rather than the eventual retry.)
     let mut host = Host::dram_only(48 * 1024);
     host.start();
     let mut client = host.client().await;
@@ -2896,37 +2898,14 @@ async fn l0_61_rootless_temporary_pressure_waits_instead_of_oversize() {
         "{accept:?}"
     );
 
-    let child = key(6 * 64);
     assert_eq!(
         client
-            .put(child, Some(key(64)), PutOptions::default())
+            .put(key(6 * 64), Some(key(64)), PutOptions::default())
             .await,
         PutOutcome::Refused(proto::Reason::Budget as u8)
     );
-
-    // End the unrelated Put; its extent returns and the retry is admitted.
-    sender
-        .send(proto::PutMessage {
-            m: Some(proto::put_message::M::Cancel(proto::Cancel {})),
-        })
-        .await
-        .unwrap();
     drop(sender);
     drop(replies);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match client
-            .put(child, Some(key(64)), PutOptions::default())
-            .await
-        {
-            PutOutcome::Stored(_) => break,
-            PutOutcome::Refused(reason) if reason == proto::Reason::Budget as u8 => {
-                assert!(Instant::now() < deadline, "the retry never earned room");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            other => panic!("unexpected retry outcome: {other:?}"),
-        }
-    }
 }
 
 #[test]
@@ -2976,4 +2955,62 @@ fn l0_62_socket_directory_modes() {
     let mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o770, "a created socket directory gets 0770");
     let _ = fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_63_a_paused_put_keeps_its_window_past_the_deadline() {
+    // A Put that stalls past the no-progress deadline is failed, but its
+    // granted window stays leased: the client may still be writing into it.
+    // A later Put cannot take the extent, and bytes written after the deadline
+    // are intact.
+    use std::os::unix::fs::FileExt;
+    let mut host = Host::dram_only(32 * 1024);
+    host.start();
+    let client = host.client().await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let mut replies = client
+        .inner
+        .clone()
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(proto::PutMessage {
+            m: Some(client.begin(key(3 * 64), None)),
+        })
+        .await
+        .unwrap();
+    let (offset, length) = loop {
+        match replies.message().await.unwrap().unwrap().r {
+            Some(proto::put_reply::R::Grant(grant)) => {
+                let memory = grant.memory.unwrap();
+                break (memory.offset, memory.length);
+            }
+            Some(proto::put_reply::R::Refused(refused)) => panic!("refused: {refused:?}"),
+            Some(_) => continue,
+            None => panic!("the Put ended before a grant"),
+        }
+    };
+    // Stall until the manager fails the operation for no progress.
+    match tokio::time::timeout(Duration::from_secs(10), replies.message())
+        .await
+        .expect("the no-progress deadline did not fire")
+    {
+        Ok(None) => {}
+        Ok(Some(reply)) => panic!("unexpected reply after the deadline: {reply:?}"),
+        Err(status) => assert!(status.message().contains("no progress"), "{status:?}"),
+    }
+    // Resume writing into the window; the extent must not be reusable.
+    let pattern: Vec<u8> = (0..length as usize)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    client.arena.write_all_at(&pattern, offset).unwrap();
+    let mut other = host.client().await;
+    assert_eq!(
+        other.put(key(64), None, PutOptions::default()).await,
+        PutOutcome::Refused(proto::Reason::Budget as u8),
+        "the stalled Put's extent must stay leased"
+    );
+    assert_eq!(client.read(Reg::Arena, offset, length as usize), pattern);
 }

@@ -100,9 +100,11 @@ stream ends with `Stored{bytes}` (the record length) or `Refused`.
 `Present` is a successful deduplication: no bytes are transferred and the
 record is available. A replica may send `Cancel` before it has sent `Commit`;
 after `Commit` the operation runs to `Stored` or a refusal. A window's credit
-returns when its `WindowFilled` is accepted. Unfilled windows are released when
-the operation ends, so a replica must stop writing to a window once it cancels
-or receives a terminal reply.
+returns when its `WindowFilled` is accepted. An unfilled window stays leased to
+the connection even after a refusal, a cancellation or a no-progress failure,
+because the replica may still be writing into it; it is reclaimed when the
+connection closes and the writing process has exited (the manager watches the
+peer pid), or when a remote session's streams end.
 
 ## Get stream
 
@@ -188,8 +190,9 @@ survive manager restarts and are recovered into the disk tier.
 - Call `Hello` before any other RPC, keep the generation for the connection's
   lifetime, and rebuild the session on `ABORTED` or a transport failure.
 - Map both region files after `Hello`, use only granted windows, never use a Put
-  window after its `WindowFilled` is sent or the operation ends, and never use
-  a Get window after releasing it.
+  window after its `WindowFilled` is sent (an unfilled window from a failed or
+  cancelled Put stays valid until the connection ends), and never use a Get
+  window after releasing it.
 - Validate every restored record before use and fail closed to recompute.
 - Retry only transient reasons, and only after `Room` or an availability change.
 - Discard catalog events from a superseded generation or subscription epoch.
