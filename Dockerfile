@@ -1,4 +1,5 @@
 FROM rust:1.94.1-bookworm AS build
+# prost-build needs protoc; the rust image already carries the C toolchain.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*

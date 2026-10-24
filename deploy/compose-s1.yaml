@@ -1,0 +1,76 @@
+# S1: one host, one manager and two Flare replicas sharing DRAM and NVMe.
+#
+# Required environment:
+#   CACHE_UID / CACHE_GID  uid and gid of the replicas (default 1000)
+#   FLARE_IMAGE            Flare image (default flare:latest)
+#   FLARE_PACKAGE          prepared package path inside the replica
+#   FLARE_ARGS             extra `flare run` arguments (default: --gpus 0)
+#
+# The manager and every replica must use the same uid/gid and share both
+# /run/selene (the socket) and /dev/shm/selene (windows).
+services:
+  manager:
+    image: ${MANAGER_IMAGE:-selene:local}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    command:
+      - --name
+      - pool
+      - --socket
+      - /run/selene/pool.sock
+      - --root
+      - /nvme/flare-cache
+      - --memory
+      - 8G
+      - --nvme
+      - 256G
+      - --staging
+      - 512M
+      - --metrics
+      - 0.0.0.0:9108
+    volumes:
+      - /run/selene:/run/selene
+      - /dev/shm/selene:/dev/shm/selene
+      - /nvme/flare-cache:/nvme/flare-cache
+    restart: unless-stopped
+
+  replica-a:
+    image: ${FLARE_IMAGE:-flare:latest}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    depends_on:
+      - manager
+    command: ["run", "${FLARE_PACKAGE}", "--prefix-cache-manager", "/run/selene/pool.sock"]
+    environment:
+      FLARE_ARGS: ${FLARE_ARGS:---gpus 0}
+    volumes:
+      - /run/selene:/run/selene
+      - /dev/shm/selene:/dev/shm/selene
+      - /nvme/flare-cache:/nvme/flare-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  replica-b:
+    image: ${FLARE_IMAGE:-flare:latest}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    depends_on:
+      - manager
+    command: ["run", "${FLARE_PACKAGE}", "--prefix-cache-manager", "/run/selene/pool.sock"]
+    environment:
+      FLARE_ARGS: ${FLARE_ARGS:---gpus 1}
+    volumes:
+      - /run/selene:/run/selene
+      - /dev/shm/selene:/dev/shm/selene
+      - /nvme/flare-cache:/nvme/flare-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    restart: unless-stopped

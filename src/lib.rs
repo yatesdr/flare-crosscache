@@ -1,10 +1,19 @@
+pub mod admin;
 pub mod arena;
 pub mod codec;
+pub mod config;
 pub mod control;
+pub mod data;
 pub mod disk;
+pub mod grants;
 pub mod local;
+pub mod peer;
+pub mod peer_client;
+pub mod peer_runtime;
+pub mod placement;
 pub mod proto;
 pub mod record;
+pub mod regions;
 pub mod store;
 pub mod tree;
 

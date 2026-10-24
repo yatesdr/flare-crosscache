@@ -14,7 +14,7 @@ Each rung uses the real component below it and adds one class of risk.
 | Unit and L0 | Linux CPU, no GPU | The manager's contract in isolation: tree and catalog ordering, admission and refusal classification, window grants and credits, budget and Room, eviction and compaction, chain durability, crash recovery, directory modes, and a throughput smoke test. Run against exact-byte regions in shared memory and a real local NVMe file system. |
 | L1 | One GPU, a real manager process, the real client | Exact bytes through the whole client-server path: cross-process DRAM round trips including partial tails and padded planes/rows, a durable chain longer than DRAM, streamed records larger than DRAM, interrupted transfers on a new generation, corruption rejection, a paused window owner, a multi-record chain with non-aligned boundaries, and a BUDGET refusal followed by Room. Six CUDA scenarios; they are ignored by default because they need the GPU and manager environment. |
 | L2 | Two GPU replicas, one manager | The shared lifecycle end to end: publish on one replica, evict the GPU copy, restore on the other from DRAM, evict DRAM, restore from NVMe, kill the publisher mid-copy, restart a replica, kill and restart the manager, restore again. Facts are judged with the distribution oracle below; a miss is legitimate only when a manager-off replica produces the same answer. |
-| L3 | GPU replicas across a topology/tier matrix | TP1, TP2 and TP4 at 8k, 32k, 100k and 262k-token contexts over the DRAM and NVMe tiers, plus write-through and offload legs. Every row is gated against that row's own measured noise floor, so scaling and sharding do not hide numeric effects. |
+| L3 | GPU replicas across a topology/tier matrix | TP1, TP2 and TP4 at 8k, 32k, 100k and 262k-token contexts over the DRAM and NVMe tiers, plus write-through and offload legs. Each DRAM/NVMe row is compared with the GPU-native-reuse row at the same topology and context, so scaling and sharding do not hide numeric effects. |
 | L4 | Two managers, CPU only | The remote tier's protocol between managers: peer catalog, forwarding, transfer and grant fencing, peer loss, and quota behavior, without GPUs. |
 
 Counts at the time of writing: 108 default manager tests (library, L0 and
@@ -42,7 +42,8 @@ still identical:
 - for every token present in both top-20 lists with logprob at least -5 nats,
   the logprob difference is recorded.
 
-A comparison reports the mean and maximum difference over those positions.
+A comparison reports the mean and maximum difference over those positions; the
+mean is the gate.
 
 **Compare the same shape on the same GPU.** Resuming a prefill after a prefix
 is a different execution shape from a full cold prefill, so a restore is
@@ -51,16 +52,42 @@ with a cold run. Cold/cold and native/native runs measure the noise floor; a
 restore is judged against those, never against zero.
 
 **Self-calibrating floor.** Each run takes two cold samples per seed on the same
-GPU, topology and tier, and records their comparison as that row's floor. A
-measured row passes when
+GPU for every topology and context, and pools those cold/cold comparisons into
+one floor for that topology and context: the pooled mean is the mean of all the
+measured cold/cold means, so one noisy seed cannot set the bar for the whole
+context. Only the GPU pass measures cold baselines, so every tier at that
+topology and context uses the identical pooled floor, and the row records its
+sample count.
 
-- mean delta <= max(1.5 x floor mean, floor mean + 0.15), and
-- max delta <= max(2.0 x floor max, floor max + 1.5),
+The floor answers two different questions, neither of them a fixed tolerance:
 
-with an absolute 10-nat guard that fails any comparison outright (corruption or
-a wrong record). A fixed fallback envelope (mean 0.66, max 4.8) applies only
-when no floor could be measured. Top-5 differences and exact tokens are
-reported for diagnosis and are not gates.
+- **Selene (pass/fail).** A DRAM or NVMe restore is judged against the
+  GPU-native-reuse row at the *same topology and context*, so both sides have
+  the same execution shape. It passes when its mean delta is at most
+  max(1.5 x native mean, native mean + 0.15), with an absolute 10-nat guard on
+  any single difference (corruption or a wrong record; malformed or non-finite
+  top-20 data fails outright, as does a missing observation). The reference
+  must be valid: a native row that ran cleanly, restored the whole prompt and
+  compared at least the minimum number of positions. Without one the restore
+  fails as "no valid native reference"; there is no fixed fallback, and the row
+  is judged only against a native row from the same reference realisation (the
+  prompt and cold answers are persisted and fingerprinted, so a resumed run
+  reuses them rather than mixing processes).
+- **Flare reuse (observation).** The GPU-native row is reported against the
+  pooled cold/cold floor. How far Flare's own reuse sits from a cold prefill is
+  a Flare numerics observation for the model server, not a selene failure.
+
+A row's maximum delta, top-5 difference fraction and exact tokens are recorded
+for diagnosis but are not gates: a per-row maximum over a few dozen positions
+against a three-seed floor is an extreme-value statistic and does not
+discriminate.
+
+At 8k and 32k a row compares several hundred positions. At 100k and 262k the
+sampled sequences diverge early and one seed adds only a few positions, so those
+rows add seeds (up to a hard cap of 12) until they reach 200 compared positions;
+the row records its seed schedule and compares count, and a row that hits the cap
+reports the count it reached. The count is part of the report, because the mean
+of 40 heavy-tailed deltas is not the same evidence as the mean of 700.
 
 ## Five-seed control
 
@@ -117,9 +144,9 @@ effect, not a serving cost.
 
 To be filled when the L3 matrix run completes. Each row reports the topology,
 context length and tier, the cold/cold floor measured in the same run, and the
-comparison's mean and max deltas against the gates above.
+comparison's mean and max deltas and the mean gate above.
 
-| Topology | Context | Tier | Floor mean/max | Row mean/max | Top-5 fraction | Result |
+| Topology | Context | Tier | Compared | Floor mean/max | Row mean/max | Top-5 fraction | Result |
 |---|---|---|---|---|---|---|
 
 ## Limitations

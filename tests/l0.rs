@@ -1,13 +1,14 @@
 mod support;
 use selene::{
     arena::{Arena, ExtentSlice},
-    disk, proto,
+    control, disk, proto,
     record::{self, Header},
     store::Config,
     tree::{Eviction, Tree},
 };
 use std::{
     fs,
+    net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -286,7 +287,9 @@ fn l0_06_multiprocess_kill_recovery() {
         config.faults.pause_at = Some(point.clone());
         config.faults.signal = Some(base.join("gate"));
         if let Ok(dump) = std::env::var(CHILD_DUMP) {
-            let store = selene::store::Store::open(config).unwrap();
+            let store = selene::store::Store::open(config).unwrap_or_else(|error| {
+                panic!("the snapshot child could not open the store: {error}")
+            });
             let snapshot = store
                 .namespace_id()
                 .and_then(|id| store.snapshot(id))
@@ -372,15 +375,114 @@ fn l0_06_multiprocess_kill_recovery() {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        wait(|| dump.exists());
-        assert_eq!(
-            fs::read_to_string(&dump).unwrap().parse::<usize>().unwrap(),
-            recovered.len()
-        );
+        // `exists` can be true before the child has written the snapshot, so wait for a
+        // value the file actually parses to.
+        let mut snapshot = None;
+        wait(|| {
+            snapshot = fs::read_to_string(&dump)
+                .ok()
+                .and_then(|text| text.parse::<usize>().ok());
+            snapshot.is_some()
+        });
+        assert_eq!(snapshot.unwrap(), recovered.len());
         restarted.kill().unwrap();
         restarted.wait().unwrap();
         fs::remove_dir_all(base).unwrap();
     }
+}
+
+/// A startup failure after the store opened must release the instance and root locks and
+/// leave no socket, so the same manager can start again on the same paths immediately.
+#[test]
+fn l0_67_a_failed_start_releases_the_instance_and_root() {
+    let base = base("failed-start");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        65536,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("failed-start");
+    let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut failed = config.clone();
+    failed.metrics = Some(squatter.local_addr().unwrap().to_string());
+    let error = control::run(failed, Arc::new(AtomicBool::new(false)))
+        .expect_err("a taken metrics port must fail the start");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "the metrics refusal is reported: {error}"
+    );
+    assert!(!config.socket.exists(), "a failed start leaves no socket");
+    drop(squatter);
+    // The instance, lock and root are free again: the same manager starts at once.
+    config.metrics = None;
+    let mut host = Host::open_config(config);
+    host.try_start()
+        .expect("the previous attempt released its locks");
+    host.stop();
+    let _ = fs::remove_dir_all(base);
+}
+
+/// Certificate errors are found before the manager opens its store or any listener, so a
+/// failed start leaves no locks, socket or accepting data port behind.
+#[test]
+fn l0_68_a_tls_error_starts_nothing() {
+    let base = base("tls-error");
+    fs::create_dir_all(&base).unwrap();
+    let socket = base.join("run/m.sock");
+    let mut local = selene::config::Config::defaults();
+    local.name = instance_name("tls-error");
+    local.socket = socket.clone();
+    local.socket_explicit = true;
+    local.root = Some(base.join("records"));
+    local.memory = 65536;
+    local.staging = 8 << 20;
+    local.nvme = 64 << 20;
+    local.tls_cert = Some(base.join("missing-cert.pem"));
+    local.tls_key = Some(base.join("missing-key.pem"));
+    local.tls_ca = Some(base.join("missing-ca.pem"));
+    let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
+    store.name = local.name.clone();
+    let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
+        .expect_err("a missing certificate must fail the start");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::NotFound,
+        "the certificate error is reported: {error}"
+    );
+    assert!(!socket.exists(), "nothing was created");
+    // A key that does not belong to the certificate is only caught by building the full
+    // server configuration, which now happens before anything starts.
+    let good = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert = base.join("cert.pem");
+    let key = base.join("key.pem");
+    let ca = base.join("ca.pem");
+    fs::write(&cert, good.cert.pem()).unwrap();
+    fs::write(&key, other.signing_key.serialize_pem()).unwrap();
+    fs::write(&ca, good.cert.pem()).unwrap();
+    let mut local = selene::config::Config::defaults();
+    local.name = instance_name("tls-mismatch");
+    local.socket = socket.clone();
+    local.socket_explicit = true;
+    local.root = Some(base.join("records"));
+    local.memory = 65536;
+    local.staging = 8 << 20;
+    local.nvme = 64 << 20;
+    local.tls_cert = Some(cert);
+    local.tls_key = Some(key);
+    local.tls_ca = Some(ca);
+    let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
+    store.name = local.name.clone();
+    let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
+        .expect_err("a key that does not match the certificate must fail the start");
+    assert!(
+        error.to_string().contains("TLS"),
+        "the certificate error is named: {error}"
+    );
+    assert!(!socket.exists(), "nothing was created");
+    let _ = fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1678,9 +1780,10 @@ fn l0_38_async_reads_overtake_queued_writes() {
     let base = base("read-priority");
     fs::create_dir_all(&base).unwrap();
     let lock = Arc::new(disk::RootLock::acquire(&base.join("root")).unwrap());
+    // Long enough that enqueueing the read cannot race the first write completing.
     let worker = disk::Worker::start(
         disk::Faults {
-            delay_ms: 100,
+            delay_ms: 2000,
             ..disk::Faults::default()
         },
         lock,
@@ -1714,13 +1817,22 @@ fn l0_38_async_reads_overtake_queued_writes() {
             buffer: arena.allocate(4096).unwrap(),
         })
         .unwrap();
-    let first = worker.receiver.recv().unwrap();
-    assert_eq!(
-        first.id, 999,
-        "the read must not wait behind the write queue"
+    // The write channel holds all eight writes, so the read is enqueued while at most the
+    // first write is in flight; it must be the next completion.
+    let mut writes_ahead = 0;
+    loop {
+        let completion = worker.receiver.recv().unwrap();
+        if completion.id == 999 {
+            assert_eq!(completion.data.unwrap().bytes(), &[7u8; 4096]);
+            break;
+        }
+        writes_ahead += 1;
+    }
+    assert!(
+        writes_ahead <= 1,
+        "the read waited behind {writes_ahead} queued writes"
     );
-    assert_eq!(first.data.unwrap().bytes(), &[7u8; 4096]);
-    for _ in 0..8 {
+    for _ in writes_ahead..8 {
         worker.receiver.recv().unwrap();
     }
     fs::remove_dir_all(base).unwrap();

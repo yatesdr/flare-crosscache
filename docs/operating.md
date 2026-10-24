@@ -62,9 +62,10 @@ uid (with distinct instance names) or its own host.
 
 ## Refusal reasons
 
-Clients retry on the transient reasons and must not retry `OVERSIZE` or
-`INVALID`. The manager never stalls a connection: a `BUDGET` refusal arms a
-Room notification that arrives when capacity or the budget frees up.
+Clients retry on the transient reasons and must not retry `OVERSIZE`,
+`QUOTA` or `INVALID`. The manager never stalls a connection: a `BUDGET`
+refusal arms a Room notification that arrives when capacity or the budget
+frees up.
 
 | Reason | Meaning | Operator action |
 |---|---|---|
@@ -72,6 +73,7 @@ Room notification that arrives when capacity or the budget frees up.
 | `BUDGET` | A capacity or rate limit is currently exhausted: a negative write-budget balance or no DRAM room that eviction can free. The manager arms a Room notification for the same connection. | Expect retries; a Room follows. Sustained `BUDGET` with no Room means the write budget is far below ingest, or other clients hold the space. |
 | `QUEUE` | The connection's open-operation limit (four per direction) or an internal queue is full. | None; retries drain. Persistent `QUEUE` means clients are not reaping completions. |
 | `OVERSIZE` | The record can never be admitted in this configuration: with `--root`, record plus envelope exceeds `--nvme`; without `--root`, its rounded extent exceeds `--memory`; or its two-window staging hold exceeds `--staging`. | Raise the budget, add `--root`, or publish a smaller record. Retrying cannot succeed. |
+| `QUOTA` | A namespace quota set by an operator (DRAM or NVMe, through the admin API; zero means unlimited) would be exceeded. No Room is armed. | Raise the namespace quota or purge records. Retrying cannot succeed until the quota changes. |
 | `INVALID` | Malformed request, namespace-descriptor mismatch or geometry disagreement between a replica and the manager. | Alert. Check the protocol version and that replicas and manager use the same prepared package. |
 | `IO` | An NVMe read or write failed. | Alert on `cm_nvme_errors_total`; check the device and file system. |
 | `INFLIGHT` | A duplicate operation for the same prefix is in flight. | None; retry after it settles. |
@@ -81,8 +83,9 @@ that depends on what else must stay resident - the retained ancestry, a
 protected parent, another operation's lease - is `BUDGET`, and without `Room`
 the record is simply not stored.
 
-`QUOTA` and `UNSPECIFIED` are defined by the protocol but never produced by
-this manager.
+`QUOTA` describes a namespace budget, which only an operator can change, so
+it is never transient for the client. `UNSPECIFIED` is defined by the
+protocol but never produced by this manager.
 
 ## Metrics
 

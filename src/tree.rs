@@ -11,6 +11,10 @@ pub struct Node<L> {
     pub location: L,
     children: u32,
     pins: u32,
+    /// An operator pinned this record; independent of transfer pins.
+    admin: bool,
+    /// Number of admin-pinned descendants that need this node as an ancestor.
+    admin_children: u32,
     accessed: u64,
 }
 
@@ -22,7 +26,21 @@ impl<L> Node<L> {
         self.children
     }
     pub fn pinned(&self) -> bool {
-        self.pins > 0
+        self.pins > 0 || self.admin || self.admin_children > 0
+    }
+
+    pub fn admin_pinned(&self) -> bool {
+        self.admin
+    }
+
+    /// Toggle the operator pin. Returns whether the direct flag changed; ancestors keep a
+    /// reference count so a pinned record cannot lose its chain to eviction or purge.
+    pub fn set_admin(&mut self, on: bool) -> bool {
+        if self.admin == on {
+            return false;
+        }
+        self.admin = on;
+        true
     }
 }
 
@@ -100,6 +118,8 @@ impl<L> Tree<L> {
                 location,
                 children: 0,
                 pins: 0,
+                admin: false,
+                admin_children: 0,
                 accessed: 0,
             },
         );
@@ -135,12 +155,47 @@ impl<L> Tree<L> {
         Ok(())
     }
 
+    /// Toggle an operator pin. Repeated calls with the same value are no-ops. Returns the
+    /// number of records whose direct protection changed (zero or one).
+    pub fn admin_pin(&mut self, key: &Key, on: bool) -> Result<u32> {
+        let Some(node) = self.nodes.get(key) else {
+            return Err(invalid("cannot pin an unindexed host record"));
+        };
+        if node.admin == on {
+            return Ok(0);
+        }
+        let before = node.pinned();
+        self.nodes.get_mut(key).unwrap().admin = on;
+        let mut changed = u32::from(self.nodes[key].pinned() != before);
+        let mut parent = self.nodes[key].parent;
+        while let Some(current) = parent {
+            let before = self.nodes[&current].pinned();
+            let node = self.nodes.get_mut(&current).unwrap();
+            node.admin_children = if on {
+                node.admin_children.saturating_add(1)
+            } else {
+                node.admin_children.saturating_sub(1)
+            };
+            if node.pinned() != before {
+                changed += 1;
+            }
+            parent = node.parent;
+        }
+        Ok(changed)
+    }
+
+    /// Remove every record, pinned or not. Used by a namespace purge; the caller retires the
+    /// extents and emits the removals.
+    pub fn take_all(&mut self) -> Vec<Node<L>> {
+        std::mem::take(&mut self.nodes).into_values().collect()
+    }
+
     pub fn remove(&mut self, key: &Key) -> Result<Vec<Node<L>>> {
         let node = self
             .nodes
             .get(key)
             .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
-        if node.children != 0 || node.pins != 0 {
+        if node.children != 0 || node.pinned() {
             return Err(invalid(
                 "cannot remove a pinned host record or one with children",
             ));
@@ -153,13 +208,34 @@ impl<L> Tree<L> {
             if let Some(parent) = node.parent {
                 let parent_node = self.nodes.get_mut(&parent).unwrap();
                 parent_node.children -= 1;
-                if parent_node.children == 0 && !parent_node.row && parent_node.pins == 0 {
+                if parent_node.children == 0 && !parent_node.row && !parent_node.pinned() {
                     next = Some(parent);
                 }
             }
             removed.push(node);
         }
         Ok(removed)
+    }
+
+    /// Removes exactly this node, which must have no children and no pin. Unlike `remove`, an
+    /// ancestor left childless is not touched.
+    pub fn remove_node(&mut self, key: &Key) -> Result<Node<L>> {
+        let node = self
+            .nodes
+            .get(key)
+            .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
+        if node.children != 0 || node.pinned() {
+            return Err(invalid(
+                "cannot remove a pinned host record or one with children",
+            ));
+        }
+        let node = self.nodes.remove(key).unwrap();
+        if let Some(parent) = node.parent {
+            if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                parent_node.children = parent_node.children.saturating_sub(1);
+            }
+        }
+        Ok(node)
     }
 
     pub fn evict(
@@ -171,7 +247,7 @@ impl<L> Tree<L> {
             .nodes
             .values()
             .filter(|node| {
-                node.pins == 0
+                !node.pinned()
                     && evictable(node)
                     && (node.children == 0 || (need_row && node.row && node.children == 1))
             })

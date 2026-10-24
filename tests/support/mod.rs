@@ -107,6 +107,15 @@ pub fn instance_name(label: &str) -> String {
     )
 }
 
+/// A probed loopback port for a manager's metrics endpoint. The probe can lose the port to
+/// another process before the manager binds it; `Host::start` retries with a fresh one.
+fn free_metrics_address() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    address
+}
+
 pub fn wait(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !condition() {
@@ -162,9 +171,7 @@ impl Host {
         let name = instance_name("host");
         let mut config = Config::new(base.join("records"), base.join("run/m.sock"), memory, nvme);
         config.name = name;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        config.metrics = Some(listener.local_addr().unwrap().to_string());
-        drop(listener);
+        config.metrics = Some(free_metrics_address());
         Self {
             base,
             config,
@@ -193,9 +200,7 @@ impl Host {
 
     pub fn open_config(mut config: Config) -> Self {
         if config.metrics.is_none() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            config.metrics = Some(listener.local_addr().unwrap().to_string());
-            drop(listener);
+            config.metrics = Some(free_metrics_address());
         }
         let base = config
             .root
@@ -226,7 +231,36 @@ impl Host {
     }
 
     pub fn start(&mut self) {
-        self.try_start().unwrap();
+        for attempt in 0..4 {
+            if attempt > 0 {
+                // A failed attempt may have lost its metrics port after the probe.
+                self.config.metrics = Some(free_metrics_address());
+            }
+            match self.try_start() {
+                Ok(()) => {
+                    // A manager that failed after creating its socket is not serving.
+                    thread::sleep(Duration::from_millis(20));
+                    if self
+                        .thread
+                        .as_ref()
+                        .is_some_and(|thread| !thread.is_finished())
+                    {
+                        return;
+                    }
+                    if let Some(thread) = self.thread.take() {
+                        let _ = thread.join();
+                    }
+                }
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::AddrInUse,
+                        "manager did not start: {error}"
+                    );
+                }
+            }
+        }
+        panic!("manager did not start");
     }
 
     pub fn try_start(&mut self) -> std::io::Result<()> {
@@ -274,7 +308,14 @@ impl Host {
     }
 
     pub async fn client(&self) -> Client {
-        Client::connect(&self.config, descriptor()).await.unwrap()
+        Client::connect(&self.config, descriptor())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a client could not connect to the manager at {}: {error}",
+                    self.config.socket.display()
+                )
+            })
     }
 
     pub async fn client_with(&self, descriptor: Descriptor) -> std::result::Result<Client, String> {
@@ -564,7 +605,33 @@ impl Client {
         }
     }
 
+    /// Stores content prepared ahead of time, skipping this call's content generation.
+    pub async fn store_prepared(
+        &mut self,
+        key: Key,
+        parent: Option<Key>,
+        prepared: (Header, Vec<u8>),
+    ) -> Vec<u8> {
+        match self
+            .put_with(key, parent, PutOptions::default(), Some(prepared))
+            .await
+        {
+            PutOutcome::Stored(bytes) => bytes,
+            other => panic!("store_prepared failed for {key:?} parent {parent:?}: {other:?}"),
+        }
+    }
+
     pub async fn put(&mut self, key: Key, parent: Option<Key>, options: PutOptions) -> PutOutcome {
+        self.put_with(key, parent, options, None).await
+    }
+
+    pub async fn put_with(
+        &mut self,
+        key: Key,
+        parent: Option<Key>,
+        options: PutOptions,
+        mut prepared: Option<(Header, Vec<u8>)>,
+    ) -> PutOutcome {
         let (sender, receiver) = mpsc::channel(8);
         let mut replies = match self
             .inner
@@ -609,7 +676,10 @@ impl Client {
                     }
                     first = u32::try_from(accept.first_page).unwrap();
                     let parent = accept.parent.as_ref().map(key_from_msg);
-                    let (value, data, _) = self.content(key, parent, first);
+                    let (value, data, _) = match prepared.take() {
+                        Some((value, data)) if first == 0 => (value, data, Vec::new()),
+                        Some(_) | None => self.content(key, parent, first),
+                    };
                     header = Some(value);
                     bytes = Some(data);
                 }
@@ -775,6 +845,37 @@ impl Client {
         }
     }
 
+    /// Fetch into caller-owned buffers so a benchmark can reuse a pre-touched
+    /// destination across samples. Returns false when the Get does not finish.
+    pub async fn fetch_into(
+        &mut self,
+        keys: &[Key],
+        skip: u32,
+        pages: u32,
+        destination: &mut Vec<Vec<u8>>,
+    ) -> bool {
+        let outcome = get_once(
+            self.inner.clone(),
+            self.descriptor.clone(),
+            self.generation,
+            self.arena.try_clone().unwrap(),
+            self.staging.try_clone().unwrap(),
+            keys.to_vec(),
+            skip,
+            pages,
+            GetOptions::default(),
+            Some(destination),
+        )
+        .await;
+        match outcome {
+            GetOutcome::Done(records) => {
+                *destination = records;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub async fn get(
         &mut self,
         keys: &[Key],
@@ -792,6 +893,7 @@ impl Client {
             skip,
             pages,
             options,
+            None,
         )
         .await
     }
@@ -816,6 +918,7 @@ impl Client {
                 left.1,
                 left.2,
                 GetOptions::default(),
+                None,
             ),
             get_once(
                 self.inner.clone(),
@@ -827,6 +930,7 @@ impl Client {
                 right.1,
                 right.2,
                 GetOptions::default(),
+                None,
             ),
         )
     }
@@ -1065,6 +1169,7 @@ async fn get_once(
     skip: u32,
     pages: u32,
     options: GetOptions,
+    destination: Option<&mut Vec<Vec<u8>>>,
 ) -> GetOutcome {
     let (sender, receiver) = mpsc::channel(8);
     let mut request = Request::new(ReceiverStream::new(receiver));
@@ -1102,7 +1207,22 @@ async fn get_once(
         file.read_exact_at(&mut bytes, offset).unwrap();
         bytes
     };
-    let mut records: Vec<Vec<u8>> = Vec::new();
+    // A caller-owned destination is reused across Gets (benchmarks), so its
+    // pages stay resident; otherwise fresh zeroed records are allocated.
+    let mut owned = Vec::new();
+    let records: &mut Vec<Vec<u8>> = destination.unwrap_or(&mut owned);
+    let timing = std::env::var_os("SELENE_GET_TIMING").is_some();
+    // Diagnostics for the Get profile: reuse one read buffer across windows and/or touch
+    // every page of the destination records before the window loop.
+    let reuse = std::env::var_os("SELENE_GET_REUSE").is_some();
+    let prefault = std::env::var_os("SELENE_GET_PREFAULT").is_some();
+    let mut scratch: Vec<u8> = Vec::new();
+    let begin_sent = Instant::now();
+    let mut last_release = begin_sent;
+    let mut waits: Vec<f64> = Vec::new();
+    let mut reads: Vec<f64> = Vec::new();
+    let mut copies: Vec<f64> = Vec::new();
+    let mut releases: Vec<f64> = Vec::new();
     loop {
         let reply = match replies.message().await {
             Ok(Some(reply)) => reply,
@@ -1111,11 +1231,18 @@ async fn get_once(
         };
         match reply.r {
             Some(get_reply::R::Leased(leased)) => {
-                records = leased
-                    .record_bytes
-                    .iter()
-                    .map(|bytes| vec![0; *bytes as usize])
-                    .collect();
+                // Grow a reused destination in place; every byte is
+                // overwritten by the metadata and the window payload.
+                records.truncate(leased.record_bytes.len());
+                records.resize_with(leased.record_bytes.len(), Vec::new);
+                for (record, bytes) in records.iter_mut().zip(&leased.record_bytes) {
+                    record.resize(*bytes as usize, 0);
+                }
+                if prefault {
+                    for record in records.iter_mut() {
+                        record.fill(0);
+                    }
+                }
             }
             Some(get_reply::R::Meta(meta)) => {
                 let record = meta.record as usize;
@@ -1137,6 +1264,8 @@ async fn get_once(
                         tokio::time::timeout(Duration::from_millis(500), replies.message()).await;
                     return GetOutcome::Cancelled;
                 }
+                let grant_at = Instant::now();
+                let wait = (grant_at - last_release).as_secs_f64();
                 let memory = grant.memory.as_ref().unwrap();
                 let region = if memory.region == proto::Region::Arena as i32 {
                     Reg::Arena
@@ -1144,13 +1273,28 @@ async fn get_once(
                     Reg::Staging
                 };
                 let length = usize::try_from(memory.length).unwrap();
-                let mut data = read(region, memory.offset, length);
-                if options.corrupt_copy {
-                    data[0] ^= 1;
+                let read_started = Instant::now();
+                if reuse {
+                    scratch.resize(length, 0);
+                    let file = match region {
+                        Reg::Arena => &arena,
+                        Reg::Staging => &staging,
+                    };
+                    file.read_exact_at(&mut scratch, memory.offset).unwrap();
+                } else {
+                    scratch = read(region, memory.offset, length);
                 }
+                let read_span = read_started.elapsed().as_secs_f64();
+                if options.corrupt_copy {
+                    scratch[0] ^= 1;
+                }
+                let data = &scratch[..length];
                 let record = grant.record as usize;
                 let start = grant.record_offset as usize;
-                records[record][start..start + length].copy_from_slice(&data);
+                let copy_started = Instant::now();
+                records[record][start..start + length].copy_from_slice(data);
+                let copy_span = copy_started.elapsed().as_secs_f64();
+                let release_started = Instant::now();
                 let _ = sender
                     .send(GetMessage {
                         m: Some(get_message::M::Released(proto::WindowReleased {
@@ -1159,8 +1303,45 @@ async fn get_once(
                         })),
                     })
                     .await;
+                let release_span = release_started.elapsed().as_secs_f64();
+                last_release = Instant::now();
+                if timing {
+                    waits.push(wait);
+                    reads.push(read_span);
+                    copies.push(copy_span);
+                    releases.push(release_span);
+                }
             }
-            Some(get_reply::R::Done(_)) => return GetOutcome::Done(records),
+            Some(get_reply::R::Done(_)) => {
+                if timing {
+                    let summary = |values: &mut Vec<f64>| -> (f64, f64) {
+                        if values.is_empty() {
+                            return (0.0, 0.0);
+                        }
+                        let mean = values.iter().sum::<f64>() / values.len() as f64;
+                        let max = values.iter().copied().fold(0.0f64, f64::max);
+                        (mean, max)
+                    };
+                    let (wait_mean, wait_max) = summary(&mut waits);
+                    let (read_mean, read_max) = summary(&mut reads);
+                    let (copy_mean, copy_max) = summary(&mut copies);
+                    let (release_mean, release_max) = summary(&mut releases);
+                    eprintln!(
+                        "get-timing windows={} total_s={:.6} wait_mean_ms={:.3}                          wait_max_ms={:.3} read_mean_ms={:.3} read_max_ms={:.3}                          copy_mean_ms={:.3} copy_max_ms={:.3} release_mean_ms={:.3}                          release_max_ms={:.3}",
+                        waits.len(),
+                        begin_sent.elapsed().as_secs_f64(),
+                        wait_mean * 1e3,
+                        wait_max * 1e3,
+                        read_mean * 1e3,
+                        read_max * 1e3,
+                        copy_mean * 1e3,
+                        copy_max * 1e3,
+                        release_mean * 1e3,
+                        release_max * 1e3,
+                    );
+                }
+                return GetOutcome::Done(std::mem::take(records));
+            }
             Some(get_reply::R::Refused(refused)) => {
                 return GetOutcome::Refused(u8::try_from(refused.reason).unwrap_or(0));
             }

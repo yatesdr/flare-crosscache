@@ -9,7 +9,7 @@ use crate::{
     tree::{Eviction, Tree},
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::{self, Read},
     path::PathBuf,
@@ -24,6 +24,7 @@ pub const WINDOW_CREDITS: u32 = 2;
 pub const MAX_CHAIN: usize = 65_536;
 pub const NO_PROGRESS: Duration = Duration::from_secs(3);
 pub const DEFAULT_MAX_WINDOW: u64 = 4 * 1024 * 1024;
+pub const DEFAULT_REMOTE_CATALOG: usize = 1_000_000;
 
 #[derive(Clone)]
 pub struct Config {
@@ -37,6 +38,10 @@ pub struct Config {
     pub faults: disk::Faults,
     pub write_budget: u64,
     pub max_window_bytes: u64,
+    /// Cap on remote-only records per namespace in the merged catalog.
+    pub remote_catalog_entries: usize,
+    /// Keep a fetched remote record after the Get completes.
+    pub retain_remote: bool,
 }
 
 impl Config {
@@ -52,6 +57,8 @@ impl Config {
             faults: disk::Faults::default(),
             write_budget: 0,
             max_window_bytes: DEFAULT_MAX_WINDOW,
+            remote_catalog_entries: DEFAULT_REMOTE_CATALOG,
+            retain_remote: true,
         }
     }
 
@@ -67,6 +74,8 @@ impl Config {
             faults: disk::Faults::default(),
             write_budget: 0,
             max_window_bytes: DEFAULT_MAX_WINDOW,
+            remote_catalog_entries: DEFAULT_REMOTE_CATALOG,
+            retain_remote: true,
         }
     }
 }
@@ -82,15 +91,110 @@ pub fn record_charge(header: &Header, in_memory: bool) -> u64 {
     }
 }
 
+/// Where a record entered this manager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Local,
+    Peer,
+}
+
 #[derive(Clone)]
 pub struct Location {
     pub header: Header,
+    pub origin: Origin,
     pub memory: Option<Arc<Extent>>,
     pub disk: Option<Arc<DiskExtent>>,
+    /// A copy on an upstream manager, kept in the merged catalog for lookups and fetches.
+    pub remote: Option<RemoteSource>,
     pub durable: bool,
     pub writing: bool,
+    /// The disk job currently transforming these bytes, so a stale completion is ignored.
+    pub job: Option<u64>,
+    /// The disk copy is stale (a fetched row completed it) and must be rewritten.
+    pub rewrite: bool,
     pub retry: Instant,
     pub bytes: u64,
+}
+
+/// Where an upstream manager keeps one record, as advertised in its catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteSource {
+    pub node: String,
+    pub bytes: u64,
+    pub row: bool,
+}
+
+/// What a finished Put should do to the tree entry for its key.
+enum PublishTarget {
+    /// No entry exists; index a new record.
+    Insert,
+    /// A catalog entry without local bytes is present; take its place and keep its source.
+    Replace(Option<RemoteSource>),
+    /// A local copy won the race; the Put is a duplicate.
+    Present,
+    /// The existing entry describes a different record under the same key.
+    Conflict,
+}
+
+/// What a local Get needs from the peer runtime before it can be served.
+pub struct RemotePlan {
+    pub descriptor: Descriptor,
+    /// The whole chain's root; placement hashes this, never a fetched suffix.
+    pub root: Key,
+    /// Records to fetch in one Get: from the first missing record to the chain endpoint. The
+    /// endpoint carries a row, so the chain is a valid Get.
+    pub records: Vec<ChainRecord>,
+}
+
+/// One record of a requested chain, as the local merged catalog knows it.
+#[derive(Clone, Debug)]
+pub struct ChainRecord {
+    pub key: Key,
+    pub bytes: u64,
+    pub tail_pages: u32,
+    pub row: bool,
+    pub remote: bool,
+    pub local: bool,
+    /// The upstream that advertised this record, when it is a remote source.
+    pub source: Option<String>,
+    /// True for the last record of the requested chain, whose row a Get delivers.
+    pub endpoint: bool,
+    /// The record's full shape, including its row, used to size a fetch destination.
+    pub length: u64,
+}
+
+fn remote_key(key: Option<proto::Key>) -> Option<Key> {
+    let key = key?;
+    if key.consumed_tokens == 0 || key.digest.len() != 16 {
+        return None;
+    }
+    let digest: [u8; 16] = key.digest.as_slice().try_into().ok()?;
+    Some(Key {
+        consumed_tokens: key.consumed_tokens,
+        digest,
+    })
+}
+
+fn remote_entry(entry: &proto::CatalogEntry) -> Option<(Key, RemoteEntry)> {
+    let key = remote_key(entry.key.clone())?;
+    let parent = if entry.has_parent {
+        Some(remote_key(entry.parent.clone())?)
+    } else {
+        None
+    };
+    let bucket: [u8; 16] = entry.bucket.as_slice().try_into().ok()?;
+    let tail_pages = u32::try_from(entry.tail_pages).ok()?;
+    Some((
+        key,
+        RemoteEntry {
+            parent,
+            bucket,
+            tail_pages,
+            row: entry.row,
+            bytes: entry.bytes,
+            unreadable: entry.unreadable,
+        },
+    ))
 }
 
 impl Location {
@@ -112,6 +216,12 @@ pub struct Namespace {
     pub seq: u64,
     pub disk: Option<disk::Worker>,
     pub inflight: HashSet<Key>,
+    /// Incremented by a purge; publications from an older epoch are discarded.
+    pub epoch: u64,
+    /// True while a purge's retired disk extents are still draining.
+    pub purging: bool,
+    /// Retired extents that keep the namespace closed to new Puts until they are released.
+    pub purge_drain: Vec<std::sync::Weak<crate::disk::DiskExtent>>,
 }
 
 impl Namespace {
@@ -226,6 +336,8 @@ enum RootChoice {
 
 pub struct Put {
     namespace: NamespaceId,
+    epoch: u64,
+    remote: bool,
     header: Header,
     first_page: u32,
     grants: Vec<PlannedGrant>,
@@ -243,7 +355,6 @@ pub struct Put {
     pending: usize,
     blocked: VecDeque<(u64, u64, ExtentSlice)>,
     pins: VecDeque<Key>,
-    replacement: bool,
     reservation: u64,
     requirement: PutRequirement,
     /// Fixed staging reservation for a streamed Put. Live windows are
@@ -285,6 +396,7 @@ struct GetRecord {
 }
 
 pub struct Get {
+    namespace: NamespaceId,
     pins: VecDeque<Key>,
     records: Vec<GetRecord>,
     grants: Vec<PlannedGetGrant>,
@@ -360,6 +472,9 @@ pub struct Session {
     pub namespace: Option<NamespaceId>,
     pub ops: HashMap<u64, Open>,
     pub budget: TokenBucket,
+    /// A manager-to-manager session. It has no local pidfd and may bind its namespace on first
+    /// use (Subscribe, PutBegin or GetBegin) instead of at Hello.
+    pub remote: bool,
 }
 
 const SNAPSHOT_BUFFER: usize = 65_536;
@@ -439,6 +554,12 @@ pub struct Metrics {
     pub nvme_bytes: u64,
     pub nvme_seconds: f64,
     pub nvme_errors: u64,
+    pub forwarded: u64,
+    pub forward_failed: u64,
+    pub forward_retries: u64,
+    pub remote_conflicts: u64,
+    pub remote_refused: u64,
+    pub remote_fetched: u64,
     pub hits: HashMap<(String, &'static str), u64>,
 }
 
@@ -449,9 +570,12 @@ pub struct EntryData {
     pub bucket: [u8; 16],
     pub tail_pages: u32,
     pub row: bool,
+    /// 0 = DRAM, 1 = NVMe, 2 = only an upstream manager has it.
     pub tier: u8,
     pub durable: bool,
     pub bytes: u64,
+    /// A shape anchor without a readable local or remote source.
+    pub unreadable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -477,6 +601,43 @@ impl Drop for ForwardRecord {
             extent.release();
         }
     }
+}
+
+impl ForwardRecord {
+    /// The lease when the record is readable in memory; its bytes start at the extent.
+    pub fn memory(&self) -> Option<&Arc<Extent>> {
+        self.memory.as_ref()
+    }
+
+    /// The lease when the record is durable. Disk files carry a 4096-byte envelope.
+    pub fn disk(&self) -> Option<&Arc<DiskExtent>> {
+        self.disk.as_ref()
+    }
+
+    /// A disk-only lease, for tests that drive the forwarder without a store.
+    #[cfg(test)]
+    pub fn for_test_disk(header: Header, disk: Arc<DiskExtent>) -> Self {
+        Self {
+            header,
+            memory: None,
+            disk: Some(disk),
+        }
+    }
+}
+
+/// One write-through step: the exact stored shape and a lease on its bytes.
+pub struct ForwardJob {
+    pub namespace: NamespaceId,
+    pub descriptor: Descriptor,
+    pub key: Key,
+    pub parent: Option<Key>,
+    /// The chain from its root to `key`, root first.
+    pub ancestors: Vec<Key>,
+    pub chain_pages: u64,
+    pub tail_pages: u64,
+    pub bucket: [u8; 16],
+    pub row: bool,
+    pub record: ForwardRecord,
 }
 
 pub enum StoreEvent {
@@ -538,6 +699,7 @@ struct PendingGet {
 }
 
 pub struct PutRequest {
+    pub namespace: NamespaceId,
     pub key: Key,
     pub published_parent: Option<Key>,
     pub bucket: [u8; 16],
@@ -547,6 +709,7 @@ pub struct PutRequest {
 }
 
 pub struct GetRequest {
+    pub namespace: NamespaceId,
     pub keys: Vec<Key>,
     pub skip_pages: u32,
     pub expected_pages: u32,
@@ -577,12 +740,50 @@ pub struct Store {
     pending_gets: HashMap<u64, VecDeque<PendingGet>>,
     put_order: VecDeque<u64>,
     get_order: VecDeque<u64>,
-    subscriptions: HashMap<u64, Subscription>,
+    subscriptions: HashMap<(u64, NamespaceId), Subscription>,
     next_transfer: u64,
     read_backlog: VecDeque<(NamespaceId, u64, Task)>,
     detached_puts: HashMap<(u64, u64), Put>,
     armed: HashMap<u64, ArmedRoom>,
     forward_events: Vec<ForwardEvent>,
+    /// Ancestor chains pinned while a forward is pending.
+    forward_pins: HashMap<(NamespaceId, Key), Vec<Key>>,
+    /// Chains pinned by a remote fetch reservation until the serving Get takes over.
+    fetch_pins: HashMap<u64, FetchPin>,
+    fetch_counter: u64,
+    /// Remote-only anchors waiting for the lease that kept them to end.
+    remote_orphans: Vec<(NamespaceId, Key)>,
+    quotas: HashMap<NamespaceId, Quota>,
+    /// The live remote view of each (namespace, upstream), keyed by record.
+    remote_views: HashMap<(NamespaceId, String), BTreeMap<Key, RemoteEntry>>,
+    /// Snapshots being assembled for the same pair.
+    remote_snapshots: HashMap<(NamespaceId, String), BTreeMap<Key, RemoteEntry>>,
+    /// Remote entries whose parent was not indexed yet; retried when a parent arrives.
+    remote_deferred: HashMap<(NamespaceId, String), BTreeMap<Key, RemoteEntry>>,
+}
+
+/// One record as an upstream catalog describes it.
+#[derive(Clone)]
+struct RemoteEntry {
+    parent: Option<Key>,
+    bucket: [u8; 16],
+    tail_pages: u32,
+    row: bool,
+    bytes: u64,
+    unreadable: bool,
+}
+
+/// A remote fetch's DRAM destinations, pinned until the serving Get plans its own pins.
+struct FetchPin {
+    connection: u64,
+    namespace: NamespaceId,
+    keys: Vec<Key>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Quota {
+    dram: u64,
+    nvme: u64,
 }
 
 impl Store {
@@ -645,6 +846,14 @@ impl Store {
             detached_puts: HashMap::new(),
             armed: HashMap::new(),
             forward_events: Vec::new(),
+            forward_pins: HashMap::new(),
+            fetch_pins: HashMap::new(),
+            fetch_counter: 0,
+            remote_orphans: Vec::new(),
+            quotas: HashMap::new(),
+            remote_views: HashMap::new(),
+            remote_snapshots: HashMap::new(),
+            remote_deferred: HashMap::new(),
         };
         let mut recovered_age = Vec::new();
         for recovered in recovered {
@@ -663,11 +872,15 @@ impl Store {
                     header.tail_pages as usize,
                     row,
                     Location {
+                        origin: Origin::Local,
+                        remote: None,
                         header,
                         memory: None,
                         disk: Some(extent),
                         durable: false,
                         writing: false,
+                        job: None,
+                        rewrite: false,
                         retry: Instant::now(),
                         bytes,
                     },
@@ -726,6 +939,9 @@ impl Store {
             seq: 0,
             disk,
             inflight: HashSet::new(),
+            epoch: 0,
+            purging: false,
+            purge_drain: Vec::new(),
         }
     }
 
@@ -805,13 +1021,1182 @@ impl Store {
                 namespace: Some(id),
                 ops: HashMap::new(),
                 budget: TokenBucket::new(self.config.write_budget, Instant::now()),
+                remote: false,
             },
         );
         Ok(generation)
     }
 
+    /// Register a manager-to-manager connection. The namespace is bound by the first
+    /// Subscribe or PutBegin, because `PeerHello` carries no descriptor.
+    pub fn peer_hello(&mut self, connection: u64, node: &str) -> Result<u64> {
+        if node.is_empty() || node.len() > 256 {
+            return Err(invalid("peer node name must be 1..=256 bytes"));
+        }
+        if self.sessions.contains_key(&connection) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "connection already greeted",
+            ));
+        }
+        self.local.accept_remote(connection)?;
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .ok_or_else(|| invalid("connection counter exhausted"))?;
+        let generation = self.boot ^ self.counter;
+        self.sessions.insert(
+            connection,
+            Session {
+                generation,
+                namespace: None,
+                ops: HashMap::new(),
+                budget: TokenBucket::new(self.config.write_budget, Instant::now()),
+                remote: true,
+            },
+        );
+        Ok(generation)
+    }
+
+    /// The namespaces currently registered, for upstream subscription.
+    pub fn descriptors(&self) -> Vec<(NamespaceId, Descriptor)> {
+        self.namespaces
+            .iter()
+            .map(|(id, namespace)| (*id, namespace.descriptor.clone()))
+            .collect()
+    }
+
+    /// The arena and staging mappings, for the peer data channels.
+    pub fn regions(&self) -> crate::regions::LocalRegions {
+        crate::regions::LocalRegions::new(self.memory.clone(), self.staging.clone())
+    }
+
+    /// The chain from its root to `key`, root first, for parent-first forwarding.
+    pub fn ancestors_of(&self, id: NamespaceId, key: Key) -> Vec<Key> {
+        let Some(namespace) = self.namespaces.get(&id) else {
+            return Vec::new();
+        };
+        let Some(node) = namespace.tree.node(&key) else {
+            return Vec::new();
+        };
+        let mut chain = vec![key];
+        let mut parent = node.parent;
+        while let Some(current) = parent {
+            chain.push(current);
+            parent = namespace.tree.node(&current).and_then(|node| node.parent);
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Everything a forward step needs: the exact stored shape, the pinned record lease and its
+    /// ancestor chain, root first. The ancestors stay pinned until `PeerEvent::Forwarded`.
+    pub fn prepare_forward(&mut self, namespace: NamespaceId, key: Key) -> Result<ForwardJob> {
+        let state = self
+            .namespaces
+            .get(&namespace)
+            .ok_or_else(|| invalid("forward namespace is not registered"))?;
+        let node = state
+            .tree
+            .node(&key)
+            .ok_or_else(|| invalid("forward source is not stored"))?;
+        let mut ancestors = vec![key];
+        let mut parent = node.parent;
+        while let Some(current) = parent {
+            ancestors.push(current);
+            parent = state.tree.node(&current).and_then(|node| node.parent);
+        }
+        ancestors.reverse();
+        let chain_pages = key.consumed_tokens / state.descriptor.page_tokens;
+        let job = ForwardJob {
+            namespace,
+            descriptor: state.descriptor.clone(),
+            key,
+            parent: node.parent,
+            ancestors: ancestors.clone(),
+            chain_pages,
+            tail_pages: node.tail_pages as u64,
+            bucket: node.bucket,
+            row: node.row,
+            record: self.forward_source(namespace, key)?,
+        };
+        let state = self.namespaces.get_mut(&namespace).unwrap();
+        for ancestor in &ancestors {
+            let _ = state.tree.pin(ancestor);
+        }
+        self.forward_pins.insert((namespace, key), ancestors);
+        Ok(job)
+    }
+
+    fn forward_finished(&mut self, namespace: NamespaceId, key: Key) {
+        let Some(ancestors) = self.forward_pins.remove(&(namespace, key)) else {
+            return;
+        };
+        let Some(state) = self.namespaces.get_mut(&namespace) else {
+            return;
+        };
+        for ancestor in &ancestors {
+            let _ = state.tree.unpin(ancestor);
+        }
+    }
+
+    /// Releases a prepared forward that never reached the peer thread.
+    pub fn forward_dropped(&mut self, namespace: NamespaceId, key: Key) {
+        self.metrics.forward_failed += 1;
+        self.forward_finished(namespace, key);
+    }
+
+    /// Remove every record of a namespace, canceling its transfers first. Records are removed
+    /// even when pinned or leased: their extents stay alive through the leases, and disk files
+    /// are retired once the last reader drops.
+    fn purge_namespace(&mut self, id: NamespaceId) -> (u64, u64) {
+        let Some(namespace) = self.namespaces.get_mut(&id) else {
+            return (0, 0);
+        };
+        namespace.epoch = namespace.epoch.wrapping_add(1);
+        let mut ops = Vec::new();
+        for (connection, session) in &self.sessions {
+            for (transfer, open) in &session.ops {
+                let namespace = match &open.operation {
+                    Operation::Put(put) => Some(put.namespace),
+                    Operation::Get(get) => Some(get.namespace),
+                };
+                if namespace == Some(id) {
+                    ops.push((*connection, *transfer));
+                }
+            }
+        }
+        for (connection, transfer) in ops {
+            self.cancel(connection, transfer);
+        }
+        for queue in self.pending_puts.values_mut() {
+            queue.retain(|pending| {
+                if pending.request.namespace != id {
+                    return true;
+                }
+                let _ = pending.events.try_send(Ok(PutAnswer::Refused(Refused {
+                    reason: proto::Reason::Invalid as u8,
+                    detail: "namespace was purged".into(),
+                })));
+                false
+            });
+        }
+        for queue in self.pending_gets.values_mut() {
+            queue.retain(|pending| {
+                if pending.request.namespace != id {
+                    return true;
+                }
+                let _ = pending.events.try_send(Ok(GetAnswer::Refused(Refused {
+                    reason: proto::Reason::Invalid as u8,
+                    detail: "namespace was purged".into(),
+                })));
+                false
+            });
+        }
+        let nodes = self.namespaces.get_mut(&id).unwrap().tree.take_all();
+        let mut records = 0u64;
+        let mut bytes = 0u64;
+        for node in nodes {
+            records += 1;
+            bytes = bytes.saturating_add(node.location.bytes);
+            if node.location.memory.is_some() || node.location.disk.is_some() {
+                self.charged = self.charged.saturating_sub(node.location.bytes);
+            }
+            if let Some(disk) = &node.location.disk {
+                disk.retire();
+                self.namespaces
+                    .get_mut(&id)
+                    .unwrap()
+                    .purge_drain
+                    .push(Arc::downgrade(disk));
+                self.deferred_disk.push(disk.clone());
+            }
+            self.delta(id, 2, node.key);
+        }
+        // Only publications that are waiting (no submitted job) can be dropped here. Ones
+        // with outstanding Chunk/Finish jobs keep their ownership and charge until those
+        // complete; their epoch mismatch retires the renamed file.
+        let detached: Vec<(u64, u64)> = self
+            .detached_puts
+            .iter()
+            .filter(|(_, put)| put.namespace == id && put.pending == 0)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in detached {
+            if let Some(put) = self.detached_puts.remove(&key) {
+                self.finish_detached_put(Some(id), put);
+            }
+        }
+        let draining = self.purge_busy(id);
+        self.namespaces.get_mut(&id).unwrap().purging = draining;
+        self.metrics.evictions += records;
+        (records, bytes)
+    }
+
+    fn namespace_charge(&self, id: NamespaceId, memory_only: bool) -> u64 {
+        self.namespaces
+            .get(&id)
+            .map(|state| {
+                state
+                    .tree
+                    .nodes()
+                    .filter(|node| {
+                        if memory_only {
+                            node.location.memory.is_some()
+                        } else {
+                            node.location.memory.is_some() || node.location.disk.is_some()
+                        }
+                    })
+                    .map(|node| node.location.bytes)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn pending_reserved(&self, id: NamespaceId) -> u64 {
+        let mut total = 0u64;
+        for session in self.sessions.values() {
+            for open in session.ops.values() {
+                if let Operation::Put(put) = &open.operation
+                    && put.namespace == id
+                    && !put.finished
+                {
+                    total = total.saturating_add(put.reservation);
+                }
+            }
+        }
+        for put in self.detached_puts.values() {
+            if put.namespace == id {
+                total = total.saturating_add(put.reservation);
+            }
+        }
+        for drain in &self.retired_puts {
+            if drain.namespace == id {
+                total = total.saturating_add(drain.reservation);
+            }
+        }
+        total
+    }
+
+    /// Capacity held by unfinished Puts of this namespace on the memory side: a streaming
+    /// Put's staging hold, or a non-streaming Put's arena reservation. A streaming Put's disk
+    /// reservation belongs to the durable side and is counted by `pending_reserved`.
+    fn pending_memory(&self, id: NamespaceId) -> u64 {
+        fn held(put: &Put) -> u64 {
+            put.staging_hold
+                .as_ref()
+                .map_or(put.reservation, |hold| hold.capacity() as u64)
+        }
+        let mut total = 0u64;
+        for session in self.sessions.values() {
+            for open in session.ops.values() {
+                if let Operation::Put(put) = &open.operation
+                    && put.namespace == id
+                    && !put.finished
+                {
+                    total = total.saturating_add(held(put));
+                }
+            }
+        }
+        for put in self.detached_puts.values() {
+            if put.namespace == id {
+                total = total.saturating_add(held(put));
+            }
+        }
+        for drain in &self.retired_puts {
+            if drain.namespace == id {
+                total = total.saturating_add(
+                    drain
+                        ._staging_hold
+                        .as_ref()
+                        .map_or(drain.reservation, |hold| hold.capacity() as u64),
+                );
+            }
+        }
+        total
+    }
+
+    fn quota_excess(&self, id: NamespaceId) -> u64 {
+        let quota = self.quotas.get(&id).copied().unwrap_or_default();
+        let pending = self.pending_reserved(id);
+        let pending_memory = self.pending_memory(id);
+        let physical = self.namespace_charge(id, false).saturating_add(pending);
+        let memory = self
+            .namespace_charge(id, true)
+            .saturating_add(pending_memory);
+        let nvme = if quota.nvme == 0 {
+            0
+        } else {
+            physical.saturating_sub(quota.nvme)
+        };
+        let dram = if quota.dram == 0 {
+            0
+        } else {
+            memory.saturating_sub(quota.dram)
+        };
+        nvme.max(dram)
+    }
+
+    /// Evict this namespace's eligible leaves until both limits hold. Pinned or leased records
+    /// stay and are reported as excess.
+    fn enforce_quota(&mut self, id: NamespaceId) {
+        loop {
+            let Some(quota) = self.quotas.get(&id).copied() else {
+                return;
+            };
+            let pending = self.pending_reserved(id);
+            let pending_memory = self.pending_memory(id);
+            let physical = self.namespace_charge(id, false).saturating_add(pending);
+            let memory = self
+                .namespace_charge(id, true)
+                .saturating_add(pending_memory);
+            let over_nvme = quota.nvme != 0 && physical > quota.nvme;
+            let over_dram = quota.dram != 0 && memory > quota.dram;
+            if !over_nvme && !over_dram {
+                return;
+            }
+            let memory_only = over_dram && !over_nvme;
+            let Some(key) = self.quota_candidate(id, memory_only) else {
+                return;
+            };
+            let before = (
+                self.namespace_charge(id, false),
+                self.namespace_charge(id, true),
+            );
+            if memory_only {
+                self.evict_memory_of(id, key);
+            } else {
+                self.remove_quota_leaf(id, key);
+            }
+            let after = (
+                self.namespace_charge(id, false),
+                self.namespace_charge(id, true),
+            );
+            if after == before {
+                // Nothing eligible left to free; the remaining excess is blocked.
+                return;
+            }
+        }
+    }
+
+    fn quota_candidate(&self, id: NamespaceId, memory_only: bool) -> Option<Key> {
+        let namespace = self.namespaces.get(&id)?;
+        namespace
+            .tree
+            .nodes()
+            .filter(|node| {
+                !node.pinned()
+                    && node.children() == 0
+                    && (node.location.memory.is_some() || node.location.disk.is_some())
+                    && (!memory_only || node.location.memory.is_some())
+            })
+            .min_by_key(|node| (node.accessed(), node.key.consumed_tokens))
+            .map(|node| node.key)
+    }
+
+    fn evict_memory_of(&mut self, id: NamespaceId, key: Key) {
+        let disk = self.namespaces[&id]
+            .tree
+            .node(&key)
+            .is_some_and(|node| node.location.disk.is_some());
+        if disk {
+            let node = self
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&key)
+                .unwrap();
+            let old = node.location.bytes;
+            node.location.memory = None;
+            node.location.bytes = record_charge(&node.location.header, false);
+            self.charged = self.charged - old + node.location.bytes;
+            self.delta(id, 1, key);
+        } else {
+            self.remove_quota_leaf(id, key);
+        }
+    }
+
+    fn remove_quota_leaf(&mut self, id: NamespaceId, key: Key) -> bool {
+        let removed = match self.namespaces.get_mut(&id).unwrap().tree.remove(&key) {
+            Ok(removed) => removed,
+            Err(_) => return false,
+        };
+        for node in removed {
+            if node.location.memory.is_some() || node.location.disk.is_some() {
+                self.charged = self.charged.saturating_sub(node.location.bytes);
+            }
+            if let Some(disk) = &node.location.disk {
+                disk.retire();
+                self.deferred_disk.push(disk.clone());
+            }
+            self.metrics.evictions += 1;
+            self.delta(id, 2, node.key);
+        }
+        true
+    }
+
+    /// `nvme_charge` is the incoming record's durable reservation; `memory_charge` is what it
+    /// holds in memory (its arena extent, or only the staging hold for a streamed record).
+    fn quota_allows(&self, id: NamespaceId, nvme_charge: u64, memory_charge: u64) -> bool {
+        let Some(quota) = self.quotas.get(&id).copied() else {
+            return true;
+        };
+        let pending = self.pending_reserved(id);
+        let pending_memory = self.pending_memory(id);
+        let physical = self
+            .namespace_charge(id, false)
+            .saturating_add(pending)
+            .saturating_add(nvme_charge);
+        if quota.nvme != 0 && physical > quota.nvme {
+            return false;
+        }
+        let retained = self
+            .namespace_charge(id, true)
+            .saturating_add(pending_memory)
+            .saturating_add(memory_charge);
+        !(quota.dram != 0 && retained > quota.dram)
+    }
+
+    fn admin(&mut self, command: AdminCommand) {
+        match command {
+            AdminCommand::Stats(reply) => {
+                let _ = reply.send(Ok(self.metrics_text()));
+            }
+            AdminCommand::Pin {
+                namespace,
+                keys,
+                pin,
+                reply,
+            } => {
+                let result = (|| -> Result<u32> {
+                    let id: NamespaceId = namespace
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| invalid("namespace_id must be 32 bytes"))?;
+                    let state = self
+                        .namespaces
+                        .get_mut(&id)
+                        .ok_or_else(|| invalid("unknown namespace"))?;
+                    let mut changed = 0;
+                    for key in keys {
+                        if let Ok(transition) = state.tree.admin_pin(&key, pin) {
+                            changed += transition;
+                        }
+                    }
+                    Ok(changed)
+                })();
+                let _ = reply.send(result);
+            }
+            AdminCommand::Purge {
+                namespace,
+                all_namespaces,
+                reply,
+            } => {
+                let result = (|| -> Result<(u64, u64)> {
+                    let ids: Vec<NamespaceId> = if all_namespaces {
+                        self.namespaces.keys().copied().collect()
+                    } else {
+                        vec![
+                            namespace
+                                .as_slice()
+                                .try_into()
+                                .map_err(|_| invalid("namespace_id must be 32 bytes"))?,
+                        ]
+                    };
+                    let mut records = 0u64;
+                    let mut bytes = 0u64;
+                    for id in ids {
+                        let (purged, purged_bytes) = self.purge_namespace(id);
+                        records += purged;
+                        bytes = bytes.saturating_add(purged_bytes);
+                    }
+                    Ok((records, bytes))
+                })();
+                let _ = reply.send(result);
+            }
+            AdminCommand::SetQuota {
+                namespace,
+                dram,
+                nvme,
+                reply,
+            } => {
+                let result = (|| -> Result<u64> {
+                    let id: NamespaceId = namespace
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| invalid("namespace_id must be 32 bytes"))?;
+                    if !self.namespaces.contains_key(&id) {
+                        return Err(invalid("unknown namespace"));
+                    }
+                    self.quotas.insert(id, Quota { dram, nvme });
+                    self.enforce_quota(id);
+                    Ok(self.quota_excess(id))
+                })();
+                let _ = reply.send(result);
+            }
+        }
+    }
+
     pub fn take_forward_events(&mut self) -> Vec<ForwardEvent> {
         std::mem::take(&mut self.forward_events)
+    }
+
+    /// The records of one requested chain, as the local catalog sees them.
+    pub fn chain_records(&self, id: NamespaceId, chain: &[Key]) -> Vec<ChainRecord> {
+        let Some(namespace) = self.namespaces.get(&id) else {
+            return Vec::new();
+        };
+        let endpoint = chain.last().copied();
+        chain
+            .iter()
+            .filter_map(|key| namespace.tree.node(key))
+            .map(|node| ChainRecord {
+                key: node.key,
+                bytes: node.location.bytes,
+                tail_pages: node.tail_pages as u32,
+                row: node.row,
+                remote: node.location.remote.is_some(),
+                local: node.location.memory.is_some() || node.location.disk.is_some(),
+                source: node
+                    .location
+                    .remote
+                    .as_ref()
+                    .map(|source| source.node.clone()),
+                endpoint: Some(node.key) == endpoint,
+                length: node.location.header.length_with_row(),
+            })
+            .collect()
+    }
+
+    /// Pin a record and its ancestors, so an eviction pass cannot take them while the caller
+    /// installs its own bytes. Returns false when the record is gone.
+    fn pin_chain(&mut self, id: NamespaceId, key: Key) -> bool {
+        let mut chain = Vec::new();
+        let mut current = Some(key);
+        while let Some(key) = current {
+            chain.push(key);
+            current = self
+                .namespaces
+                .get(&id)
+                .and_then(|namespace| namespace.tree.node(&key))
+                .and_then(|node| node.parent);
+        }
+        if chain.first() != Some(&key) {
+            return false;
+        }
+        let mut pinned = 0usize;
+        for key in &chain {
+            match self
+                .namespaces
+                .get_mut(&id)
+                .map(|namespace| namespace.tree.pin(key))
+            {
+                Some(Ok(())) => pinned += 1,
+                _ => {
+                    for key in chain.iter().take(pinned) {
+                        let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
+                    }
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn unpin_chain(&mut self, id: NamespaceId, key: Key) {
+        let mut current = Some(key);
+        while let Some(key) = current {
+            let Some(namespace) = self.namespaces.get_mut(&id) else {
+                return;
+            };
+            if namespace.tree.unpin(&key).is_err() {
+                return;
+            }
+            current = namespace.tree.node(&key).and_then(|node| node.parent);
+        }
+    }
+
+    /// Install a fetched record as a local DRAM copy. The catalog may have moved on; a record
+    /// that vanished or changed shape is refused and the caller drops the extent.
+    fn adopt_remote(
+        &mut self,
+        id: NamespaceId,
+        key: Key,
+        extent: Arc<Extent>,
+        row: bool,
+    ) -> Result<()> {
+        let bytes = extent.bytes();
+        if bytes.len() < record::HEADER_BYTES {
+            return Err(invalid("adopted record is shorter than a header"));
+        }
+        let header = Header::decode(&bytes[..record::HEADER_BYTES])?;
+        let (previous, page_only_disk, descriptor) = {
+            let namespace = self
+                .namespaces
+                .get(&id)
+                .ok_or_else(|| invalid("adopted namespace is not registered"))?;
+            let node = namespace
+                .tree
+                .node(&key)
+                .ok_or_else(|| invalid("adopted record is not in the catalog"))?;
+            if node.location.memory.is_some() && (node.row || !row) {
+                // A complete copy, or a page-only copy when that is all this fetch carries.
+                return Ok(());
+            }
+            if node.location.writing || node.location.job.is_some() {
+                // The bytes on disk are owned by an in-flight write-back or compaction; a
+                // fetched copy cannot be installed without racing its completion.
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "the record has a disk job in flight",
+                ));
+            }
+            if header.key != key
+                || header.parent != node.parent
+                || header.tail_pages as usize != node.tail_pages
+            {
+                return Err(invalid("adopted record changed the chain shape"));
+            }
+            let previous = node
+                .location
+                .memory
+                .is_some()
+                .then_some(node.location.bytes);
+            // A page-only disk copy cannot satisfy the delivered row; queue its rewrite.
+            let page_only_disk = row && node.location.disk.is_some() && !node.row;
+            (previous, page_only_disk, namespace.descriptor.clone())
+        };
+        if header.identity != descriptor.identity
+            || header.fingerprint != descriptor.fingerprint
+            || !header.matches(&descriptor)
+            || header.flags != 0
+            || header.length(row) as usize > bytes.len()
+        {
+            return Err(invalid("adopted record does not match the namespace"));
+        }
+        let charge = record_charge(&header, true);
+        if !self.quota_allows(id, charge, charge) {
+            return Err(invalid("namespace quota blocks the fetched record"));
+        }
+        let previous = previous.unwrap_or(0);
+        // Adoption spends the same global budget as a local publication. Pin the record and
+        // its ancestors first: make_room may evict, but never what is about to be replaced.
+        if !self.pin_chain(id, key) {
+            return Err(invalid("adopted record is not in the catalog"));
+        }
+        let made = self.make_room_with(Some(id), charge.saturating_sub(previous), &[]);
+        self.unpin_chain(id, key);
+        if !made {
+            return Err(invalid("no room for the fetched record"));
+        }
+        {
+            let namespace = self.namespaces.get_mut(&id).unwrap();
+            let node = namespace.tree.node_mut(&key).unwrap();
+            node.location.origin = Origin::Peer;
+            node.location.header = header.clone();
+            node.location.memory = Some(extent);
+            node.location.bytes = charge;
+            node.location.retry = Instant::now();
+            if page_only_disk {
+                node.location.rewrite = true;
+            }
+            node.row = row;
+        }
+        self.charged = self.charged.saturating_sub(previous).saturating_add(charge);
+        self.metrics.remote_fetched += 1;
+        self.clock += 1;
+        let clock = self.clock;
+        self.namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .access_at(&key, clock);
+        self.refresh_durability(id);
+        self.delta(id, 1, key);
+        self.drain_remote_deferred(id);
+        Ok(())
+    }
+
+    /// Allocate the DRAM destinations for a remote fetch through the same room making an
+    /// admission uses, so eviction can free space and the allocation stays visible to
+    /// admission while the transfer runs. The chain stays pinned until the serving Get plans
+    /// its own pins or the reservation is released. `None` classifies a chain that cannot fit
+    /// the arena as a miss: there is no windowed fetch path.
+    fn reserve_fetch(
+        &mut self,
+        id: NamespaceId,
+        chain: &[Key],
+        lengths: &[u64],
+        connection: u64,
+    ) -> Result<Option<FetchReservation>> {
+        // A fetch whose connection has already closed has no Get left to serve: do not pin.
+        if !self.namespaces.contains_key(&id) || !self.sessions.contains_key(&connection) {
+            return Ok(None);
+        }
+        let total = lengths
+            .iter()
+            .fold(0u64, |total, length| total.saturating_add(*length));
+        if total > self.memory.capacity() as u64 {
+            return Ok(None);
+        }
+        // Keep the chain the fetch is served from and adopts: admission may evict otherwise.
+        let mut pinned = Vec::new();
+        for key in chain {
+            if let Some(namespace) = self.namespaces.get_mut(&id)
+                && namespace.tree.pin(key).is_ok()
+            {
+                pinned.push(*key);
+            }
+        }
+        let durable = self.config.root.is_some();
+        let mut extents = Vec::with_capacity(lengths.len());
+        let mut fitted = true;
+        for length in lengths {
+            let Ok(bytes) = usize::try_from(*length) else {
+                fitted = false;
+                break;
+            };
+            match self.memory_room_excluding(bytes, durable, &[]) {
+                Some(extent) => extents.push(Arc::new(extent)),
+                None => {
+                    fitted = false;
+                    break;
+                }
+            }
+        }
+        if !fitted {
+            if let Some(namespace) = self.namespaces.get_mut(&id) {
+                for key in pinned {
+                    let _ = namespace.tree.unpin(&key);
+                }
+            }
+            return Ok(None);
+        }
+        self.fetch_counter += 1;
+        let token = self.fetch_counter;
+        self.fetch_pins.insert(
+            token,
+            FetchPin {
+                connection,
+                namespace: id,
+                keys: pinned,
+            },
+        );
+        Ok(Some((token, extents)))
+    }
+
+    /// A record with no bytes of its own, no children, no remote source and no pin cannot
+    /// serve anything and holds no charge; it is garbage.
+    fn dead_anchor(node: &crate::tree::Node<Location>) -> bool {
+        !node.pinned()
+            && node.location.memory.is_none()
+            && node.location.disk.is_none()
+            && node.location.remote.is_none()
+            && node.children() == 0
+    }
+
+    /// Removes a dead remote node and then any ancestor that is now equally dead.
+    /// `remove_node` never cascades, so every node is checked before it goes, and a node with
+    /// local bytes is left alone: eviction owns its charge accounting and disk retirement.
+    fn remove_dead_remote(&mut self, id: NamespaceId, key: Key) {
+        let mut current = Some(key);
+        while let Some(key) = current {
+            let dead = self
+                .namespaces
+                .get(&id)
+                .and_then(|namespace| namespace.tree.node(&key))
+                .is_some_and(Self::dead_anchor);
+            if !dead {
+                break;
+            }
+            let removed = self
+                .namespaces
+                .get_mut(&id)
+                .and_then(|namespace| namespace.tree.remove_node(&key).ok());
+            let Some(node) = removed else {
+                break;
+            };
+            self.delta(id, 2, node.key);
+            current = node.parent;
+        }
+    }
+
+    /// Releases the pins a fetch reservation holds. Idempotent.
+    fn release_fetch(&mut self, token: u64) {
+        let Some(pin) = self.fetch_pins.remove(&token) else {
+            return;
+        };
+        if let Some(namespace) = self.namespaces.get_mut(&pin.namespace) {
+            for key in pin.keys {
+                let _ = namespace.tree.unpin(&key);
+            }
+        }
+    }
+
+    fn apply_catalog(&mut self, node: &str, id: NamespaceId, event: proto::CatalogEvent) {
+        use proto::catalog_event::Event;
+        let Some(body) = event.event else {
+            return;
+        };
+        let view_key = (id, node.to_string());
+        match body {
+            Event::SnapshotBegin(_) => {
+                self.remote_snapshots
+                    .entry(view_key.clone())
+                    .or_default()
+                    .clear();
+                self.remote_deferred.remove(&view_key);
+            }
+            Event::Entry(entry) => {
+                let Some((key, remote)) = remote_entry(&entry) else {
+                    return;
+                };
+                let limit = self.config.remote_catalog_entries.max(1);
+                if let Some(snapshot) = self.remote_snapshots.get_mut(&view_key)
+                    && (snapshot.len() < limit || snapshot.contains_key(&key))
+                {
+                    snapshot.insert(key, remote);
+                }
+            }
+            Event::SnapshotEnd(_) => {
+                let Some(snapshot) = self.remote_snapshots.remove(&view_key) else {
+                    return;
+                };
+                let previous = self
+                    .remote_views
+                    .insert(view_key, snapshot.clone())
+                    .unwrap_or_default();
+                let removed: Vec<Key> = previous
+                    .keys()
+                    .filter(|key| !snapshot.contains_key(key))
+                    .copied()
+                    .collect();
+                for key in removed {
+                    self.remove_remote_source(id, node, &key);
+                }
+                for (key, remote) in snapshot {
+                    self.upsert_remote(id, node, key, remote);
+                }
+                self.drain_remote_deferred(id);
+            }
+            Event::Added(entry) | Event::Changed(entry) => {
+                if self.remote_snapshots.contains_key(&view_key) {
+                    return;
+                }
+                let Some((key, remote)) = remote_entry(&entry) else {
+                    return;
+                };
+                let limit = self.config.remote_catalog_entries.max(1);
+                let view = self.remote_views.entry(view_key).or_default();
+                if view.len() < limit || view.contains_key(&key) {
+                    view.insert(key, remote.clone());
+                } else {
+                    self.metrics.remote_refused += 1;
+                    return;
+                }
+                self.upsert_remote(id, node, key, remote);
+                self.drain_remote_deferred(id);
+            }
+            Event::Removed(key) => {
+                if self.remote_snapshots.contains_key(&view_key) {
+                    return;
+                }
+                let Some(key) = remote_key(Some(key)) else {
+                    return;
+                };
+                if let Some(view) = self.remote_views.get_mut(&view_key) {
+                    view.remove(&key);
+                }
+                if let Some(deferred) = self.remote_deferred.get_mut(&view_key) {
+                    deferred.remove(&key);
+                }
+                self.remove_remote_source(id, node, &key);
+            }
+            Event::Room(_) => {}
+        }
+    }
+
+    /// Retry deferred remote entries whose parent is now indexed.
+    fn drain_remote_deferred(&mut self, id: NamespaceId) {
+        loop {
+            let ready: Vec<(String, Key)> = self
+                .remote_deferred
+                .iter()
+                .filter(|((namespace, _), _)| *namespace == id)
+                .flat_map(|((_, node), deferred)| {
+                    deferred
+                        .iter()
+                        .filter(|(_, entry)| {
+                            entry.parent.is_none_or(|parent| {
+                                self.namespaces
+                                    .get(&id)
+                                    .is_some_and(|namespace| namespace.tree.node(&parent).is_some())
+                            })
+                        })
+                        .map(move |(key, _)| (node.clone(), *key))
+                })
+                .collect();
+            if ready.is_empty() {
+                return;
+            }
+            for (node, key) in ready {
+                let entry = self
+                    .remote_deferred
+                    .get_mut(&(id, node.clone()))
+                    .and_then(|deferred| deferred.remove(&key));
+                if let Some(entry) = entry {
+                    self.upsert_remote(id, &node, key, entry);
+                }
+            }
+        }
+    }
+
+    fn upsert_remote(&mut self, id: NamespaceId, node: &str, key: Key, remote: RemoteEntry) {
+        let source = (!remote.unreadable).then(|| RemoteSource {
+            node: node.to_string(),
+            bytes: remote.bytes,
+            row: remote.row,
+        });
+        let existed = self
+            .namespaces
+            .get(&id)
+            .is_some_and(|namespace| namespace.tree.node(&key).is_some());
+        if !existed {
+            let parent_ok = remote.parent.is_none_or(|parent| {
+                self.namespaces
+                    .get(&id)
+                    .is_some_and(|namespace| namespace.tree.node(&parent).is_some())
+            });
+            if !parent_ok {
+                // A local publication or an earlier snapshot entry may still supply the
+                // parent; keep the child until it does.
+                let deferred = self
+                    .remote_deferred
+                    .entry((id, node.to_string()))
+                    .or_default();
+                if deferred.len() < self.config.remote_catalog_entries.max(1) {
+                    deferred.insert(key, remote);
+                } else {
+                    self.metrics.remote_refused += 1;
+                }
+                return;
+            }
+            if source.is_some()
+                && self.remote_only_count(id) >= self.config.remote_catalog_entries.max(1)
+            {
+                // Never evict the ancestor the incoming record needs.
+                let mut protected = std::collections::HashSet::new();
+                let mut parent = remote.parent;
+                while let Some(current) = parent {
+                    protected.insert(current);
+                    parent = self
+                        .namespaces
+                        .get(&id)
+                        .and_then(|namespace| namespace.tree.node(&current))
+                        .and_then(|node| node.parent);
+                }
+                if !self.evict_remote(id, &protected) {
+                    self.metrics.remote_refused += 1;
+                    return;
+                }
+            }
+        }
+        {
+            let Some(namespace) = self.namespaces.get_mut(&id) else {
+                return;
+            };
+            if let Some(existing) = namespace.tree.node(&key) {
+                if existing.parent != remote.parent
+                    || existing.bucket != remote.bucket
+                    || existing.tail_pages != remote.tail_pages as usize
+                {
+                    self.metrics.remote_conflicts += 1;
+                    return;
+                }
+                let local = existing.location.memory.is_some() || existing.location.disk.is_some();
+                // A local copy knows whether its own bytes carry the row; the upstream's flag
+                // must not claim a row this manager does not have.
+                let row = if local { existing.row } else { remote.row };
+                let node_ref = namespace.tree.node_mut(&key).unwrap();
+                node_ref.row = row;
+                node_ref.location.remote = source;
+                if !local {
+                    node_ref.location.bytes = remote.bytes;
+                }
+            } else {
+                let Ok(header) = Header::new(
+                    &namespace.descriptor,
+                    key,
+                    remote.parent,
+                    remote.bucket,
+                    remote.tail_pages,
+                ) else {
+                    return;
+                };
+                let location = Location {
+                    origin: Origin::Peer,
+                    header,
+                    memory: None,
+                    disk: None,
+                    remote: source,
+                    durable: false,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes: remote.bytes,
+                };
+                if namespace
+                    .tree
+                    .insert(
+                        key,
+                        remote.parent,
+                        remote.bucket,
+                        remote.tail_pages as usize,
+                        remote.row,
+                        location,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        self.delta(id, if existed { 1 } else { 0 }, key);
+    }
+
+    fn remove_remote_source(&mut self, id: NamespaceId, node: &str, key: &Key) {
+        let remove = {
+            let Some(namespace) = self.namespaces.get_mut(&id) else {
+                return;
+            };
+            let Some(existing) = namespace.tree.node(key) else {
+                return;
+            };
+            if existing
+                .location
+                .remote
+                .as_ref()
+                .is_none_or(|source| source.node != node)
+            {
+                return;
+            }
+            let local = existing.location.memory.is_some() || existing.location.disk.is_some();
+            let children = existing.children();
+            let pinned = existing.pinned();
+            if !local && children == 0 && !pinned {
+                true
+            } else {
+                let node_ref = namespace.tree.node_mut(key).unwrap();
+                node_ref.location.remote = None;
+                // A bare anchor held only by a lease is dead once the lease ends; a serving
+                // Get has it pinned right now. Retry from the cleanup turn.
+                if !local && children == 0 && !self.remote_orphans.contains(&(id, *key)) {
+                    self.remote_orphans.push((id, *key));
+                }
+                false
+            }
+        };
+        if remove {
+            // The source is what is being forgotten; the node is dead once it is cleared.
+            if let Some(namespace) = self.namespaces.get_mut(&id) {
+                if let Some(node) = namespace.tree.node_mut(key) {
+                    node.location.remote = None;
+                }
+            }
+            self.remove_dead_remote(id, *key);
+        } else {
+            self.delta(id, 1, *key);
+        }
+    }
+
+    fn remote_only_count(&self, id: NamespaceId) -> usize {
+        self.namespaces
+            .get(&id)
+            .map(|namespace| {
+                namespace
+                    .tree
+                    .nodes()
+                    .filter(|node| {
+                        node.location.remote.is_some()
+                            && node.location.memory.is_none()
+                            && node.location.disk.is_none()
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn evict_remote(
+        &mut self,
+        id: NamespaceId,
+        protected: &std::collections::HashSet<Key>,
+    ) -> bool {
+        let candidate = self.namespaces.get(&id).and_then(|namespace| {
+            namespace
+                .tree
+                .nodes()
+                .filter(|node| {
+                    node.location.remote.is_some()
+                        && node.location.memory.is_none()
+                        && node.location.disk.is_none()
+                        && node.children() == 0
+                        && !node.pinned()
+                        && !protected.contains(&node.key)
+                })
+                .min_by_key(|node| (node.accessed(), node.key.consumed_tokens))
+                .map(|node| node.key)
+        });
+        let Some(key) = candidate else {
+            return false;
+        };
+        // Dropping the catalogue entry drops its source; the node is dead from here.
+        if let Some(namespace) = self.namespaces.get_mut(&id) {
+            if let Some(node) = namespace.tree.node_mut(&key) {
+                node.location.remote = None;
+            }
+        }
+        self.remove_dead_remote(id, key);
+        self.namespaces
+            .get(&id)
+            .and_then(|namespace| namespace.tree.node(&key))
+            .is_none()
+    }
+
+    fn peer_gone(&mut self, node: &str) {
+        let ids: Vec<NamespaceId> = self
+            .remote_views
+            .keys()
+            .filter(|(_, name)| name == node)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.remote_views.remove(&(id, node.to_string()));
+            self.remote_snapshots.remove(&(id, node.to_string()));
+            self.remote_deferred.remove(&(id, node.to_string()));
+            let live: Vec<Key> = self
+                .namespaces
+                .get(&id)
+                .map(|namespace| {
+                    namespace
+                        .tree
+                        .nodes()
+                        .filter(|record| {
+                            record
+                                .location
+                                .remote
+                                .as_ref()
+                                .is_some_and(|source| source.node == node)
+                        })
+                        .map(|record| record.key)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for key in live {
+                self.remove_remote_source(id, node, &key);
+            }
+        }
     }
 
     /// Leases a stored record's bytes for write-through forwarding.
@@ -852,15 +2237,33 @@ impl Store {
 
     fn entry(namespace: &Namespace, key: Key) -> EntryData {
         let node = &namespace.tree[&key];
+        // Advertising may claim a row the upstream holds; refetch decisions use the local flag.
+        let row = node.row
+            || node
+                .location
+                .remote
+                .as_ref()
+                .is_some_and(|source| source.row);
         EntryData {
             key,
             parent: node.parent,
             bucket: node.bucket,
             tail_pages: node.tail_pages as u32,
-            row: node.row,
-            tier: if node.location.memory.is_some() { 0 } else { 1 },
+            row,
+            tier: if node.location.memory.is_some() {
+                0
+            } else if node.location.durable {
+                1
+            } else if node.location.remote.is_some() {
+                2
+            } else {
+                1
+            },
             durable: node.location.durable,
             bytes: node.location.bytes,
+            unreadable: node.location.memory.is_none()
+                && node.location.disk.is_none()
+                && node.location.remote.is_none(),
         }
     }
 
@@ -889,14 +2292,23 @@ impl Store {
                 .parent
                 .is_none_or(|parent| self.namespaces[&id].tree[&parent].location.durable);
             let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
-            let durable = node.location.disk.is_some() && parent_ok;
+            let durable = node.location.disk.is_some() && parent_ok && !node.location.rewrite;
             if node.location.durable != durable {
                 node.location.durable = durable;
-                flipped.push(key);
+                flipped.push((key, durable));
             }
         }
-        for key in flipped {
+        for (key, durable) in flipped {
             self.delta(id, 1, key);
+            if durable
+                && self.namespaces[&id]
+                    .tree
+                    .node(&key)
+                    .is_some_and(|node| node.location.origin == Origin::Local)
+            {
+                self.forward_events
+                    .push(ForwardEvent::Durable { namespace: id, key });
+            }
         }
     }
 
@@ -1065,10 +2477,49 @@ impl Store {
     // ---------------------------------------------------------------- Put begin
 
     fn reject_put(&mut self, events: &tokio::sync::mpsc::Sender<Result<PutAnswer>>, reason: u8) {
+        self.reject_put_detail(events, reason, &format!("reason {reason}"));
+    }
+
+    fn reject_put_detail(
+        &mut self,
+        events: &tokio::sync::mpsc::Sender<Result<PutAnswer>>,
+        reason: u8,
+        detail: &str,
+    ) {
         let _ = events.try_send(Ok(PutAnswer::Refused(Refused {
             reason,
-            detail: format!("reason {reason}"),
+            detail: detail.to_string(),
         })));
+    }
+
+    /// A transfer id is unusable while any operation, queued request or drain with that
+    /// (connection, transfer) is still alive, in either direction.
+    fn transfer_in_use(&self, connection: u64, transfer: u64) -> bool {
+        if self
+            .sessions
+            .get(&connection)
+            .is_some_and(|session| session.ops.contains_key(&transfer))
+        {
+            return true;
+        }
+        if self
+            .pending_puts
+            .get(&connection)
+            .is_some_and(|queue| queue.iter().any(|pending| pending.transfer == transfer))
+            || self
+                .pending_gets
+                .get(&connection)
+                .is_some_and(|queue| queue.iter().any(|pending| pending.transfer == transfer))
+        {
+            return true;
+        }
+        self.retired_puts
+            .iter()
+            .any(|drain| drain.connection == connection && drain.transfer == transfer)
+            || self
+                .retired_gets
+                .iter()
+                .any(|drain| drain.connection == connection && drain.transfer == transfer)
     }
 
     fn begin_put(&mut self, pending: PendingPut) {
@@ -1078,11 +2529,7 @@ impl Store {
             request,
             events,
         } = pending;
-        let Some(id) = self
-            .sessions
-            .get(&connection)
-            .and_then(|session| session.namespace)
-        else {
+        let Some(id) = self.sessions.get(&connection).map(|_| request.namespace) else {
             return;
         };
         let Some(descriptor) = self
@@ -1110,6 +2557,13 @@ impl Store {
             self.reject_put(&events, proto::Reason::Invalid as u8);
             return;
         }
+        if self.namespaces[&id].purging {
+            // The previous namespace contents are still being released; a new record could
+            // race their disk completions.
+            self.metrics.retry_queue += 1;
+            self.reject_put(&events, proto::Reason::Queue as u8);
+            return;
+        }
         let initial_old = self.namespaces[&id].tree.node(&request.key).cloned();
         if self.namespaces[&id].inflight.contains(&request.key)
             || initial_old
@@ -1120,9 +2574,31 @@ impl Store {
             self.reject_put(&events, proto::Reason::Inflight as u8);
             return;
         }
-        if initial_old.as_ref().is_some_and(|node| node.row) {
+        if initial_old.as_ref().is_some_and(|node| {
+            node.row && (node.location.memory.is_some() || node.location.disk.is_some())
+        }) {
+            // A catalog entry that only names an upstream copy is not a local record.
             self.metrics.present += 1;
             self.reject_put(&events, proto::Reason::Present as u8);
+            return;
+        }
+        if self.sessions[&connection].remote
+            && request.published_parent.is_some_and(|parent| {
+                !self.namespaces[&id]
+                    .tree
+                    .node(&parent)
+                    .is_some_and(|node| node.row)
+            })
+        {
+            // A peer names the exact ancestor it forwarded under; the near side restores a
+            // missing ancestor and retries the child. A local Put only hints at its parent and
+            // falls back to a root below when the hint is unusable.
+            self.metrics.puts_error += 1;
+            self.reject_put_detail(
+                &events,
+                proto::Reason::Invalid as u8,
+                "published parent is not stored",
+            );
             return;
         }
         if Self::put_count(&self.sessions[&connection]) >= OPEN_PUTS {
@@ -1326,6 +2802,23 @@ impl Store {
         } else {
             None
         };
+        if !self.quota_allows(
+            id,
+            requirement.reservation,
+            if requirement.streaming {
+                requirement.allocation
+            } else {
+                requirement.reservation
+            },
+        ) {
+            drop(memory);
+            drop(staging_hold);
+            for key in &pins {
+                let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
+            }
+            self.reject_put(&events, proto::Reason::Quota as u8);
+            return;
+        }
         if !self.admit(connection, requirement.charge) {
             drop(memory);
             drop(staging_hold);
@@ -1360,8 +2853,15 @@ impl Store {
             parent.map_or(0, |parent| parent.consumed_tokens / descriptor.page_tokens) as u32;
         let grants = plan_put_grants(&header, first, self.config.max_window_bytes);
         let pages = vec![None; header.tail_pages as usize];
+        let epoch = self.namespaces[&id].epoch;
+        let remote = self
+            .sessions
+            .get(&connection)
+            .is_some_and(|session| session.remote);
         let mut put = Put {
             namespace: id,
+            epoch,
+            remote,
             header: header.clone(),
             first_page: first,
             grants,
@@ -1386,7 +2886,6 @@ impl Store {
             pending: 0,
             blocked: VecDeque::new(),
             pins: pins.into(),
-            replacement,
             reservation: requirement.reservation,
             requirement,
             staging_hold,
@@ -1676,6 +3175,7 @@ impl Store {
                             );
                             let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
                             node.location.writing = true;
+                            node.location.job = Some(job);
                             self.namespaces
                                 .get_mut(&id)
                                 .unwrap()
@@ -2133,6 +3633,7 @@ impl Store {
             .and_then(|session| session.ops.get(&transfer))
             .and_then(|open| match &open.operation {
                 Operation::Get(get) => Some((
+                    get.namespace,
                     get.next_grant,
                     get.grants.get(get.next_grant).map(|grant| PlannedGetGrant {
                         record: grant.record,
@@ -2148,14 +3649,9 @@ impl Store {
         else {
             return false;
         };
-        let (position, Some(plan)) = ready else {
+        let (namespace, position, Some(plan)) = ready else {
             return false;
         };
-        let namespace = self
-            .sessions
-            .get(&connection)
-            .and_then(|session| session.namespace)
-            .unwrap();
         enum Next {
             Stop,
             Fail(proto::Reason, io::Error),
@@ -2339,7 +3835,11 @@ impl Store {
         let namespace = self
             .sessions
             .get(&connection)
-            .and_then(|session| session.namespace);
+            .and_then(|session| session.ops.get(&transfer))
+            .and_then(|open| match &open.operation {
+                Operation::Get(get) => Some(get.namespace),
+                Operation::Put(_) => None,
+            });
         if let Some(open) = self
             .sessions
             .get_mut(&connection)
@@ -2564,7 +4064,17 @@ impl Store {
                 );
                 return Ok(());
             };
-            let namespace = self.sessions[&connection].namespace.unwrap();
+            let Some(namespace) = self.sessions.get(&connection).and_then(|session| {
+                session
+                    .ops
+                    .get(&transfer)
+                    .and_then(|open| match &open.operation {
+                        Operation::Put(put) => Some(put.namespace),
+                        Operation::Get(_) => None,
+                    })
+            }) else {
+                return Ok(());
+            };
             self.job_counter += 1;
             let job = self.job_counter;
             let task = Task::Chunk {
@@ -2669,14 +4179,18 @@ impl Store {
             Fail(proto::Reason, io::Error),
             Publish,
         }
-        let descriptor = self
+        let namespace = self
             .sessions
             .get(&connection)
-            .and_then(|session| session.namespace)
-            .map(|id| self.namespaces[&id].descriptor.clone());
-        let Some(descriptor) = descriptor else {
+            .and_then(|session| session.ops.get(&transfer))
+            .and_then(|open| match &open.operation {
+                Operation::Put(put) => Some(put.namespace),
+                Operation::Get(_) => None,
+            });
+        let Some(namespace) = namespace else {
             return Err(invalid("unknown Put transfer"));
         };
+        let descriptor = self.namespaces[&namespace].descriptor.clone();
         let action = {
             let Some(open) = self
                 .sessions
@@ -2748,6 +4262,30 @@ impl Store {
         Ok(())
     }
 
+    /// Admission records whether the key existed when the Put began, but the merged catalog
+    /// can add or drop a remote-only entry while the Put is in flight. Decide from the tree
+    /// as it is when the publication lands.
+    fn publish_target(&self, id: NamespaceId, header: &Header) -> PublishTarget {
+        let Some(namespace) = self.namespaces.get(&id) else {
+            return PublishTarget::Conflict;
+        };
+        let Some(node) = namespace.tree.node(&header.key) else {
+            return PublishTarget::Insert;
+        };
+        if node.parent != header.parent
+            || node.bucket != header.bucket
+            || node.tail_pages != header.tail_pages as usize
+        {
+            return PublishTarget::Conflict;
+        }
+        // A complete local copy wins; a page-only record (its row was compacted away) is
+        // exactly what a replacement Put restores.
+        if node.row && (node.location.memory.is_some() || node.location.disk.is_some()) {
+            return PublishTarget::Present;
+        }
+        PublishTarget::Replace(node.location.remote.clone())
+    }
+
     fn publish_put(
         &mut self,
         connection: u64,
@@ -2755,13 +4293,57 @@ impl Store {
         disk: Option<Arc<DiskExtent>>,
         durable: bool,
     ) {
-        let Some(id) = self
+        let Some((id, epoch, header)) = self
             .sessions
             .get(&connection)
-            .and_then(|session| session.namespace)
+            .and_then(|session| session.ops.get(&transfer))
+            .and_then(|open| match &open.operation {
+                Operation::Put(put) if !put.finished => {
+                    Some((put.namespace, put.epoch, put.header.clone()))
+                }
+                _ => None,
+            })
         else {
             return;
         };
+        if self
+            .namespaces
+            .get(&id)
+            .is_none_or(|namespace| namespace.epoch != epoch)
+        {
+            if let Some(disk) = &disk {
+                disk.retire();
+            }
+            self.fail_put(
+                connection,
+                transfer,
+                proto::Reason::Invalid as u8,
+                invalid("namespace was purged while publishing"),
+            );
+            return;
+        }
+        let target = self.publish_target(id, &header);
+        match target {
+            PublishTarget::Present => {
+                self.fail_put(
+                    connection,
+                    transfer,
+                    proto::Reason::Present as u8,
+                    invalid("record was published concurrently"),
+                );
+                return;
+            }
+            PublishTarget::Conflict => {
+                self.fail_put(
+                    connection,
+                    transfer,
+                    proto::Reason::Invalid as u8,
+                    invalid("published record conflicts with the catalog entry"),
+                );
+                return;
+            }
+            PublishTarget::Insert | PublishTarget::Replace(_) => {}
+        }
         let prepared = {
             let Some(open) = self
                 .sessions
@@ -2781,41 +4363,50 @@ impl Store {
             let bytes = record_charge(&header, memory.is_some());
             let reservation = put.reservation;
             let pins = std::mem::take(&mut put.pins);
-            let replacement = put.replacement;
+            let remote = put.remote;
             let record_bytes = header.length_with_row();
             let key = header.key;
             let already_terminal = put.terminal;
             put.terminal = true;
-            put.finished = true;
-            put.pending = 0;
-            if !already_terminal {
-                put.outbox.push_back(Ok(PutAnswer::Stored {
-                    bytes: record_bytes,
-                }));
-            }
-            (header, memory, bytes, reservation, pins, replacement, key)
+            (
+                header,
+                memory,
+                bytes,
+                reservation,
+                pins,
+                remote,
+                key,
+                already_terminal,
+                record_bytes,
+            )
         };
-        let (header, memory, bytes, reservation, pins, replacement, key) = prepared;
+        let (header, memory, bytes, reservation, pins, remote, key, already_terminal, record_bytes) =
+            prepared;
+        let (replace, source) = match target {
+            PublishTarget::Replace(source) => (true, source),
+            _ => (false, None),
+        };
         let location = Location {
+            origin: if remote { Origin::Peer } else { Origin::Local },
             header: header.clone(),
+            remote: source,
             memory,
             disk,
             durable: false,
             writing: false,
+            job: None,
+            rewrite: false,
             retry: Instant::now(),
             bytes,
         };
         let inserted = {
             let namespace = self.namespaces.get_mut(&id).unwrap();
-            let inserted = if replacement {
-                if let Some(node) = namespace.tree.node_mut(&key) {
-                    let old = std::mem::replace(&mut node.location, location);
-                    node.row = true;
-                    self.retired_records.push((id, key, old));
-                    true
-                } else {
-                    false
-                }
+            let inserted = if replace {
+                let node = namespace.tree.node_mut(&key).unwrap();
+                let old = std::mem::replace(&mut node.location, location);
+                node.row = true;
+                self.retired_records.push((id, key, old));
+                true
             } else {
                 namespace
                     .tree
@@ -2844,6 +4435,21 @@ impl Store {
             );
             return;
         }
+        if let Some(open) = self
+            .sessions
+            .get_mut(&connection)
+            .and_then(|session| session.ops.get_mut(&transfer))
+            && let Operation::Put(put) = &mut open.operation
+            && !put.finished
+        {
+            put.finished = true;
+            put.pending = 0;
+            if !already_terminal {
+                put.outbox.push_back(Ok(PutAnswer::Stored {
+                    bytes: record_bytes,
+                }));
+            }
+        }
         self.clock += 1;
         let clock = self.clock;
         self.namespaces
@@ -2859,9 +4465,12 @@ impl Store {
         }
         self.refresh_durability(id);
         self.metrics.puts_ok += 1;
-        self.forward_events
-            .push(ForwardEvent::Stored { namespace: id, key });
-        self.delta(id, if replacement { 1 } else { 0 }, key);
+        if !remote {
+            self.forward_events
+                .push(ForwardEvent::Stored { namespace: id, key });
+        }
+        self.delta(id, if replace { 1 } else { 0 }, key);
+        self.drain_remote_deferred(id);
     }
 
     fn begin_get(&mut self, pending: PendingGet) {
@@ -2871,11 +4480,7 @@ impl Store {
             request,
             events,
         } = pending;
-        let Some(id) = self
-            .sessions
-            .get(&connection)
-            .and_then(|session| session.namespace)
-        else {
+        let Some(id) = self.sessions.get(&connection).map(|_| request.namespace) else {
             return;
         };
         let parsed = self.plan_get(id, &request);
@@ -2907,9 +4512,11 @@ impl Store {
         }
         let record_bytes: Vec<u64> = records
             .iter()
-            .map(|record| record.header.length(record.row))
+            .enumerate()
+            .map(|(index, record)| record.header.length(index + 1 == records.len()))
             .collect();
         let get = Get {
+            namespace: id,
             pins: pages.into(),
             records,
             grants,
@@ -3177,13 +4784,24 @@ impl Store {
             self.read_failed(connection, transfer);
             return;
         };
-        let Some(id) = self
+        let state = self
             .sessions
             .get(&connection)
-            .and_then(|session| session.namespace)
-        else {
+            .and_then(|session| session.ops.get(&transfer))
+            .and_then(|open| match &open.operation {
+                Operation::Get(get) => Some((
+                    get.namespace,
+                    usize::try_from(record).is_ok_and(|index| index < get.records.len()),
+                )),
+                Operation::Put(_) => None,
+            });
+        let Some((id, in_range)) = state else {
             return;
         };
+        if !in_range {
+            self.read_failed(connection, transfer);
+            return;
+        }
         match kind {
             ReadKind::Fill => {
                 let (header, row) = {
@@ -3471,7 +5089,7 @@ impl Store {
                 && get.next_meta >= get.records.len()
         };
         if done {
-            let pins = {
+            let (namespace, pins, keys) = {
                 let Some(open) = self
                     .sessions
                     .get_mut(&connection)
@@ -3485,21 +5103,52 @@ impl Store {
                 get.terminal = true;
                 get.finished = true;
                 get.outbox.push_back(Ok(GetAnswer::Done));
-                std::mem::take(&mut get.pins)
+                (
+                    get.namespace,
+                    std::mem::take(&mut get.pins),
+                    get.records
+                        .iter()
+                        .map(|record| record.header.key)
+                        .collect::<Vec<_>>(),
+                )
             };
             self.metrics.gets_ok += 1;
-            self.release_pins(connection, pins);
+            self.release_pins(namespace, pins);
+            if !self.config.retain_remote {
+                for key in keys {
+                    self.release_fetched(namespace, key);
+                }
+            }
         }
     }
 
-    fn release_pins(&mut self, connection: u64, pins: VecDeque<Key>) {
-        let Some(id) = self
-            .sessions
-            .get(&connection)
-            .and_then(|session| session.namespace)
+    /// Drop a fetched copy after its Get; the record falls back to its upstream source.
+    fn release_fetched(&mut self, id: NamespaceId, key: Key) {
+        let Some(node) = self
+            .namespaces
+            .get_mut(&id)
+            .and_then(|namespace| namespace.tree.node_mut(&key))
         else {
             return;
         };
+        if node.location.origin != Origin::Peer || node.location.remote.is_none() {
+            return;
+        }
+        if node.location.memory.is_none() {
+            return;
+        }
+        let old = node.location.bytes;
+        node.location.memory = None;
+        node.location.bytes = node
+            .location
+            .remote
+            .as_ref()
+            .map_or(0, |source| source.bytes);
+        self.charged = self.charged.saturating_sub(old);
+        self.delta(id, 1, key);
+    }
+
+    fn release_pins(&mut self, id: NamespaceId, pins: VecDeque<Key>) {
         let namespace = self.namespaces.get_mut(&id).unwrap();
         for key in pins {
             let _ = namespace.tree.unpin(&key);
@@ -3560,7 +5209,7 @@ impl Store {
                 if put.pending == 0 {
                     self.finish_put_drain(connection, transfer, *put);
                 } else {
-                    let id = self.sessions[&connection].namespace.unwrap();
+                    let id = put.namespace;
                     put.finished = true;
                     self.retired_puts.push(PutDrain {
                         connection,
@@ -3583,9 +5232,9 @@ impl Store {
                 get.cancelled = true;
                 if get.pending_reads == 0 {
                     let pins = std::mem::take(&mut get.pins);
-                    self.release_pins(connection, pins);
+                    self.release_pins(get.namespace, pins);
                 } else {
-                    let id = self.sessions[&connection].namespace.unwrap();
+                    let id = get.namespace;
                     self.retired_gets.push(GetDrain {
                         connection,
                         transfer,
@@ -3598,14 +5247,8 @@ impl Store {
         }
     }
 
-    fn finish_put_drain(&mut self, connection: u64, _transfer: u64, put: Put) {
-        let Some(id) = self
-            .sessions
-            .get(&connection)
-            .and_then(|session| session.namespace)
-        else {
-            return;
-        };
+    fn finish_put_drain(&mut self, _connection: u64, _transfer: u64, put: Put) {
+        let id = put.namespace;
         let namespace = self.namespaces.get_mut(&id).unwrap();
         for key in &put.pins {
             let _ = namespace.tree.unpin(key);
@@ -3617,7 +5260,17 @@ impl Store {
     fn connection_closed(&mut self, connection: u64) {
         self.armed.remove(&connection);
         self.local.close(connection);
-        self.subscriptions.remove(&connection);
+        self.subscriptions.retain(|(id, _), _| *id != connection);
+        // A fetch whose Get never began with this connection leaves no pins behind.
+        let released: Vec<u64> = self
+            .fetch_pins
+            .iter()
+            .filter(|(_, pin)| pin.connection == connection)
+            .map(|(token, _)| *token)
+            .collect();
+        for token in released {
+            self.release_fetch(token);
+        }
         self.pending_gets.remove(&connection);
         self.pending_puts.remove(&connection);
         self.get_order.retain(|id| *id != connection);
@@ -3694,33 +5347,53 @@ impl Store {
             return;
         };
         let id = put.namespace;
+        if self
+            .namespaces
+            .get(&id)
+            .is_none_or(|namespace| namespace.epoch != put.epoch)
+        {
+            // The worker renamed the file into place before the epoch was checked.
+            disk.retire();
+            self.finish_detached_put(Some(id), put);
+            return;
+        }
         let key = put.header.key;
         let memory = put.memory.clone();
         let header = put.header.clone();
         let bytes = record_charge(&header, memory.is_some());
         let pins = put.pins.clone();
-        let replacement = put.replacement;
         let reservation = put.reservation;
+        let remote = put.remote;
+        let target = self.publish_target(id, &header);
+        let (replace, source) = match target {
+            PublishTarget::Insert => (false, None),
+            PublishTarget::Replace(source) => (true, source),
+            PublishTarget::Present | PublishTarget::Conflict => {
+                self.finish_detached_put(Some(id), put);
+                return;
+            }
+        };
         let location = Location {
+            origin: if remote { Origin::Peer } else { Origin::Local },
             header: header.clone(),
+            remote: source,
             memory,
             disk: Some(disk),
             durable: true,
             writing: false,
+            job: None,
+            rewrite: false,
             retry: Instant::now(),
             bytes,
         };
         let inserted = {
             let namespace = self.namespaces.get_mut(&id).unwrap();
-            let inserted = if replacement {
-                if let Some(node) = namespace.tree.node_mut(&key) {
-                    let old = std::mem::replace(&mut node.location, location);
-                    node.row = true;
-                    self.retired_records.push((id, key, old));
-                    true
-                } else {
-                    false
-                }
+            let inserted = if replace {
+                let node = namespace.tree.node_mut(&key).unwrap();
+                let old = std::mem::replace(&mut node.location, location);
+                node.row = true;
+                self.retired_records.push((id, key, old));
+                true
             } else {
                 namespace
                     .tree
@@ -3751,9 +5424,12 @@ impl Store {
                 .access_at(&key, clock);
             self.refresh_durability(id);
             self.metrics.puts_ok += 1;
-            self.forward_events
-                .push(ForwardEvent::Stored { namespace: id, key });
-            self.delta(id, if replacement { 1 } else { 0 }, key);
+            if !remote {
+                self.forward_events
+                    .push(ForwardEvent::Stored { namespace: id, key });
+            }
+            self.delta(id, if replace { 1 } else { 0 }, key);
+            self.drain_remote_deferred(id);
         } else {
             self.finish_detached_put(Some(id), put);
         }
@@ -3849,6 +5525,43 @@ impl Store {
             false
         });
         self.deferred_disk.retain(|extent| extent.references() > 1);
+        let mut orphans = std::mem::take(&mut self.remote_orphans);
+        orphans.retain(|(id, key)| {
+            let anchor = *key;
+            if self
+                .namespaces
+                .get(id)
+                .and_then(|namespace| namespace.tree.node(&anchor))
+                .is_none()
+            {
+                // The record is gone; its entry is stale.
+                return false;
+            }
+            // Only nodes with no local bytes are touched here: a node with bytes is left to
+            // normal eviction, which owns the charge accounting and disk retirement.
+            self.remove_dead_remote(*id, anchor);
+            self.namespaces
+                .get(id)
+                .and_then(|namespace| namespace.tree.node(&anchor))
+                .is_some_and(|node| !Self::dead_anchor(node))
+        });
+        self.remote_orphans = orphans;
+        let draining: Vec<NamespaceId> = self
+            .namespaces
+            .iter()
+            .filter(|(_, namespace)| namespace.purging)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in draining {
+            self.namespaces
+                .get_mut(&id)
+                .unwrap()
+                .purge_drain
+                .retain(|extent| extent.strong_count() > 0);
+            if !self.purge_busy(id) {
+                self.namespaces.get_mut(&id).unwrap().purging = false;
+            }
+        }
         self.retired_records.retain(|(id, key, location)| {
             let replaced = self.namespaces[id]
                 .tree
@@ -3861,6 +5574,51 @@ impl Store {
                 false
             }
         });
+    }
+
+    /// The namespace a disk job still belongs to, when completing it could touch that
+    /// namespace's files out of order.
+    fn job_namespace(&self, job: &Job) -> Option<NamespaceId> {
+        match job {
+            Job::Write { namespace, .. } | Job::Compact { namespace, .. } => Some(*namespace),
+            Job::Chunk {
+                connection,
+                transfer,
+            }
+            | Job::Finish {
+                connection,
+                transfer,
+                ..
+            } => self
+                .sessions
+                .get(connection)
+                .and_then(|session| session.ops.get(transfer))
+                .and_then(|open| match &open.operation {
+                    Operation::Put(put) => Some(put.namespace),
+                    Operation::Get(_) => None,
+                })
+                .or_else(|| {
+                    self.detached_puts
+                        .get(&(*connection, *transfer))
+                        .map(|put| put.namespace)
+                }),
+            Job::GetRead { .. } => None,
+        }
+    }
+
+    /// True while a purged namespace still has disk work that could resolve later: retired
+    /// extents, transfer drains or queued write-back/compaction/publication jobs.
+    fn purge_busy(&self, id: NamespaceId) -> bool {
+        self.namespaces.get(&id).is_some_and(|namespace| {
+            namespace
+                .purge_drain
+                .iter()
+                .any(|extent| extent.strong_count() > 0)
+        }) || self.retired_puts.iter().any(|drain| drain.namespace == id)
+            || self
+                .jobs
+                .values()
+                .any(|job| self.job_namespace(job) == Some(id))
     }
 
     fn disk_events(&mut self) {
@@ -3889,17 +5647,36 @@ impl Store {
             match job {
                 Job::Write { namespace, key } => {
                     let path = self.namespaces[&namespace].path(key);
-                    {
-                        let node = &mut self.namespaces.get_mut(&namespace).unwrap().tree[&key];
-                        node.location.writing = false;
-                        if !failed {
-                            if let Some(path) = path {
-                                node.location.disk = Some(Arc::new(DiskExtent::new(path)));
-                            }
-                            node.location.retry = Instant::now();
-                        } else {
-                            node.location.retry = Instant::now() + Duration::from_millis(100);
+                    let Some(node) = self
+                        .namespaces
+                        .get_mut(&namespace)
+                        .and_then(|namespace| namespace.tree.node_mut(&key))
+                    else {
+                        // A purge removed the record while its write drained; the fresh file
+                        // is retired and never enters the tree.
+                        if !failed && let Some(path) = path {
+                            let extent = Arc::new(DiskExtent::new(path));
+                            extent.retire();
+                            self.deferred_disk.push(extent);
                         }
+                        continue;
+                    };
+                    if node.location.job != Some(completion.id) {
+                        // The record this write belonged to was replaced. The replacement owns
+                        // the key's file now, so the stale completion must not touch either the
+                        // node or that path.
+                        continue;
+                    }
+                    node.location.job = None;
+                    node.location.writing = false;
+                    if !failed {
+                        node.location.rewrite = false;
+                        if let Some(path) = path {
+                            node.location.disk = Some(Arc::new(DiskExtent::new(path)));
+                        }
+                        node.location.retry = Instant::now();
+                    } else {
+                        node.location.retry = Instant::now() + Duration::from_millis(100);
                     }
                     self.refresh_durability(namespace);
                 }
@@ -3996,6 +5773,46 @@ impl Store {
                             self.finish_detached_put(Some(id), put);
                         }
                     } else {
+                        // Check the epoch before the extent is made permanent: a Put whose
+                        // namespace was purged must not leave a never-referenced file behind.
+                        let purged = self
+                            .sessions
+                            .get(&connection)
+                            .and_then(|session| session.ops.get(&transfer))
+                            .and_then(|open| match &open.operation {
+                                Operation::Put(put) => Some((put.namespace, put.epoch)),
+                                Operation::Get(_) => None,
+                            })
+                            .or_else(|| {
+                                self.detached_puts
+                                    .get(&(connection, transfer))
+                                    .map(|put| (put.namespace, put.epoch))
+                            })
+                            .is_some_and(|(namespace, epoch)| {
+                                self.namespaces
+                                    .get(&namespace)
+                                    .is_none_or(|namespace| namespace.epoch != epoch)
+                            });
+                        if purged {
+                            // The publication was renamed into place before the epoch was
+                            // checked; remove the file so recovery cannot resurrect it.
+                            final_extent.retire();
+                            if attached {
+                                self.fail_put(
+                                    connection,
+                                    transfer,
+                                    proto::Reason::Invalid as u8,
+                                    invalid("namespace was purged while publishing"),
+                                );
+                                self.settle_put(connection, transfer);
+                            } else if let Some(put) =
+                                self.detached_puts.remove(&(connection, transfer))
+                            {
+                                let id = put.namespace;
+                                self.finish_detached_put(Some(id), put);
+                            }
+                            continue;
+                        }
                         final_extent.keep();
                         if attached {
                             self.publish_put(connection, transfer, Some(final_extent), true);
@@ -4010,13 +5827,24 @@ impl Store {
                     bytes,
                 } => {
                     let path = self.namespaces[&namespace].path(key);
-                    self.namespaces
+                    let _ = self
+                        .namespaces
                         .get_mut(&namespace)
                         .unwrap()
                         .tree
-                        .unpin(&key)
-                        .unwrap();
-                    let node = &mut self.namespaces.get_mut(&namespace).unwrap().tree[&key];
+                        .unpin(&key);
+                    let Some(node) = self
+                        .namespaces
+                        .get_mut(&namespace)
+                        .and_then(|namespace| namespace.tree.node_mut(&key))
+                    else {
+                        continue;
+                    };
+                    if node.location.job != Some(completion.id) {
+                        // The record was replaced; its successor owns this path.
+                        continue;
+                    }
+                    node.location.job = None;
                     node.location.writing = false;
                     if !failed {
                         node.location.bytes -= bytes;
@@ -4129,7 +5957,17 @@ impl Store {
                     let Some((job, offset, data, temporary)) = next else {
                         break;
                     };
-                    let namespace = self.sessions[&connection].namespace.unwrap();
+                    let namespace = self
+                        .sessions
+                        .get(&connection)
+                        .and_then(|session| session.ops.get(&transfer))
+                        .and_then(|open| match &open.operation {
+                            Operation::Put(put) => Some(put.namespace),
+                            Operation::Get(_) => None,
+                        });
+                    let Some(namespace) = namespace else {
+                        break;
+                    };
                     let Some(worker) = &self.namespaces[&namespace].disk else {
                         self.fail_put(
                             connection,
@@ -4302,9 +6140,9 @@ impl Store {
                 };
                 if worker.sender.try_send(task).is_ok() {
                     self.jobs.insert(job, Job::Write { namespace: id, key });
-                    self.namespaces.get_mut(&id).unwrap().tree[&key]
-                        .location
-                        .writing = true;
+                    let location = &mut self.namespaces.get_mut(&id).unwrap().tree[&key].location;
+                    location.writing = true;
+                    location.job = Some(job);
                 } else {
                     break;
                 }
@@ -4312,18 +6150,25 @@ impl Store {
         }
         let connections: Vec<u64> = self.sessions.keys().copied().collect();
         for connection in connections {
-            let Some(id) = self.sessions[&connection].namespace else {
-                continue;
-            };
-            let ops: Vec<u64> = self.sessions[&connection]
+            let ops: Vec<(u64, NamespaceId)> = self.sessions[&connection]
                 .ops
                 .iter()
-                .filter(|(_, open)| {
-                    matches!(&open.operation, Operation::Put(put) if put.committed && put.metadata.is_some() && put.pending == 0 && put.blocked.is_empty() && put.temporary.is_some() && !put.terminal && !put.finalizing)
+                .filter_map(|(transfer, open)| match &open.operation {
+                    Operation::Put(put)
+                        if put.committed
+                            && put.metadata.is_some()
+                            && put.pending == 0
+                            && put.blocked.is_empty()
+                            && put.temporary.is_some()
+                            && !put.terminal
+                            && !put.finalizing =>
+                    {
+                        Some((*transfer, put.namespace))
+                    }
+                    _ => None,
                 })
-                .map(|(transfer, _)| *transfer)
                 .collect();
-            for transfer in ops {
+            for (transfer, id) in ops {
                 self.schedule_finish(connection, transfer, id);
             }
         }
@@ -4341,6 +6186,34 @@ impl Store {
     }
 
     fn schedule_finish(&mut self, connection: u64, transfer: u64, id: NamespaceId) {
+        let Some((epoch, parent, terminal)) = self
+            .sessions
+            .get(&connection)
+            .and_then(|session| session.ops.get(&transfer))
+            .and_then(|open| match &open.operation {
+                Operation::Put(put) => Some((put.epoch, put.header.parent, put.terminal)),
+                Operation::Get(_) => None,
+            })
+        else {
+            return;
+        };
+        if terminal {
+            return;
+        }
+        if self.namespaces[&id].epoch != epoch {
+            // The namespace was purged; never rename this publication into place.
+            self.fail_put(
+                connection,
+                transfer,
+                proto::Reason::Invalid as u8,
+                invalid("namespace was purged while publishing"),
+            );
+            self.settle_put(connection, transfer);
+            return;
+        }
+        if !self.namespaces[&id].parent_durable(parent) {
+            return;
+        }
         let Some(open) = self
             .sessions
             .get_mut(&connection)
@@ -4351,12 +6224,6 @@ impl Store {
         let Operation::Put(put) = &mut open.operation else {
             return;
         };
-        if put.terminal {
-            return;
-        }
-        if !self.namespaces[&id].parent_durable(put.header.parent) {
-            return;
-        }
         let Some(metadata) = put.metadata.clone() else {
             return;
         };
@@ -4395,6 +6262,16 @@ impl Store {
     }
 
     fn schedule_detached_finish(&mut self, connection: u64, transfer: u64, id: NamespaceId) {
+        let Some(put) = self.detached_puts.get(&(connection, transfer)) else {
+            return;
+        };
+        if self.namespaces[&id].epoch != put.epoch {
+            // The namespace was purged; never rename this publication into place.
+            if let Some(put) = self.detached_puts.remove(&(connection, transfer)) {
+                self.finish_detached_put(Some(id), put);
+            }
+            return;
+        }
         let Some(put) = self.detached_puts.get_mut(&(connection, transfer)) else {
             return;
         };
@@ -4596,7 +6473,7 @@ impl Store {
                     key,
                     entry,
                 } => {
-                    let mut subscribers: Vec<u64> = self
+                    let mut subscribers: Vec<(u64, NamespaceId)> = self
                         .subscriptions
                         .iter()
                         .filter(|(_, subscription)| subscription.namespace == namespace)
@@ -4616,8 +6493,16 @@ impl Store {
                     }
                 }
                 StoreEvent::Room { connection, bytes } => {
-                    if self.buffer_or_send(connection, LiveEvent::Room { bytes }) {
-                        self.restart_snapshot(connection);
+                    let keys: Vec<(u64, NamespaceId)> = self
+                        .subscriptions
+                        .keys()
+                        .filter(|(id, _)| *id == connection)
+                        .copied()
+                        .collect();
+                    for key in keys {
+                        if self.buffer_or_send(key, LiveEvent::Room { bytes }) {
+                            self.restart_snapshot(key);
+                        }
                     }
                 }
             }
@@ -4626,7 +6511,7 @@ impl Store {
 
     /// Queues a live event behind an in-progress snapshot, or sends it when the
     /// snapshot has ended. Returns true when the snapshot buffer overflowed.
-    fn buffer_or_send(&mut self, connection: u64, live: LiveEvent) -> bool {
+    fn buffer_or_send(&mut self, connection: (u64, NamespaceId), live: LiveEvent) -> bool {
         let seq = match &live {
             LiveEvent::Catalog { seq, .. } => Some(*seq),
             LiveEvent::Room { .. } => None,
@@ -4662,7 +6547,7 @@ impl Store {
         }
     }
 
-    fn send_live(&mut self, connection: u64, live: LiveEvent) {
+    fn send_live(&mut self, connection: (u64, NamespaceId), live: LiveEvent) {
         let mut remove = false;
         {
             let Some(subscription) = self.subscriptions.get_mut(&connection) else {
@@ -4681,7 +6566,7 @@ impl Store {
         }
     }
 
-    fn restart_snapshot(&mut self, connection: u64) {
+    fn restart_snapshot(&mut self, connection: (u64, NamespaceId)) {
         let Some(namespace) = self
             .subscriptions
             .get(&connection)
@@ -4703,7 +6588,7 @@ impl Store {
     }
 
     fn pump_subscriptions(&mut self) {
-        let connections: Vec<u64> = self.subscriptions.keys().copied().collect();
+        let connections: Vec<(u64, NamespaceId)> = self.subscriptions.keys().copied().collect();
         for connection in connections {
             let mut remove = false;
             {
@@ -4817,10 +6702,17 @@ impl Store {
             .sessions
             .get(&connection)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "Subscribe before Hello"))?;
-        if session.generation != generation || session.namespace != Some(namespace) {
+        let bound = session.namespace;
+        if session.generation != generation || (!session.remote && bound != Some(namespace)) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "Subscribe generation or namespace",
+            ));
+        }
+        if bound.is_some_and(|bound| bound != namespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a session may not change its namespace",
             ));
         }
         match self.namespaces.get(&namespace) {
@@ -4841,11 +6733,12 @@ impl Store {
                 }
             }
         }
+
         let (seq0, entries) = self
             .snapshot(namespace)
             .ok_or_else(|| invalid("namespace"))?;
         self.subscriptions.insert(
-            connection,
+            (connection, namespace),
             Subscription {
                 namespace,
                 sender,
@@ -4908,6 +6801,10 @@ impl Store {
                 "pending_gets",
                 self.pending_gets.values().map(|q| q.len() as u64).sum(),
             ),
+            ("forwarded_total", self.metrics.forwarded),
+            ("forward_failed_total", self.metrics.forward_failed),
+            ("forward_retries_total", self.metrics.forward_retries),
+            ("remote_fetched_total", self.metrics.remote_fetched),
         ] {
             text.push_str(&format!("cm_{name} {value}\n"));
         }
@@ -5000,14 +6897,21 @@ pub enum PeerEvent {
     },
     Catalog {
         node: String,
+        namespace: NamespaceId,
         event: proto::CatalogEvent,
     },
     Disconnected {
         node: String,
     },
     Forwarded {
+        namespace: NamespaceId,
         key: Key,
         result: Result<()>,
+    },
+    /// One forward attempt failed on the transport; the forwarder will retry.
+    ForwardFailed {
+        namespace: NamespaceId,
+        key: Key,
     },
     Data {
         node: String,
@@ -5073,6 +6977,9 @@ pub enum GetAnswer {
     Done,
     Refused(Refused),
 }
+
+/// A fetch reservation: its token and one arena destination per fetched record.
+pub type FetchReservation = (u64, Vec<Arc<Extent>>);
 
 pub enum StoreCommand {
     Hello {
@@ -5155,13 +7062,69 @@ pub enum StoreCommand {
     PeerHello {
         connection: u64,
         node: String,
-        transport: Transport,
-        regions: PeerRegions,
-        reply: Reply<Result<PeerSession>>,
+        reply: Reply<Result<u64>>,
+    },
+    /// Which records of a chain only exist upstream, including every destination shape.
+    RemotePlan {
+        namespace: NamespaceId,
+        chain: Vec<Key>,
+        reply: Reply<Result<Option<RemotePlan>>>,
+    },
+    /// Lease a record so the peer runtime can forward it (used to repair a missing ancestor).
+    PrepareForward {
+        namespace: NamespaceId,
+        key: Key,
+        reply: Reply<Result<ForwardJob>>,
+    },
+    /// Allocate the DRAM destinations for a remote fetch, making room by eviction, and pin the
+    /// chain until the serving Get plans its own pins. `None` means the chain cannot fit the
+    /// arena, so the fetch is a miss.
+    ReserveFetch {
+        namespace: NamespaceId,
+        chain: Vec<Key>,
+        lengths: Vec<u64>,
+        connection: u64,
+        reply: Reply<Result<Option<FetchReservation>>>,
+    },
+    /// Release a fetch reservation whose Get will not run (a failed transfer or adoption).
+    ReleaseFetch {
+        token: u64,
+    },
+    /// Install bytes fetched from an upstream as a local DRAM record. `row` records whether the
+    /// fetch delivered the endpoint row or only the pages.
+    AdoptRemote {
+        namespace: NamespaceId,
+        key: Key,
+        extent: Arc<Extent>,
+        row: bool,
+        reply: Reply<Result<()>>,
     },
     Peer(PeerEvent),
+    Admin(AdminCommand),
     Tick,
     Shutdown,
+}
+
+/// Administrative operations, executed on the store thread.
+pub enum AdminCommand {
+    Stats(Reply<Result<String>>),
+    Pin {
+        namespace: Vec<u8>,
+        keys: Vec<Key>,
+        pin: bool,
+        reply: Reply<Result<u32>>,
+    },
+    Purge {
+        namespace: Vec<u8>,
+        all_namespaces: bool,
+        reply: Reply<Result<(u64, u64)>>,
+    },
+    SetQuota {
+        namespace: Vec<u8>,
+        dram: u64,
+        nvme: u64,
+        reply: Reply<Result<u64>>,
+    },
 }
 
 fn live_event(live: &LiveEvent, sequence: u64) -> Option<proto::CatalogEvent> {
@@ -5341,15 +7304,12 @@ impl Store {
                 events,
                 reply,
             } => {
-                let session_ok = self
-                    .sessions
-                    .get(&connection)
-                    .is_some_and(|session| session.namespace == Some(namespace));
-                if self
-                    .sessions
-                    .get(&connection)
-                    .is_none_or(|session| session.generation != generation)
-                {
+                let session = self.sessions.get(&connection);
+                let session_ok = session.is_some_and(|session| {
+                    session.generation == generation
+                        && (session.namespace == Some(namespace) || session.remote)
+                });
+                if session.is_some_and(|session| session.generation != generation) {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "generation superseded",
@@ -5366,10 +7326,18 @@ impl Store {
                     )));
                     return;
                 }
+                if self.transfer_in_use(connection, transfer) {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "Put transfer id is already open on this connection",
+                    )));
+                    return;
+                }
                 self.submit_put(
                     connection,
                     transfer,
                     PutRequest {
+                        namespace,
                         key,
                         published_parent,
                         bucket,
@@ -5438,31 +7406,22 @@ impl Store {
                 events,
                 reply,
             } => {
-                if self
-                    .sessions
-                    .get(&connection)
-                    .is_none_or(|session| session.generation != generation)
-                {
+                let session = self.sessions.get(&connection);
+                if session.is_none_or(|session| session.generation != generation) {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "generation superseded",
                     )));
                     return;
                 }
-                let Some(session_namespace) = self
-                    .sessions
-                    .get(&connection)
-                    .and_then(|session| session.namespace)
-                else {
-                    let _ = reply.send(Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "Get before Hello",
-                    )));
+                let known = self.namespaces.contains_key(&namespace);
+                let Some(session) = session else {
                     return;
                 };
-                if session_namespace != namespace {
-                    // §8.0: a Get for a namespace the session has not
-                    // registered is a terminal operation refusal.
+                let allowed = session.namespace == Some(namespace) || (session.remote && known);
+                if !allowed {
+                    // §8.0: a Get for a namespace the session has not registered is a
+                    // terminal operation refusal.
                     let _ = reply.send(Ok(()));
                     let _ = events.try_send(Ok(GetAnswer::Refused(Refused {
                         reason: proto::Reason::Invalid as u8,
@@ -5470,10 +7429,18 @@ impl Store {
                     })));
                     return;
                 }
+                if self.transfer_in_use(connection, transfer) {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "Get transfer id is already open on this connection",
+                    )));
+                    return;
+                }
                 self.submit_get(
                     connection,
                     transfer,
                     GetRequest {
+                        namespace,
                         keys: chain,
                         skip_pages,
                         expected_pages,
@@ -5520,14 +7487,99 @@ impl Store {
             StoreCommand::ConnectionClosed { connection }
             | StoreCommand::ProcessExited { connection } => self.connection_closed(connection),
             StoreCommand::PeerHello {
-                connection, reply, ..
+                connection,
+                node,
+                reply,
             } => {
-                // Register the peer session now so the M4 wiring only has to add
-                // the transport negotiation; remote sessions have no local pidfd.
-                let _ = self.local.accept_remote(connection);
-                let _ = reply.send(Err(invalid("peer support arrives in M4")));
+                let _ = reply.send(self.peer_hello(connection, &node));
             }
-            StoreCommand::Peer(_) => {}
+            StoreCommand::Peer(event) => match event {
+                PeerEvent::Forwarded {
+                    namespace,
+                    key,
+                    result,
+                } => {
+                    if result.is_ok() {
+                        self.metrics.forwarded += 1;
+                    } else {
+                        self.metrics.forward_failed += 1;
+                    }
+                    self.forward_finished(namespace, key);
+                }
+                PeerEvent::ForwardFailed { namespace, key } => {
+                    let _ = (namespace, key);
+                    self.metrics.forward_retries += 1;
+                }
+                PeerEvent::Catalog {
+                    node,
+                    namespace,
+                    event,
+                } => self.apply_catalog(&node, namespace, event),
+                PeerEvent::Disconnected { node } => self.peer_gone(&node),
+                PeerEvent::Connecting | PeerEvent::Connected { .. } | PeerEvent::Data { .. } => {}
+            },
+            StoreCommand::RemotePlan {
+                namespace,
+                chain,
+                reply,
+            } => {
+                let all = self.chain_records(namespace, &chain);
+                let root = all.first().map(|record| record.key);
+                let complete = all.len() == chain.len();
+                // A record is needed when it has no local bytes, or when it is the chain
+                // endpoint and its local copy lacks the row. The row flag of a record with
+                // local bytes is its own; a merged upstream flag never hides a local row.
+                let needed =
+                    |record: &ChainRecord| !record.local || (record.endpoint && !record.row);
+                // One Get from the first missing record to the chain endpoint. Local records in
+                // between ride along; that costs a few bytes and keeps every request a valid
+                // chain ending at a row-bearing endpoint.
+                let first = all.iter().position(needed);
+                let records = first.map(|start| all[start..].to_vec());
+                let result = if complete && let Some(records) = records {
+                    match self.namespaces.get(&namespace) {
+                        Some(state) => Ok(Some(RemotePlan {
+                            descriptor: state.descriptor.clone(),
+                            root: root.unwrap(),
+                            records,
+                        })),
+                        None => Err(invalid("Get namespace is not registered")),
+                    }
+                } else {
+                    Ok(None)
+                };
+                let _ = reply.send(result);
+            }
+            StoreCommand::PrepareForward {
+                namespace,
+                key,
+                reply,
+            } => {
+                let result = self.prepare_forward(namespace, key);
+                let _ = reply.send(result);
+            }
+            StoreCommand::ReserveFetch {
+                namespace,
+                chain,
+                lengths,
+                connection,
+                reply,
+            } => {
+                let result = self.reserve_fetch(namespace, &chain, &lengths, connection);
+                let _ = reply.send(result);
+            }
+            StoreCommand::ReleaseFetch { token } => self.release_fetch(token),
+            StoreCommand::AdoptRemote {
+                namespace,
+                key,
+                extent,
+                row,
+                reply,
+            } => {
+                let result = self.adopt_remote(namespace, key, extent, row);
+                let _ = reply.send(result);
+            }
+            StoreCommand::Admin(command) => self.admin(command),
             StoreCommand::Tick => {}
             StoreCommand::Shutdown => {}
         }
@@ -5711,11 +7763,15 @@ mod tests {
                 tail as usize,
                 true,
                 Location {
+                    origin: Origin::Local,
+                    remote: None,
                     header,
                     memory: Some(Arc::new(extent)),
                     disk: None,
                     durable: false,
                     writing: false,
+                    job: None,
+                    rewrite: false,
                     retry: Instant::now(),
                     bytes,
                 },
@@ -5777,6 +7833,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                namespace: id,
                 key: Key {
                     consumed_tokens: 192,
                     digest: [3; 16],
@@ -5840,6 +7897,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                namespace: id,
                 key: Key {
                     consumed_tokens: 384,
                     digest: [4; 16],
@@ -5929,11 +7987,13 @@ mod tests {
         store
             .hello(1, "l0".into(), std::process::id(), value)
             .unwrap();
+        let id = store.sessions[&1].namespace.unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
             1,
             1,
             PutRequest {
+                namespace: id,
                 key: Key {
                     consumed_tokens: 128,
                     digest: [10; 16],
@@ -5974,6 +8034,7 @@ mod tests {
             .unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         let get = Get {
+            namespace: id,
             pins: VecDeque::new(),
             records: Vec::new(),
             grants: Vec::new(),
@@ -6087,6 +8148,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
                     digest: [6; 16],
@@ -6163,11 +8225,13 @@ mod tests {
         store
             .hello(1, "l0".into(), std::process::id(), value)
             .unwrap();
+        let id = store.sessions[&1].namespace.unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
             1,
             1,
             PutRequest {
+                namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
                     digest: [7; 16],
@@ -6188,6 +8252,7 @@ mod tests {
             1,
             2,
             PutRequest {
+                namespace: id,
                 key: Key {
                     consumed_tokens: 192,
                     digest: [8; 16],
@@ -6228,11 +8293,15 @@ mod tests {
                 tail as usize,
                 true,
                 Location {
+                    origin: Origin::Local,
+                    remote: None,
                     header,
                     memory: None,
                     disk: None,
                     durable: false,
                     writing: false,
+                    job: None,
+                    rewrite: false,
                     retry: Instant::now(),
                     bytes: 0,
                 },
@@ -6324,19 +8393,19 @@ mod tests {
                 events.push(event);
             }
         }
-        let subscription = &store.subscriptions[&1];
+        let subscription = &store.subscriptions[&(1, id)];
         assert!(subscription.snapshot.is_none());
         assert_eq!(subscription.buffered.len(), 2);
         // A newer mutation must queue behind the older buffered ones.
         store.delta(id, 1, third);
         store.flush_events();
-        assert_eq!(store.subscriptions[&1].buffered.len(), 3);
+        assert_eq!(store.subscriptions[&(1, id)].buffered.len(), 3);
         loop {
             store.pump_subscriptions();
             while let Ok(event) = receiver.try_recv() {
                 events.push(event);
             }
-            let subscription = &store.subscriptions[&1];
+            let subscription = &store.subscriptions[&(1, id)];
             if subscription.buffered.is_empty() && subscription.snapshot.is_none() {
                 break;
             }
@@ -6372,6 +8441,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
                     digest: [9; 16],
@@ -6426,6 +8496,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
                     digest: [8; 16],
@@ -6445,6 +8516,7 @@ mod tests {
             1,
             2,
             GetRequest {
+                namespace: store.namespace_id().unwrap(),
                 keys: vec![Key {
                     consumed_tokens: 64,
                     digest: [4; 16],
@@ -6475,6 +8547,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
                     digest: [5; 16],
@@ -6491,6 +8564,7 @@ mod tests {
             1,
             2,
             GetRequest {
+                namespace: store.namespace_id().unwrap(),
                 keys: vec![Key {
                     consumed_tokens: 64,
                     digest: [4; 16],
@@ -6537,11 +8611,15 @@ mod tests {
                     1,
                     true,
                     Location {
+                        origin: Origin::Local,
+                        remote: None,
                         header: header.clone(),
                         memory: Some(extent),
                         disk: None,
                         durable: false,
                         writing: false,
+                        job: None,
+                        rewrite: false,
                         retry: Instant::now(),
                         bytes,
                     },
@@ -6590,11 +8668,15 @@ mod tests {
                     1,
                     true,
                     Location {
+                        origin: Origin::Local,
+                        remote: None,
                         header,
                         memory: None,
                         disk: None,
                         durable: false,
                         writing: false,
+                        job: None,
+                        rewrite: false,
                         retry: Instant::now(),
                         bytes: 0,
                     },
@@ -6645,7 +8727,7 @@ mod tests {
             store.delta(id, 0, parent.unwrap());
         }
         store.flush_events();
-        let subscription = &store.subscriptions[&1];
+        let subscription = &store.subscriptions[&(1, id)];
         assert!(subscription.restarts >= 1);
         assert!(subscription.begin_pending);
         assert!(subscription.buffered.len() <= SNAPSHOT_BUFFER);
@@ -6681,6 +8763,7 @@ mod tests {
                 1,
                 100 + index,
                 GetRequest {
+                    namespace: id,
                     keys: vec![Key {
                         consumed_tokens: 64,
                         digest: [4; 16],
@@ -6697,6 +8780,7 @@ mod tests {
                 1,
                 200 + index,
                 PutRequest {
+                    namespace: id,
                     key: Key {
                         consumed_tokens: 128 + index * 64,
                         digest: [5; 16],
@@ -6719,6 +8803,7 @@ mod tests {
             1,
             300,
             GetRequest {
+                namespace: id,
                 keys: vec![Key {
                     consumed_tokens: 64,
                     digest: [4; 16],
@@ -6764,11 +8849,15 @@ mod tests {
                 1,
                 true,
                 Location {
+                    origin: Origin::Local,
+                    remote: None,
                     header: header.clone(),
                     memory: Some(extent.clone()),
                     disk: None,
                     durable: false,
                     writing: false,
+                    job: None,
+                    rewrite: false,
                     retry: Instant::now(),
                     bytes: record_charge(&header, true),
                 },
@@ -6790,6 +8879,2528 @@ mod tests {
                 )
                 .is_err()
         );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn admin_pins_protect_a_record_from_purge() {
+        let (mut store, directory) = store("admin");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [9; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let extent = Arc::new(
+            store
+                .memory
+                .allocate(header.length_with_row() as usize)
+                .unwrap(),
+        );
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                key,
+                None,
+                [0; 16],
+                1,
+                true,
+                Location {
+                    origin: Origin::Local,
+                    remote: None,
+                    header: header.clone(),
+                    memory: Some(extent),
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes: record_charge(&header, true),
+                },
+            )
+            .unwrap();
+        let pin = |store: &mut Store, pin: bool| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            store.handle(StoreCommand::Admin(AdminCommand::Pin {
+                namespace: id.to_vec(),
+                keys: vec![key],
+                pin,
+                reply,
+            }));
+            answer.blocking_recv().unwrap().unwrap()
+        };
+        let purge = |store: &mut Store| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            store.handle(StoreCommand::Admin(AdminCommand::Purge {
+                namespace: id.to_vec(),
+                all_namespaces: false,
+                reply,
+            }));
+            answer.blocking_recv().unwrap().unwrap()
+        };
+        assert_eq!(pin(&mut store, true), 1);
+        // Repeated admin pins are idempotent.
+        assert_eq!(pin(&mut store, true), 0);
+        // A purge removes every record, pinned or not.
+        assert_eq!(purge(&mut store), (1, record_charge(&header, true)));
+        assert!(store.namespaces[&id].tree.node(&key).is_none());
+        assert_eq!(pin(&mut store, false), 0);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_remote_child_waits_for_its_parent() {
+        let (mut store, directory) = store("deferred");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let parent = Key {
+            consumed_tokens: 128,
+            digest: [1; 16],
+        };
+        let child = Key {
+            consumed_tokens: 192,
+            digest: [2; 16],
+        };
+        let entry = |key, parent: Option<Key>, tail: u64| proto::CatalogEntry {
+            key: Some(crate::control::key_to_proto(&key)),
+            parent: parent.map(|parent| crate::control::key_to_proto(&parent)),
+            has_parent: parent.is_some(),
+            bucket: vec![0; 16],
+            tail_pages: tail,
+            row: true,
+            tier: proto::Tier::Nvme as i32,
+            durable: false,
+            bytes: 8192,
+            unreadable: false,
+        };
+        let send = |store: &mut Store, sequence, body| {
+            store.handle(StoreCommand::Peer(PeerEvent::Catalog {
+                node: "upstream".into(),
+                namespace: id,
+                event: proto::CatalogEvent {
+                    sequence,
+                    event: Some(body),
+                },
+            }));
+        };
+        use proto::catalog_event::Event;
+        // The child arrives before the parent and is held back.
+        send(&mut store, 1, Event::Added(entry(child, Some(parent), 1)));
+        assert!(store.namespaces[&id].tree.node(&child).is_none());
+        send(&mut store, 2, Event::Added(entry(parent, None, 2)));
+        assert!(store.namespaces[&id].tree.node(&parent).is_some());
+        let node = store.namespaces[&id].tree.node(&child).unwrap();
+        assert_eq!(node.location.remote.as_ref().unwrap().node, "upstream");
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_pending_reservation_counts_against_a_quota() {
+        let (mut store, directory) = store("quota-pending");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [7; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        let used = 4096;
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&key)
+            .unwrap()
+            .location
+            .bytes = used;
+        store.retired_puts.push(PutDrain {
+            connection: 1,
+            transfer: 1,
+            namespace: id,
+            key,
+            pins: VecDeque::new(),
+            pending: 0,
+            reservation: used,
+            _temporary: None,
+            _staging_hold: None,
+        });
+        store.quotas.insert(
+            id,
+            Quota {
+                dram: 0,
+                nvme: used,
+            },
+        );
+        assert!(!store.quota_allows(id, 1, 1));
+        store.quotas.insert(id, Quota { dram: 0, nvme: 1 });
+        store.enforce_quota(id);
+        assert_eq!(store.namespace_charge(id, false), 0);
+        assert!(store.quota_excess(id) > 0);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_detached_publication_from_a_purged_epoch_is_dropped() {
+        let (mut store, directory) = store("stale-publish");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [2; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let epoch = store.namespaces[&id].epoch;
+        let put = Put {
+            namespace: id,
+            epoch,
+            remote: false,
+            header,
+            first_page: 0,
+            grants: Vec::new(),
+            windows: FilledWindows {
+                granted: HashMap::new(),
+                next: 0,
+                pages: vec![None; 1],
+                row: None,
+                pages_filled: 0,
+                row_filled: true,
+            },
+            memory: None,
+            temporary: None,
+            streaming: false,
+            commit_bytes: Vec::new(),
+            metadata: None,
+            committed: true,
+            finalizing: false,
+            cancelled: false,
+            terminal: false,
+            finished: true,
+            pending: 0,
+            blocked: VecDeque::new(),
+            pins: VecDeque::new(),
+            reservation: 4096,
+            requirement: PutRequirement::arena(0),
+            staging_hold: None,
+            hold_unit: 0,
+            hold_slots: [None, None],
+            events,
+            outbox: VecDeque::new(),
+        };
+        store.charged = 4096;
+        store.detached_puts.insert((1, 1), put);
+        // A purge fenced the namespace after the put was detached.
+        store.namespaces.get_mut(&id).unwrap().epoch += 1;
+        let disk = Arc::new(DiskExtent::new(directory.join("stale.record")));
+        store.publish_detached_put(1, 1, disk);
+        assert!(store.namespaces[&id].tree.node(&key).is_none());
+        assert_eq!(store.charged, 0);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_put_naming_an_absent_parent_asks_for_ancestry_repair() {
+        let (mut store, directory) = store("parent");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store.peer_hello(1, "near").unwrap();
+        let parent = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let key = Key {
+            consumed_tokens: 128,
+            digest: [9; 16],
+        };
+        let (events, mut receiver) = tokio::sync::mpsc::channel(4);
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::PutBegin {
+            connection: 1,
+            transfer: 1,
+            generation: store.sessions[&1].generation,
+            namespace: id,
+            descriptor: value.clone(),
+            key,
+            published_parent: Some(parent),
+            bucket: [0; 16],
+            chain_pages: 2,
+            published_tail_pages: 1,
+            row: true,
+            events,
+            reply,
+        });
+        store.pump();
+        match receiver.try_recv().unwrap().unwrap() {
+            PutAnswer::Refused(refused) => assert!(
+                refused.detail.contains("published parent"),
+                "unexpected detail: {}",
+                refused.detail
+            ),
+            _ => panic!("expected a refusal"),
+        }
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_local_put_with_an_unusable_parent_falls_back_to_a_root() {
+        let (mut store, directory) = store("local-parent");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let parent = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let key = Key {
+            consumed_tokens: 128,
+            digest: [9; 16],
+        };
+        let (events, mut receiver) = tokio::sync::mpsc::channel(4);
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::PutBegin {
+            connection: 1,
+            transfer: 1,
+            generation: store.sessions[&1].generation,
+            namespace: id,
+            descriptor: value.clone(),
+            key,
+            published_parent: Some(parent),
+            bucket: [0; 16],
+            chain_pages: 2,
+            published_tail_pages: 1,
+            row: true,
+            events,
+            reply,
+        });
+        store.pump();
+        match receiver.try_recv().unwrap().unwrap() {
+            PutAnswer::Accept(accept) => assert!(
+                accept.parent.is_none(),
+                "a local Put whose parent hint is unusable must be accepted as a root"
+            ),
+            PutAnswer::Refused(refused) => panic!("expected an accept: {}", refused.detail),
+            _ => panic!("expected an accept"),
+        }
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_page_only_record_is_replaced_by_a_complete_put() {
+        let (mut store, directory) = store("publish-target");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [6; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let extent = Arc::new(
+            store
+                .memory
+                .allocate(header.length_with_row() as usize)
+                .unwrap(),
+        );
+        let bytes = record_charge(&header, true);
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                key,
+                None,
+                [0; 16],
+                1,
+                true,
+                Location {
+                    origin: Origin::Local,
+                    remote: None,
+                    header: header.clone(),
+                    memory: Some(extent),
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes,
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(store.publish_target(id, &header), PublishTarget::Present),
+            "a complete local record is a duplicate"
+        );
+        // Compaction drops the row, keeping the pages as a replacement target.
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&key)
+            .unwrap()
+            .row = false;
+        assert!(
+            matches!(store.publish_target(id, &header), PublishTarget::Replace(_)),
+            "a page-only record must be replaced, not treated as present"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    fn store_with_delayed_disk(label: &str) -> (Store, PathBuf, PathBuf) {
+        let name = format!(
+            "cm-unit-{}-{label}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let mut config = Config::new(
+            base.join("records"),
+            base.join("manager.sock"),
+            1 << 20,
+            64 << 20,
+        );
+        config.name = name.clone();
+        config.staging = 8 * 1024 * 1024;
+        config.faults.delay_ms = 300;
+        let store = Store::open(config).unwrap();
+        let directory = PathBuf::from("/dev/shm/selene").join(name);
+        (store, base, directory)
+    }
+
+    /// Encode a record header the way a client does, for building a fetch result.
+    fn encoded_header(header: &Header) -> Vec<u8> {
+        use crate::codec::Encoder;
+        let mut encoder = Encoder::default();
+        encoder.bytes(b"FLARECKP");
+        encoder.u32(1);
+        encoder.u32(header.flags);
+        encoder.bytes(&header.identity);
+        encoder.bytes(&header.fingerprint);
+        encoder.key(header.key);
+        encoder.u8(header.parent.is_some() as u8);
+        encoder.key(header.parent.unwrap_or_default());
+        encoder.bytes(&header.bucket);
+        encoder.u64(header.page_tokens);
+        encoder.u32(header.tail_pages);
+        encoder.u64(header.page_segment);
+        encoder.u64(header.row_segment);
+        encoder.u64(header.row_checksum);
+        encoder.u64(header.created);
+        record::encode_ranks(&mut encoder, &header.ranks);
+        let mut bytes = vec![0; record::HEADER_BYTES];
+        bytes[..encoder.0.len()].copy_from_slice(&encoder.0);
+        bytes
+    }
+
+    /// A fetched extent holding a valid, zero-payload record.
+    fn fetched_extent(
+        store: &mut Store,
+        value: &Descriptor,
+        key: Key,
+        parent: Option<Key>,
+        tail: u32,
+    ) -> Arc<Extent> {
+        let header = Header::new(value, key, parent, [0; 16], tail).unwrap();
+        let mut extent = store
+            .memory
+            .allocate(header.length_with_row() as usize)
+            .unwrap();
+        extent.bytes_mut()[..record::HEADER_BYTES].copy_from_slice(&encoded_header(&header));
+        Arc::new(extent)
+    }
+
+    /// Turn an indexed node into a catalog-only remote entry.
+    fn make_remote(store: &mut Store, id: NamespaceId, key: Key, row: bool) {
+        let node = store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&key)
+            .unwrap();
+        node.location.origin = Origin::Peer;
+        node.location.remote = Some(RemoteSource {
+            node: "upstream".into(),
+            bytes: 8192,
+            row,
+        });
+        node.row = row;
+    }
+
+    #[test]
+    fn a_purge_waits_for_an_outstanding_publication_and_retires_it() {
+        let (mut store, base, directory) = store_with_delayed_disk("purge-inflight");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [32; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let metadata = vec![0; header.page_segment as usize];
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let epoch = store.namespaces[&id].epoch;
+        let temporary = store.namespaces[&id].temporary(1).unwrap();
+        let put = Put {
+            namespace: id,
+            epoch,
+            remote: false,
+            header,
+            first_page: 0,
+            grants: Vec::new(),
+            windows: FilledWindows {
+                granted: HashMap::new(),
+                next: 0,
+                pages: vec![None; 1],
+                row: None,
+                pages_filled: 0,
+                row_filled: true,
+            },
+            memory: None,
+            temporary: Some(temporary),
+            streaming: true,
+            commit_bytes: Vec::new(),
+            metadata: Some(Arc::new(metadata)),
+            committed: true,
+            finalizing: false,
+            cancelled: false,
+            terminal: false,
+            finished: false,
+            pending: 0,
+            blocked: VecDeque::new(),
+            pins: VecDeque::new(),
+            reservation: 0,
+            requirement: PutRequirement::arena(0),
+            staging_hold: None,
+            hold_unit: 0,
+            hold_slots: [None, None],
+            events,
+            outbox: VecDeque::new(),
+        };
+        store.detached_puts.insert((2, 2), put);
+        store.pump();
+        assert!(
+            store
+                .detached_puts
+                .get(&(2, 2))
+                .is_some_and(|put| put.pending > 0),
+            "the Finish job is outstanding"
+        );
+        store.purge_namespace(id);
+        assert!(
+            store.namespaces[&id].purging,
+            "a purge keeps the namespace closed while its publication drains"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.namespaces[&id].purging {
+            assert!(Instant::now() < deadline, "the publication never drained");
+            store.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            store.detached_puts.is_empty(),
+            "the drained publication is released"
+        );
+        let path = store.namespaces[&id].path(key).unwrap();
+        assert!(
+            !path.exists(),
+            "the file renamed before the epoch check was retired"
+        );
+        let root = base.join("records");
+        drop(store);
+        let recovered = crate::disk::recover(&root).unwrap();
+        assert!(
+            !recovered
+                .iter()
+                .flat_map(|namespace| namespace.records.iter())
+                .any(|(header, _, _)| header.key == key),
+            "a restart must not recover a purged publication"
+        );
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_remote_plan_runs_to_the_endpoint_through_local_records() {
+        let (mut store, directory) = store("plan-runs");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let first = Key {
+            consumed_tokens: 64,
+            digest: [20; 16],
+        };
+        let middle = Key {
+            consumed_tokens: 128,
+            digest: [21; 16],
+        };
+        let last = Key {
+            consumed_tokens: 192,
+            digest: [22; 16],
+        };
+        insert_node(&mut store, id, &value, first, None, 1);
+        insert_node(&mut store, id, &value, middle, Some(first), 1);
+        insert_node(&mut store, id, &value, last, Some(middle), 1);
+        // A is missing and page-only upstream, B is local, C is the remote endpoint.
+        make_remote(&mut store, id, first, false);
+        make_remote(&mut store, id, last, true);
+        let header = store.namespaces[&id].tree[&middle].location.header.clone();
+        let extent = Arc::new(store.memory.allocate(header.length(true) as usize).unwrap());
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&middle)
+            .unwrap()
+            .location
+            .memory = Some(extent);
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::RemotePlan {
+            namespace: id,
+            chain: vec![first, middle, last],
+            reply,
+        });
+        store.pump();
+        let plan = answer
+            .try_recv()
+            .expect("the store answered the plan")
+            .expect("a plan result")
+            .expect("a plan");
+        let keys: Vec<Key> = plan.records.iter().map(|record| record.key).collect();
+        assert_eq!(
+            keys,
+            vec![first, middle, last],
+            "one Get runs from the first miss to the endpoint, through local B"
+        );
+        assert!(
+            plan.records[2].endpoint,
+            "the Get ends at the remote endpoint"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_remote_fetch_reserves_room_by_evicting_a_durable_leaf() {
+        let (mut store, base, directory) = store_with_root("fetch-reserve", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let old = Key {
+            consumed_tokens: 64,
+            digest: [40; 16],
+        };
+        insert_node(&mut store, id, &value, old, None, 1);
+        let extent = Arc::new(store.memory.allocate(1 << 20).unwrap());
+        {
+            let node = store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&old)
+                .unwrap();
+            node.location.memory = Some(extent);
+            node.location.durable = true;
+            node.location.bytes = 1 << 20;
+        }
+        let fresh = Key {
+            consumed_tokens: 64,
+            digest: [41; 16],
+        };
+        insert_node(&mut store, id, &value, fresh, None, 1);
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::ReserveFetch {
+            namespace: id,
+            chain: vec![fresh],
+            lengths: vec![64 * 1024],
+            connection: 1,
+            reply,
+        });
+        let (token, extents) = answer
+            .try_recv()
+            .expect("the store answered the reservation")
+            .expect("a reservation result")
+            .expect("a fetch fits once the durable leaf is evicted");
+        assert_eq!(extents.len(), 1);
+        assert!(store.namespaces[&id].tree.node(&old).is_none());
+        assert!(extents[0].bytes().len() >= 64 * 1024);
+        assert!(store.namespaces[&id].tree[&fresh].pinned());
+        store.handle(StoreCommand::ReleaseFetch { token });
+        assert!(!store.namespaces[&id].tree[&fresh].pinned());
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_remote_fetch_larger_than_the_arena_is_a_miss() {
+        let (mut store, directory) = store("fetch-miss");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [42; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::ReserveFetch {
+            namespace: id,
+            chain: vec![key],
+            lengths: vec![2 << 20],
+            connection: 1,
+            reply,
+        });
+        let reserved = answer
+            .try_recv()
+            .expect("the store answered the reservation")
+            .expect("a reservation result");
+        assert!(reserved.is_none(), "a chain beyond the arena is a miss");
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_fetch_reservation_releases_only_its_own_pins() {
+        let (mut store, directory) = store("fetch-two-pins");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let first = Key {
+            consumed_tokens: 64,
+            digest: [44; 16],
+        };
+        let second = Key {
+            consumed_tokens: 64,
+            digest: [45; 16],
+        };
+        insert_node(&mut store, id, &value, first, None, 1);
+        insert_node(&mut store, id, &value, second, None, 1);
+        let reserve = |store: &mut Store, key: Key| {
+            let (reply, mut answer) = tokio::sync::oneshot::channel();
+            store.handle(StoreCommand::ReserveFetch {
+                namespace: id,
+                chain: vec![key],
+                lengths: vec![64 * 1024],
+                connection: 1,
+                reply,
+            });
+            answer
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .expect("the reservation fits")
+                .0
+        };
+        let token_a = reserve(&mut store, first);
+        let token_b = reserve(&mut store, second);
+        assert!(store.namespaces[&id].tree[&first].pinned());
+        assert!(store.namespaces[&id].tree[&second].pinned());
+        store.handle(StoreCommand::ReleaseFetch { token: token_a });
+        assert!(
+            !store.namespaces[&id].tree[&first].pinned(),
+            "the Get that owned A released exactly A"
+        );
+        assert!(
+            store.namespaces[&id].tree[&second].pinned(),
+            "a concurrent fetch keeps its protection"
+        );
+        assert!(store.fetch_pins.contains_key(&token_b));
+        store.handle(StoreCommand::ReleaseFetch { token: token_b });
+        assert!(!store.namespaces[&id].tree[&second].pinned());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_serving_get_does_not_release_a_fetch_reservation() {
+        let (mut store, directory) = store("fetch-get-pins");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [46; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        let header = store.namespaces[&id].tree[&key].location.header.clone();
+        let length = header.length(true);
+        let extent = Arc::new(store.memory.allocate(length as usize).unwrap());
+        {
+            let node = store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&key)
+                .unwrap();
+            node.location.memory = Some(extent);
+            node.location.bytes = length;
+        }
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::ReserveFetch {
+            namespace: id,
+            chain: vec![key],
+            lengths: vec![length],
+            connection: 1,
+            reply,
+        });
+        let (token, _) = answer
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .expect("the reservation fits");
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_get(
+            1,
+            1,
+            GetRequest {
+                namespace: id,
+                keys: vec![key],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+            },
+            events,
+        );
+        store.pump();
+        assert!(
+            store.fetch_pins.contains_key(&token),
+            "the Get leaves the fetch's own reservation alone"
+        );
+        assert!(store.namespaces[&id].tree[&key].pinned());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn an_anchor_kept_by_a_lease_is_pruned_when_the_lease_ends() {
+        let (mut store, directory) = store("remote-orphan");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [48; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        make_remote(&mut store, id, key, true);
+        store.remote_views.insert(
+            (id, "upstream".to_string()),
+            std::collections::BTreeMap::new(),
+        );
+        // A serving Get pins the anchor while its upstream disappears.
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .pin(&key)
+            .unwrap();
+        store.peer_gone("upstream");
+        assert!(
+            store.namespaces[&id].tree.node(&key).is_some(),
+            "a leased anchor is not removed under the lease"
+        );
+        assert_eq!(store.remote_orphans.len(), 1, "the anchor is queued");
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .unpin(&key)
+            .unwrap();
+        store.cleanup_turn();
+        assert!(
+            store.namespaces[&id].tree.node(&key).is_none(),
+            "the anchor is gone once its lease ends"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pruning_a_dead_anchor_leaves_a_parent_with_bytes_to_eviction() {
+        let (mut store, directory) = store("orphan-parent-bytes");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let parent = Key {
+            consumed_tokens: 64,
+            digest: [49; 16],
+        };
+        let child = Key {
+            consumed_tokens: 128,
+            digest: [50; 16],
+        };
+        insert_node(&mut store, id, &value, parent, None, 1);
+        insert_node(&mut store, id, &value, child, Some(parent), 1);
+        // The parent carries pages but no row: the tree would cascade it with the child, but
+        // its local bytes belong to normal eviction and its charge must survive this prune.
+        let header = store.namespaces[&id].tree[&parent].location.header.clone();
+        let bytes = header.length(false);
+        let extent = Arc::new(store.memory.allocate(bytes as usize).unwrap());
+        {
+            let node = store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&parent)
+                .unwrap();
+            node.row = false;
+            node.location.memory = Some(extent);
+            node.location.bytes = bytes;
+        }
+        store.charged = bytes;
+        make_remote(&mut store, id, child, true);
+        store.remote_views.insert(
+            (id, "upstream".to_string()),
+            std::collections::BTreeMap::new(),
+        );
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .pin(&child)
+            .unwrap();
+        store.peer_gone("upstream");
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .unpin(&child)
+            .unwrap();
+        store.cleanup_turn();
+        assert!(store.namespaces[&id].tree.node(&child).is_none());
+        assert!(
+            store.namespaces[&id].tree.node(&parent).is_some(),
+            "a parent with local bytes is left to eviction"
+        );
+        assert_eq!(store.charged, bytes, "its charge is untouched");
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pruning_a_dead_anchor_removes_a_dead_ancestor() {
+        let (mut store, directory) = store("orphan-parent-empty");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let parent = Key {
+            consumed_tokens: 64,
+            digest: [52; 16],
+        };
+        let child = Key {
+            consumed_tokens: 128,
+            digest: [53; 16],
+        };
+        insert_node(&mut store, id, &value, parent, None, 1);
+        insert_node(&mut store, id, &value, child, Some(parent), 1);
+        // The parent is remote-only too: at disconnect it still has a child, so it is not
+        // removable, and it becomes a dead ancestor only once the anchor goes.
+        make_remote(&mut store, id, parent, true);
+        make_remote(&mut store, id, child, true);
+        store.remote_views.insert(
+            (id, "upstream".to_string()),
+            std::collections::BTreeMap::new(),
+        );
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .pin(&child)
+            .unwrap();
+        store.peer_gone("upstream");
+        assert!(
+            store.namespaces[&id].tree.node(&parent).is_some(),
+            "the parent still has its child"
+        );
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .unpin(&child)
+            .unwrap();
+        store.cleanup_turn();
+        assert!(store.namespaces[&id].tree.node(&child).is_none());
+        assert!(
+            store.namespaces[&id].tree.node(&parent).is_none(),
+            "the now-childless dead ancestor goes with it"
+        );
+        assert!(store.remote_orphans.is_empty());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn orphan_entries_are_deduplicated_and_dropped_when_the_node_is_gone() {
+        let (mut store, directory) = store("orphan-dedupe");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [51; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        make_remote(&mut store, id, key, true);
+        store.remote_views.insert(
+            (id, "upstream".to_string()),
+            std::collections::BTreeMap::new(),
+        );
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .pin(&key)
+            .unwrap();
+        store.peer_gone("upstream");
+        store.peer_gone("upstream");
+        assert_eq!(store.remote_orphans.len(), 1, "one entry per record");
+        // The node goes away by another path: the entry must not outlive it.
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .unpin(&key)
+            .unwrap();
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .remove(&key)
+            .unwrap();
+        store.cleanup_turn();
+        assert!(store.remote_orphans.is_empty());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn only_eviction_uses_the_cascading_tree_remove() {
+        // A call that removes a whole node tree belongs to eviction, which accounts for
+        // every cascaded node; every other removal goes through the non-cascading
+        // `remove_node` and checks each ancestor itself.
+        let source = include_str!("store.rs");
+        let needle = format!("tree.{}(", "remove");
+        let mut current = String::new();
+        let mut callers = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("fn ") {
+                current = rest
+                    .split(['(', '<', ' '])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            if line.contains(&needle) {
+                callers.push(current.clone());
+            }
+        }
+        assert_eq!(
+            callers,
+            vec!["remove_quota_leaf".to_string(), "evict_memory".to_string()],
+            "the cascading remove is eviction-only"
+        );
+    }
+
+    #[test]
+    fn a_fetch_reservation_needs_an_open_connection() {
+        let (mut store, directory) = store("fetch-closed");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [47; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::ReserveFetch {
+            namespace: id,
+            chain: vec![key],
+            lengths: vec![64 * 1024],
+            connection: 9,
+            reply,
+        });
+        let reserved = answer.try_recv().unwrap().unwrap();
+        assert!(
+            reserved.is_none(),
+            "a fetch processed after its connection closed reserves nothing"
+        );
+        assert!(!store.namespaces[&id].tree[&key].pinned());
+        assert!(store.fetch_pins.is_empty());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_local_page_only_row_is_advertised_from_the_upstream() {
+        let (mut store, directory) = store("advertised-row");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [28; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        let path = store.namespaces[&id].path(key);
+        // A compacted local record: pages on disk, no row, with an upstream row.
+        let extent = path.map(|path| Arc::new(DiskExtent::new(path)));
+        {
+            let node = store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&key)
+                .unwrap();
+            node.row = false;
+            node.location.origin = Origin::Peer;
+            node.location.disk = extent;
+            node.location.remote = Some(RemoteSource {
+                node: "upstream".into(),
+                bytes: 8192,
+                row: true,
+            });
+        }
+        let advertised = Store::entry(&store.namespaces[&id], key);
+        assert!(
+            advertised.row,
+            "subscribers must see the upstream row on a local page-only record"
+        );
+        let record = store.chain_records(id, &[key]).remove(0);
+        assert!(
+            !record.row,
+            "the refetch decision still uses the local row fact"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn adoption_is_fenced_while_a_disk_job_runs() {
+        let (mut store, base, directory) = store_with_root("adopt-fence", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 128,
+            digest: [29; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 2);
+        make_remote(&mut store, id, key, true);
+        let path = store.namespaces[&id].path(key).unwrap();
+        {
+            let node = store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&key)
+                .unwrap();
+            node.row = false;
+            node.location.disk = Some(Arc::new(DiskExtent::new(path)));
+            node.location.writing = true;
+        }
+        let extent = fetched_extent(&mut store, &value, key, None, 2);
+        let error = store.adopt_remote(id, key, extent, true).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::WouldBlock,
+            "an in-flight disk job fences the adoption"
+        );
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&key)
+            .unwrap()
+            .location
+            .writing = false;
+        let extent = fetched_extent(&mut store, &value, key, None, 2);
+        store.adopt_remote(id, key, extent, true).unwrap();
+        assert!(
+            store.namespaces[&id].tree[&key].location.memory.is_some(),
+            "a quiescent record is adopted"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_staging_hold_counts_against_the_dram_quota() {
+        let (mut store, directory) = store("quota-staging");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [33; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        store.quotas.insert(
+            id,
+            Quota {
+                dram: 4096,
+                nvme: 0,
+            },
+        );
+        // A streamed record's disk reservation is not a DRAM charge.
+        assert!(
+            store.quota_allows(id, store.memory.capacity() as u64 + 1, 0),
+            "an oversize record's disk reservation does not consume the DRAM quota"
+        );
+        let hold = Arc::new(store.staging.allocate(8192).unwrap());
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let epoch = store.namespaces[&id].epoch;
+        let put = Put {
+            namespace: id,
+            epoch,
+            remote: false,
+            header,
+            first_page: 0,
+            grants: Vec::new(),
+            windows: FilledWindows {
+                granted: HashMap::new(),
+                next: 0,
+                pages: vec![None; 1],
+                row: None,
+                pages_filled: 0,
+                row_filled: true,
+            },
+            memory: None,
+            temporary: None,
+            streaming: true,
+            commit_bytes: Vec::new(),
+            metadata: None,
+            committed: false,
+            finalizing: false,
+            cancelled: false,
+            terminal: false,
+            finished: false,
+            pending: 0,
+            blocked: VecDeque::new(),
+            pins: VecDeque::new(),
+            reservation: 4096,
+            requirement: PutRequirement::streaming(4096, 4096),
+            staging_hold: Some(hold),
+            hold_unit: 4096,
+            hold_slots: [None, None],
+            events,
+            outbox: VecDeque::new(),
+        };
+        store.detached_puts.insert((4, 4), put);
+        store.quotas.insert(
+            id,
+            Quota {
+                dram: 4096,
+                nvme: 0,
+            },
+        );
+        assert_eq!(
+            store.pending_memory(id),
+            8192,
+            "the held staging region is counted"
+        );
+        assert!(
+            !store.quota_allows(id, 0, 0),
+            "a held staging region consumes the DRAM quota"
+        );
+        assert!(store.quota_excess(id) > 0);
+        assert!(
+            !store.quota_allows(id, 0, 8192),
+            "its staging hold does consume the DRAM quota"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_purge_drops_publications_waiting_for_their_parent() {
+        // The delayed disk keeps the parent's write-back in flight, so the child publication
+        // stays queued behind parent durability for the duration of the test.
+        let (mut store, base, directory) = store_with_delayed_disk("purge-waiting");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        // A parent that is resident but not durable.
+        let parent = Key {
+            consumed_tokens: 64,
+            digest: [30; 16],
+        };
+        let parent_header = Header::new(&value, parent, None, [0; 16], 1).unwrap();
+        let parent_extent = Arc::new(
+            store
+                .memory
+                .allocate(parent_header.length_with_row() as usize)
+                .unwrap(),
+        );
+        let parent_bytes = record_charge(&parent_header, true);
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                parent,
+                None,
+                [0; 16],
+                1,
+                true,
+                Location {
+                    origin: Origin::Local,
+                    remote: None,
+                    header: parent_header,
+                    memory: Some(parent_extent),
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes: parent_bytes,
+                },
+            )
+            .unwrap();
+        let child = Key {
+            consumed_tokens: 128,
+            digest: [31; 16],
+        };
+        let header = Header::new(&value, child, Some(parent), [0; 16], 1).unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let epoch = store.namespaces[&id].epoch;
+        let put = Put {
+            namespace: id,
+            epoch,
+            remote: false,
+            header,
+            first_page: 0,
+            grants: Vec::new(),
+            windows: FilledWindows {
+                granted: HashMap::new(),
+                next: 0,
+                pages: vec![None; 1],
+                row: None,
+                pages_filled: 0,
+                row_filled: true,
+            },
+            memory: None,
+            temporary: Some(store.namespaces[&id].temporary(1).unwrap()),
+            streaming: true,
+            commit_bytes: Vec::new(),
+            metadata: Some(Arc::new(vec![0; 4096])),
+            committed: true,
+            finalizing: false,
+            cancelled: false,
+            terminal: false,
+            finished: false,
+            pending: 0,
+            blocked: VecDeque::new(),
+            pins: VecDeque::new(),
+            reservation: 0,
+            requirement: PutRequirement::arena(0),
+            staging_hold: None,
+            hold_unit: 0,
+            hold_slots: [None, None],
+            events,
+            outbox: VecDeque::new(),
+        };
+        store.detached_puts.insert((2, 2), put);
+        // The publication waits for the parent's durability instead of being renamed.
+        store.pump();
+        assert!(
+            !store
+                .jobs
+                .values()
+                .any(|job| matches!(job, Job::Finish { .. })),
+            "the publication waits for its parent instead of being renamed"
+        );
+        store.purge_namespace(id);
+        assert!(
+            store.detached_puts.is_empty(),
+            "a purge drops the publication waiting for its parent"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.namespaces[&id].purging {
+            assert!(Instant::now() < deadline, "the purge never drained");
+            store.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A publication from an older epoch is dropped before any rename as well.
+        let header = Header::new(&value, child, None, [0; 16], 2).unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let stale = Put {
+            namespace: id,
+            epoch: epoch.wrapping_sub(1),
+            remote: false,
+            header,
+            first_page: 0,
+            grants: Vec::new(),
+            windows: FilledWindows {
+                granted: HashMap::new(),
+                next: 0,
+                pages: vec![None; 2],
+                row: None,
+                pages_filled: 0,
+                row_filled: true,
+            },
+            memory: None,
+            temporary: Some(store.namespaces[&id].temporary(2).unwrap()),
+            streaming: true,
+            commit_bytes: Vec::new(),
+            metadata: Some(Arc::new(vec![0; 4096])),
+            committed: true,
+            finalizing: false,
+            cancelled: false,
+            terminal: false,
+            finished: false,
+            pending: 0,
+            blocked: VecDeque::new(),
+            pins: VecDeque::new(),
+            reservation: 0,
+            requirement: PutRequirement::arena(0),
+            staging_hold: None,
+            hold_unit: 0,
+            hold_slots: [None, None],
+            events,
+            outbox: VecDeque::new(),
+        };
+        store.detached_puts.insert((3, 3), stale);
+        store.pump();
+        assert!(
+            store.detached_puts.is_empty(),
+            "a stale-epoch publication is dropped before the rename"
+        );
+        assert!(
+            !store
+                .jobs
+                .values()
+                .any(|job| matches!(job, Job::Finish { .. })),
+            "nothing was renamed or queued"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn adoption_makes_room_without_evicting_its_target() {
+        let (mut store, base, directory) = store_with_root("adopt-room", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let budget = store.config.nvme;
+        // A durable leaf that the adoption must evict to fit.
+        let leaf = Key {
+            consumed_tokens: 64,
+            digest: [23; 16],
+        };
+        let leaf_header = Header::new(&value, leaf, None, [0; 16], 1).unwrap();
+        let leaf_path = store.namespaces[&id].path(leaf).unwrap();
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                leaf,
+                None,
+                [0; 16],
+                1,
+                true,
+                Location {
+                    origin: Origin::Local,
+                    remote: None,
+                    header: leaf_header,
+                    memory: None,
+                    disk: Some(Arc::new(DiskExtent::new(leaf_path))),
+                    durable: true,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes: 8 << 20,
+                },
+            )
+            .unwrap();
+        store.charged = budget - 1024;
+        let target = Key {
+            consumed_tokens: 128,
+            digest: [24; 16],
+        };
+        insert_node(&mut store, id, &value, target, None, 2);
+        make_remote(&mut store, id, target, true);
+        let extent = fetched_extent(&mut store, &value, target, None, 2);
+        store.adopt_remote(id, target, extent, true).unwrap();
+        assert!(
+            store.namespaces[&id].tree.node(&leaf).is_none(),
+            "make_room evicted the durable leaf"
+        );
+        assert!(
+            store.namespaces[&id]
+                .tree
+                .node(&target)
+                .unwrap()
+                .location
+                .memory
+                .is_some(),
+            "the adopted record is resident"
+        );
+
+        // With the only candidate pinned, adoption reports no room instead of panicking.
+        let pinned = Key {
+            consumed_tokens: 192,
+            digest: [25; 16],
+        };
+        let pinned_header = Header::new(&value, pinned, None, [0; 16], 3).unwrap();
+        let pinned_path = store.namespaces[&id].path(pinned).unwrap();
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                pinned,
+                None,
+                [0; 16],
+                3,
+                true,
+                Location {
+                    origin: Origin::Local,
+                    remote: None,
+                    header: pinned_header,
+                    memory: None,
+                    disk: Some(Arc::new(DiskExtent::new(pinned_path))),
+                    durable: true,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes: 8 << 20,
+                },
+            )
+            .unwrap();
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .pin(&pinned)
+            .unwrap();
+        store.charged = budget - 1024;
+        let blocked = Key {
+            consumed_tokens: 256,
+            digest: [26; 16],
+        };
+        insert_node(&mut store, id, &value, blocked, None, 4);
+        make_remote(&mut store, id, blocked, true);
+        let extent = fetched_extent(&mut store, &value, blocked, None, 4);
+        assert!(
+            store.adopt_remote(id, blocked, extent, true).is_err(),
+            "a pinned candidate leaves no room for the adoption"
+        );
+        assert!(
+            store.namespaces[&id]
+                .tree
+                .node(&blocked)
+                .unwrap()
+                .location
+                .memory
+                .is_none(),
+            "a failed adoption installs nothing"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_purge_waits_for_the_write_back_before_a_replacement_put() {
+        let (mut store, base, directory) = store_with_delayed_disk("purge-writeback");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [27; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let extent = Arc::new(
+            store
+                .memory
+                .allocate(header.length_with_row() as usize)
+                .unwrap(),
+        );
+        let bytes = record_charge(&header, true);
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                key,
+                None,
+                [0; 16],
+                1,
+                true,
+                Location {
+                    origin: Origin::Local,
+                    remote: None,
+                    header,
+                    memory: Some(extent),
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes,
+                },
+            )
+            .unwrap();
+        store.pump();
+        assert!(!store.jobs.is_empty(), "the write-back is still in flight");
+        store.purge_namespace(id);
+        assert!(
+            store.namespaces[&id].purging,
+            "a purge waits for the in-flight write-back"
+        );
+        let mut events = put_begin(&mut store, 1, id, key, None);
+        match events.try_recv().unwrap().unwrap() {
+            PutAnswer::Refused(refused) => assert_eq!(
+                refused.reason,
+                proto::Reason::Queue as u8,
+                "a replacement Put is queued until the drain ends"
+            ),
+            _ => panic!("expected a queued refusal"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.namespaces[&id].purging {
+            assert!(Instant::now() < deadline, "the purge never drained");
+            store.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut events = put_begin(&mut store, 1, id, key, None);
+        assert!(
+            matches!(events.try_recv().unwrap().unwrap(), PutAnswer::Accept(_)),
+            "the replacement Put is accepted after the drain"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_remote_plan_fetches_only_missing_records() {
+        let (mut store, directory) = store("plan-missing");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let first = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let middle = Key {
+            consumed_tokens: 128,
+            digest: [2; 16],
+        };
+        let last = Key {
+            consumed_tokens: 192,
+            digest: [3; 16],
+        };
+        insert_node(&mut store, id, &value, first, None, 1);
+        insert_node(&mut store, id, &value, middle, Some(first), 1);
+        insert_node(&mut store, id, &value, last, Some(middle), 1);
+        // The first record is local; the others exist only in the merged catalog.
+        let header = store.namespaces[&id].tree[&first].location.header.clone();
+        let extent = Arc::new(store.memory.allocate(header.length(true) as usize).unwrap());
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&first)
+            .unwrap()
+            .location
+            .memory = Some(extent);
+        for key in [middle, last] {
+            let node = store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&key)
+                .unwrap();
+            node.location.origin = Origin::Peer;
+            node.location.remote = Some(RemoteSource {
+                node: "upstream".into(),
+                bytes: 8192,
+                row: true,
+            });
+        }
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::RemotePlan {
+            namespace: id,
+            chain: vec![first, middle, last],
+            reply,
+        });
+        store.pump();
+        let plan = answer
+            .try_recv()
+            .expect("the store answered the plan")
+            .expect("a plan result")
+            .expect("a plan");
+        assert_eq!(plan.root, first, "placement uses the chain root");
+        let keys: Vec<Key> = plan.records.iter().map(|record| record.key).collect();
+        assert_eq!(
+            keys,
+            vec![middle, last],
+            "the suffix starts at the first miss"
+        );
+        assert!(!plan.records[0].endpoint);
+        assert!(plan.records[1].endpoint);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_page_only_endpoint_is_fetched_for_its_row() {
+        let (mut store, directory) = store("plan-row");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let first = Key {
+            consumed_tokens: 64,
+            digest: [4; 16],
+        };
+        let last = Key {
+            consumed_tokens: 128,
+            digest: [5; 16],
+        };
+        insert_node(&mut store, id, &value, first, None, 1);
+        insert_node(&mut store, id, &value, last, Some(first), 1);
+        for key in [first, last] {
+            let header = store.namespaces[&id].tree[&key].location.header.clone();
+            let extent = Arc::new(store.memory.allocate(header.length(true) as usize).unwrap());
+            store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&key)
+                .unwrap()
+                .location
+                .memory = Some(extent);
+        }
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&last)
+            .unwrap()
+            .row = false;
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&last)
+            .unwrap()
+            .location
+            .remote = Some(RemoteSource {
+            node: "upstream".into(),
+            bytes: 8192,
+            row: true,
+        });
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        store.handle(StoreCommand::RemotePlan {
+            namespace: id,
+            chain: vec![first, last],
+            reply,
+        });
+        store.pump();
+        let plan = answer
+            .try_recv()
+            .expect("the store answered the plan")
+            .expect("a plan result")
+            .expect("a plan");
+        let keys: Vec<Key> = plan.records.iter().map(|record| record.key).collect();
+        assert_eq!(
+            keys,
+            vec![last],
+            "a page-only endpoint is refetched although its pages are local"
+        );
+        assert!(plan.records[0].endpoint);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_get_without_a_row_is_refused() {
+        let (mut store, directory) = store("get-row");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [7; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        let refused = store.plan_get(
+            id,
+            &GetRequest {
+                namespace: id,
+                keys: vec![key],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: false,
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "the Get contract requires the endpoint row"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    fn put_begin(
+        store: &mut Store,
+        connection: u64,
+        id: NamespaceId,
+        key: Key,
+        parent: Option<Key>,
+    ) -> tokio::sync::mpsc::Receiver<Result<PutAnswer>> {
+        let value = store.namespaces[&id].descriptor.clone();
+        let (events, receiver) = tokio::sync::mpsc::channel(4);
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        let chain_pages = u32::try_from(
+            key.consumed_tokens / value.page_tokens
+                - parent.map_or(0, |parent| parent.consumed_tokens / value.page_tokens),
+        )
+        .unwrap();
+        store.handle(StoreCommand::PutBegin {
+            connection,
+            transfer: 1,
+            generation: store.sessions[&connection].generation,
+            namespace: id,
+            descriptor: value,
+            key,
+            published_parent: parent,
+            bucket: [0; 16],
+            chain_pages: u32::try_from(key.consumed_tokens / 64).unwrap(),
+            published_tail_pages: chain_pages,
+            row: true,
+            events,
+            reply,
+        });
+        store.pump();
+        receiver
+    }
+
+    #[test]
+    fn a_purge_closes_the_namespace_until_its_disk_drains() {
+        let (mut store, directory, _root) = store_with_root("purge-drain", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [10; 16],
+        };
+        insert_node(&mut store, id, &value, key, None, 1);
+        let path = store.namespaces[&id].path(key).unwrap();
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&key)
+            .unwrap()
+            .location
+            .disk = Some(Arc::new(DiskExtent::new(path)));
+        store.purge_namespace(id);
+        assert!(
+            store.namespaces[&id].purging,
+            "a purge with disk extents must close the namespace"
+        );
+        let next = Key {
+            consumed_tokens: 128,
+            digest: [11; 16],
+        };
+        let mut events = put_begin(&mut store, 1, id, next, None);
+        match events.try_recv().unwrap().unwrap() {
+            PutAnswer::Refused(refused) => assert_eq!(
+                refused.reason,
+                proto::Reason::Queue as u8,
+                "a draining purge must queue new Puts"
+            ),
+            _ => panic!("expected a queued refusal"),
+        }
+        // The retired extent is released on the next cleanup turn.
+        store.pump();
+        assert!(!store.namespaces[&id].purging, "the drain completed");
+        let mut events = put_begin(&mut store, 1, id, next, None);
+        assert!(
+            matches!(events.try_recv().unwrap().unwrap(), PutAnswer::Accept(_)),
+            "the namespace accepts Puts again after the drain"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_stale_disk_write_does_not_attach_to_a_replacement() {
+        let (mut store, directory, _root) = store_with_root("stale-write", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [12; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let extent = Arc::new(
+            store
+                .memory
+                .allocate(header.length_with_row() as usize)
+                .unwrap(),
+        );
+        let bytes = record_charge(&header, true);
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                key,
+                None,
+                [0; 16],
+                1,
+                true,
+                Location {
+                    origin: Origin::Local,
+                    remote: None,
+                    header,
+                    memory: Some(extent),
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes,
+                },
+            )
+            .unwrap();
+        store.pump();
+        let job = store.namespaces[&id]
+            .tree
+            .node(&key)
+            .unwrap()
+            .location
+            .job
+            .expect("the write-back was submitted");
+        // Pretend the record these bytes belong to was replaced while the write drained.
+        let replacement = job + 1000;
+        {
+            let location = &mut store.namespaces.get_mut(&id).unwrap().tree[&key].location;
+            location.job = Some(replacement);
+            location.writing = true;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.jobs.contains_key(&job) {
+            assert!(Instant::now() < deadline, "the disk write never completed");
+            store.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let location = &store.namespaces[&id].tree[&key].location;
+        assert!(
+            location.disk.is_none(),
+            "a stale write attached its file to the replacement record"
+        );
+        assert_eq!(location.job, Some(replacement));
+        assert!(location.writing, "a stale completion cleared the new write");
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_committed_put_and_a_detached_put_hold_their_reservation() {
+        let (mut store, directory) = store("quota-unfinished");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [13; 16],
+        };
+        let _events = put_begin(&mut store, 1, id, key, None);
+        assert!(
+            store.pending_reserved(id) > 0,
+            "an accepted Put is reserved"
+        );
+        // A committed streaming Put is still unpublished while its disk write drains.
+        {
+            let open = store.sessions.get_mut(&1).unwrap().ops.get_mut(&1).unwrap();
+            let Operation::Put(put) = &mut open.operation else {
+                panic!("expected a Put");
+            };
+            put.committed = true;
+        }
+        assert!(
+            store.pending_reserved(id) > 0,
+            "a committed-but-unpublished Put still holds its reservation"
+        );
+        // Detached Puts keep their reservation until they settle too.
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let epoch = store.namespaces[&id].epoch;
+        let detached = Put {
+            namespace: id,
+            epoch,
+            remote: false,
+            header,
+            first_page: 0,
+            grants: Vec::new(),
+            windows: FilledWindows {
+                granted: HashMap::new(),
+                next: 0,
+                pages: vec![None; 1],
+                row: None,
+                pages_filled: 0,
+                row_filled: true,
+            },
+            memory: None,
+            temporary: None,
+            streaming: false,
+            commit_bytes: Vec::new(),
+            metadata: None,
+            committed: true,
+            finalizing: false,
+            cancelled: false,
+            terminal: false,
+            finished: false,
+            pending: 1,
+            blocked: VecDeque::new(),
+            pins: VecDeque::new(),
+            reservation: 4096,
+            requirement: PutRequirement::arena(0),
+            staging_hold: None,
+            hold_unit: 0,
+            hold_slots: [None, None],
+            events,
+            outbox: VecDeque::new(),
+        };
+        store.detached_puts.insert((2, 2), detached);
+        let with_detached = store.pending_reserved(id);
+        store.detached_puts.remove(&(2, 2));
+        assert_eq!(
+            with_detached - store.pending_reserved(id),
+            4096,
+            "a detached Put holds its reservation"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_removed_remote_child_is_not_resurrected() {
+        let (mut store, directory) = store("deferred-removed");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let parent = Key {
+            consumed_tokens: 64,
+            digest: [14; 16],
+        };
+        let child = Key {
+            consumed_tokens: 128,
+            digest: [15; 16],
+        };
+        let entry = |key, parent: Option<Key>, tail: u64| proto::CatalogEntry {
+            key: Some(crate::control::key_to_proto(&key)),
+            parent: parent.map(|parent| crate::control::key_to_proto(&parent)),
+            has_parent: parent.is_some(),
+            bucket: vec![0; 16],
+            tail_pages: tail,
+            row: true,
+            tier: proto::Tier::Nvme as i32,
+            durable: false,
+            bytes: 8192,
+            unreadable: false,
+        };
+        let send = |store: &mut Store, sequence, event| {
+            store.handle(StoreCommand::Peer(PeerEvent::Catalog {
+                node: "upstream".into(),
+                namespace: id,
+                event: proto::CatalogEvent {
+                    sequence,
+                    event: Some(event),
+                },
+            }));
+            store.pump();
+        };
+        use proto::catalog_event::Event;
+        send(&mut store, 1, Event::Added(entry(child, Some(parent), 1)));
+        assert!(
+            store.namespaces[&id].tree.node(&child).is_none(),
+            "the child waits for its parent"
+        );
+        send(
+            &mut store,
+            2,
+            Event::Removed(crate::control::key_to_proto(&child)),
+        );
+        send(&mut store, 3, Event::Added(entry(parent, None, 1)));
+        assert!(
+            store.namespaces[&id].tree.node(&child).is_none(),
+            "a removed child must not be resurrected by a later parent"
+        );
+        assert!(store.namespaces[&id].tree.node(&parent).is_some());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn releasing_a_fetched_copy_returns_its_charge() {
+        let (mut store, directory) = store("release-fetch");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [8; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let extent = Arc::new(
+            store
+                .memory
+                .allocate(header.length_with_row() as usize)
+                .unwrap(),
+        );
+        let bytes = record_charge(&header, true);
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                key,
+                None,
+                [0; 16],
+                1,
+                true,
+                Location {
+                    origin: Origin::Peer,
+                    remote: Some(RemoteSource {
+                        node: "upstream".into(),
+                        bytes: 4096,
+                        row: true,
+                    }),
+                    header,
+                    memory: Some(extent),
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes,
+                },
+            )
+            .unwrap();
+        store.charged = bytes;
+        store.release_fetched(id, key);
+        assert_eq!(store.charged, 0);
+        let node = store.namespaces[&id].tree.node(&key).unwrap();
+        assert!(node.location.memory.is_none());
+        assert_eq!(node.location.bytes, 4096);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_draining_or_opposite_transfer_id_is_fenced() {
+        let (mut store, directory) = store("fence");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store.peer_hello(1, "near").unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [6; 16],
+        };
+        let (get_events, _get_receiver) = tokio::sync::mpsc::channel(4);
+        let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
+        let get = |store: &mut Store, transfer: u64| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            store.handle(StoreCommand::GetBegin {
+                connection: 1,
+                transfer,
+                generation: store.sessions[&1].generation,
+                namespace: id,
+                chain: vec![key],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+                events: get_events.clone(),
+                reply,
+            });
+            answer.blocking_recv().unwrap()
+        };
+        let put = |store: &mut Store, transfer: u64| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            store.handle(StoreCommand::PutBegin {
+                connection: 1,
+                transfer,
+                generation: store.sessions[&1].generation,
+                namespace: id,
+                descriptor: value.clone(),
+                key,
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 1,
+                published_tail_pages: 1,
+                row: true,
+                events: put_events.clone(),
+                reply,
+            });
+            answer.blocking_recv().unwrap()
+        };
+        assert!(get(&mut store, 7).is_ok());
+        // The opposite direction is fenced while the Get is pending.
+        assert!(put(&mut store, 7).is_err());
+        // A draining Get keeps its id reserved until the disk copy drains.
+        store.retired_gets.push(GetDrain {
+            connection: 1,
+            transfer: 8,
+            namespace: id,
+            pins: VecDeque::new(),
+            pending: 1,
+        });
+        assert!(get(&mut store, 8).is_err());
+        assert!(put(&mut store, 8).is_err());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn one_connection_can_subscribe_two_namespaces() {
+        let (mut store, directory) = store("multi-sub");
+        let first = descriptor();
+        let mut second = descriptor();
+        second.tenant = "tenant-b".to_string();
+        store.peer_hello(1, "near").unwrap();
+        let generation = store.sessions[&1].generation;
+        let (sender_a, mut receiver_a) = tokio::sync::mpsc::channel(8);
+        store
+            .subscribe(1, first.namespace_id(), generation, first.clone(), sender_a)
+            .unwrap();
+        let (sender_b, mut receiver_b) = tokio::sync::mpsc::channel(8);
+        store
+            .subscribe(
+                1,
+                second.namespace_id(),
+                generation,
+                second.clone(),
+                sender_b,
+            )
+            .unwrap();
+        assert_eq!(store.subscriptions.len(), 2);
+        for receiver in [&mut receiver_a, &mut receiver_b] {
+            loop {
+                store.pump_subscriptions();
+                match receiver.try_recv() {
+                    Ok(event)
+                        if matches!(
+                            event.event,
+                            Some(proto::catalog_event::Event::SnapshotEnd(_))
+                        ) =>
+                    {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [5; 16],
+        };
+        insert_node(&mut store, first.namespace_id(), &first, key, None, 1);
+        store.delta(first.namespace_id(), 0, key);
+        store.flush_events();
+        store.pump_subscriptions();
+        assert!(
+            receiver_a.try_recv().is_ok(),
+            "the subscribed namespace sees it"
+        );
+        assert!(
+            receiver_b.try_recv().is_err(),
+            "another namespace must not receive it"
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_reused_get_transfer_id_is_refused() {
+        let (mut store, directory) = store("dup");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store.peer_hello(1, "near").unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [4; 16],
+        };
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let begin = |store: &mut Store| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            store.handle(StoreCommand::GetBegin {
+                connection: 1,
+                transfer: 7,
+                generation: store.sessions[&1].generation,
+                namespace: id,
+                chain: vec![key],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+                events: events.clone(),
+                reply,
+            });
+            answer.blocking_recv().unwrap()
+        };
+        assert!(begin(&mut store).is_ok());
+        assert!(begin(&mut store).is_err());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_dropped_forward_releases_its_pins() {
+        let (mut store, directory) = store("forward-drop");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [3; 16],
+        };
+        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let extent = Arc::new(
+            store
+                .memory
+                .allocate(header.length_with_row() as usize)
+                .unwrap(),
+        );
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                key,
+                None,
+                [0; 16],
+                1,
+                true,
+                Location {
+                    origin: Origin::Local,
+                    remote: None,
+                    header,
+                    memory: Some(extent),
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    job: None,
+                    rewrite: false,
+                    retry: Instant::now(),
+                    bytes: 4096,
+                },
+            )
+            .unwrap();
+        let job = store.prepare_forward(id, key).unwrap();
+        assert!(store.namespaces[&id].tree.node(&key).unwrap().pinned());
+        store.forward_dropped(id, key);
+        assert!(!store.namespaces[&id].tree.node(&key).unwrap().pinned());
+        drop(job);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_remote_catalog_snapshot_merges_and_removes_sources() {
+        let (mut store, directory) = store("catalog");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [7; 16],
+        };
+        let entry = proto::CatalogEntry {
+            key: Some(crate::control::key_to_proto(&key)),
+            parent: None,
+            has_parent: false,
+            bucket: vec![0; 16],
+            tail_pages: 1,
+            row: true,
+            tier: proto::Tier::Dram as i32,
+            durable: false,
+            bytes: 8192,
+            unreadable: false,
+        };
+        let event = |sequence, body| proto::CatalogEvent {
+            sequence,
+            event: Some(body),
+        };
+        use proto::catalog_event::Event;
+        for event in [
+            event(1, Event::SnapshotBegin(proto::SnapshotBegin { seq0: 0 })),
+            event(2, Event::Entry(entry)),
+            event(3, Event::SnapshotEnd(proto::SnapshotEnd {})),
+        ] {
+            store.handle(StoreCommand::Peer(PeerEvent::Catalog {
+                node: "upstream".into(),
+                namespace: id,
+                event,
+            }));
+        }
+        let node = store.namespaces[&id].tree.node(&key).unwrap();
+        assert_eq!(node.location.remote.as_ref().unwrap().node, "upstream");
+        let records = store.chain_records(id, &[key]);
+        assert!(records[0].remote && !records[0].local);
+        store.handle(StoreCommand::Peer(PeerEvent::Catalog {
+            node: "upstream".into(),
+            namespace: id,
+            event: event(4, Event::Removed(crate::control::key_to_proto(&key))),
+        }));
+        assert!(store.namespaces[&id].tree.node(&key).is_none());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn admin_pins_protect_ancestors_and_quota_evicts_leaves() {
+        let (mut store, directory) = store("quota");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let root = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let child = Key {
+            consumed_tokens: 128,
+            digest: [2; 16],
+        };
+        let insert = |store: &mut Store, key: Key, parent: Option<Key>, tail: u32| -> u64 {
+            let header = Header::new(&value, key, parent, [0; 16], tail).unwrap();
+            let bytes = record_charge(&header, true);
+            let extent = Arc::new(
+                store
+                    .memory
+                    .allocate(header.length_with_row() as usize)
+                    .unwrap(),
+            );
+            store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .insert(
+                    key,
+                    parent,
+                    [0; 16],
+                    tail as usize,
+                    true,
+                    Location {
+                        origin: Origin::Local,
+                        remote: None,
+                        header,
+                        memory: Some(extent),
+                        disk: None,
+                        durable: false,
+                        writing: false,
+                        job: None,
+                        rewrite: false,
+                        retry: Instant::now(),
+                        bytes,
+                    },
+                )
+                .unwrap();
+            store.charged += bytes;
+            bytes
+        };
+        let root_bytes = insert(&mut store, root, None, 1);
+        insert(&mut store, child, Some(root), 1);
+        let pin = |store: &mut Store, key: Key, pin: bool| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            store.handle(StoreCommand::Admin(AdminCommand::Pin {
+                namespace: id.to_vec(),
+                keys: vec![key],
+                pin,
+                reply,
+            }));
+            answer.blocking_recv().unwrap().unwrap()
+        };
+        let quota = |store: &mut Store, nvme: u64| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            store.handle(StoreCommand::Admin(AdminCommand::SetQuota {
+                namespace: id.to_vec(),
+                dram: 0,
+                nvme,
+                reply,
+            }));
+            answer.blocking_recv().unwrap().unwrap()
+        };
+        // The child and its ancestor both change protection.
+        assert_eq!(pin(&mut store, child, true), 2);
+        assert!(store.namespaces[&id].tree.node(&root).unwrap().pinned());
+        assert_eq!(pin(&mut store, child, false), 2);
+        assert!(!store.namespaces[&id].tree.node(&root).unwrap().pinned());
+        // A quota at one record's size evicts the only eligible leaf.
+        assert_eq!(quota(&mut store, root_bytes), 0);
+        assert!(store.namespaces[&id].tree.node(&child).is_none());
+        assert!(store.namespace_charge(id, false) <= root_bytes);
+        // A pinned record cannot be evicted, so the excess is reported.
+        assert_eq!(pin(&mut store, root, true), 1);
+        assert_eq!(quota(&mut store, 1), root_bytes - 1);
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }

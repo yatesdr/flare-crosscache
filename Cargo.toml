@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.87"
 
+[features]
+default = []
+rdma = ["dep:ibverbs-sys"]
+
 [dependencies]
 blake2 = "0.10"
+ibverbs-sys = { version = "0.3.2", optional = true }
 libc = "0.2"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +27,7 @@ prost-build = "0.14"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+rcgen = { version = "0.14", features = ["pem"] }
 sha2 = "0.10"
 hyper-util = { version = "0.1", features = ["tokio"] }
 

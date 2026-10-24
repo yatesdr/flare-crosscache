@@ -1,0 +1,64 @@
+# S2 near tier: one host with replicas and a small local manager that forwards to
+# the storage node in compose-s2-storage.yaml. The local manager has no --root,
+# so it is DRAM-only; oversized records stream through staging to the peer.
+#
+# TLS material (mounted read-only at /tls):
+#   ca.pem, client.pem, client-key.pem
+# The storage node must be reachable as `storage` on the compose network.
+services:
+  near:
+    image: ${MANAGER_IMAGE:-selene:local}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    command:
+      - --name
+      - near
+      - --memory
+      - 4G
+      - --staging
+      - 512M
+      - --upstream
+      - storage=storage:9200
+      - --peer-transport
+      - auto
+      - --tls-cert
+      - /tls/client.pem
+      - --tls-key
+      - /tls/client-key.pem
+      - --tls-ca
+      - /tls/ca.pem
+      - --metrics
+      - 0.0.0.0:9108
+    volumes:
+      - /run/selene:/run/selene
+      - /dev/shm/selene:/dev/shm/selene
+      - ./tls:/tls:ro
+    networks:
+      - pool
+    restart: unless-stopped
+
+  replica:
+    image: ${FLARE_IMAGE:-flare:latest}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    depends_on:
+      - near
+    command: ["run", "${FLARE_PACKAGE}", "--prefix-cache-manager", "/run/selene/near.sock"]
+    environment:
+      FLARE_ARGS: ${FLARE_ARGS:---gpus 0}
+    volumes:
+      - /run/selene:/run/selene
+      - /dev/shm/selene:/dev/shm/selene
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    networks:
+      - pool
+    restart: unless-stopped
+
+networks:
+  pool:
+    external: true
+    name: ${POOL_NETWORK:-flare-pool}

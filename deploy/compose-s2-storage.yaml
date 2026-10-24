@@ -1,0 +1,40 @@
+# S2 storage node: holds the pool and serves PeerCache over mTLS.
+#
+# TLS material (mounted read-only at /tls):
+#   ca.pem, server.pem, server-key.pem
+# The near manager in compose-s2-near.yaml is the only peer client.
+services:
+  storage:
+    image: ${MANAGER_IMAGE:-selene:local}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    command:
+      - --name
+      - pool
+      - --root
+      - /nvme/flare-cache
+      - --memory
+      - 16G
+      - --nvme
+      - 1T
+      - --staging
+      - 1G
+      - --listen-peer
+      - 0.0.0.0:9200
+      - --listen-data
+      - 0.0.0.0:9201
+      - --tls-cert
+      - /tls/server.pem
+      - --tls-key
+      - /tls/server-key.pem
+      - --tls-ca
+      - /tls/ca.pem
+      - --metrics
+      - 0.0.0.0:9108
+    volumes:
+      - /nvme/flare-cache:/nvme/flare-cache
+      - ./tls:/tls:ro
+    expose:
+      - "9200"
+      - "9201"
+      - "9108"
+    restart: unless-stopped
