@@ -1,353 +1,199 @@
-# Flare cache manager protocol, version 1
+# Selene cache manager protocol, version 1
 
-This document defines the complete manager/client contract. All integers are
-unsigned little-endian. Fields are packed, with no implicit alignment. A byte
-array has exactly the stated length. `text` is a `u32` byte length followed by
-UTF-8. A `key` is `u64 consumed_tokens, digest[16]`. An optional key is a `u8`
-presence flag (0 or 1), followed by a key only when present. No other boolean
-encoding is valid. Unsupported versions are rejected; changes to these layouts
-or semantics require a new protocol version.
+This document is the operating contract between Flare replicas and the selene
+cache manager. [proto/selene.proto](proto/selene.proto) is normative for field
+numbers and message layouts; this document defines the services that are served,
+the stream flows, the shared-memory window model, checksums and client
+obligations. `selene` serves `LocalCache` only. `Locate` is declared and returns
+`UNIMPLEMENTED`, and the `PeerCache` (remote tier) and `Admin` services are
+declared but not served.
 
-## Connection and framing
+## Transport and sessions
 
-Use one Linux Unix stream socket per replica. The manager checks `SO_PEERCRED`:
-both effective uid and effective gid must match. Hello's pid must equal the peer
-pid. Run containers in the same PID namespace as their clients when sharing the
-socket. The socket directory is mode 0770; the socket is 0660. There is no TCP
-cache transport. `--metrics` is a separate HTTP endpoint.
+Clients connect over a gRPC channel on the manager's Unix socket. The manager
+takes the peer pid from `SO_PEERCRED` and requires the peer's effective uid and
+gid to match its own; run replicas and manager under the same identity and, in
+containers, in the same PID namespace.
 
-Every frame is:
+`Hello` is the first call on a connection. It registers the namespace described
+by the request (creating it on first use), returns the shared-memory region
+files and the negotiated limits, and assigns a `generation`. Every other RPC
+carries that generation in the `x-selene-generation` metadata; a superseded
+generation fails with `ABORTED`, and a missing or unknown one with
+`UNAUTHENTICATED`. A new `Hello` on the same connection supersedes the previous
+generation, fencing replies from older operations.
 
-| Field | Bytes | Meaning |
-|---|---:|---|
-| length | 4 | Number of subsequent bytes; excludes this field |
-| tag | 1 | Numeric tag below |
-| generation | 8 | Connection generation |
-| op | 8 | Operation number |
-| payload | length − 17 | Tag-specific fields |
+`Hello` fails with `FAILED_PRECONDITION` when the request's `protocol` is not 1.
+The negotiated limits are:
 
-`17 <= length <= 4,194,368` (4 MiB + 64). Data bytes in a single Data or Commit
-frame are at most 4,194,304. Short frames, invalid lengths and malformed requests
-close the connection. A malformed payload belonging to an accepted Put instead
-finishes that operation with `Stored{Err}`. There is no padding in framing.
-
-The client assigns increasing op numbers, starting at 1, across Hello, Put, Get,
-and Resync. Continuation frames reuse their operation's number. Zero is invalid;
-there are no sentinel operation numbers. Op numbers must not wrap. The manager
-assigns the generation in Welcome using a random boot nonce XOR an increasing
-connection counter. Every u64 generation, including zero, is valid. Hello's
-header generation is ignored; Welcome and Reject correlate by Hello's op.
-After Welcome, both peers use its header generation for every frame. Clients
-ignore previous generations. The manager drops and counts a wrong generation,
-a continuation of an unknown/finished/cancelled op, a repeated new op number,
-or an unknown tag. New operations must have a greater op than every earlier
-new operation on the connection; rejected Put/Get requests also consume numbers.
-
-Hello opens a connection control operation. Snapshot, Entry, SnapshotEnd, Delta
-and Room use its op. Resync replaces that control operation with its own op.
-The control operation lasts until Resync or EOF; data operations have independent
-lifetimes. No Ping, Pong, Stats, or acknowledgements of notifications exist.
-
-The manager admits at most 64 connections, with four open Puts and four open Gets
-per connection. Reader channels hold one frame, writer channels eight commands,
-and namespace disk queues eight tasks. Slow or overflowing writers disconnect;
-clients discard their mirrors and reconnect. Each state-loop pass handles at
-most one incoming frame per connection in round-robin order. Dead-client pin
-cleanup releases at most 16 records per pass across all dead clients.
-
-## Namespace descriptor
-
-A descriptor encodes these fields in order:
-
-| Field | Encoding |
+| Limit | Value |
 |---|---|
-| identity | 32 bytes, full model/offload identity |
-| fingerprint | 16 bytes, layout fingerprint including rank count/order |
-| page_tokens | u64, nonzero |
-| rank_count | u32, nonzero |
-| ranks | rank_count rank entries |
-| page_record_bytes | u64 |
-| row_record_bytes | u64 |
+| Concurrent connections | 64 |
+| Open operations per direction per connection | 4 |
+| Unfilled or unreleased windows per direction | 2 credits, each up to 64 pages and/or the row |
+| gRPC message cap | 16 MiB (payload never travels in messages) |
+| Largest page window | negotiated in `HelloReply.max_window_bytes` (4 MiB) |
+| Chain length per request | 65,536 nodes |
+| No-progress deadline | 3 s |
 
-A rank entry is `u32 plane_count`, that many nonzero `u64 plane_unit_bytes`,
-then nonzero `u64 row_unit_bytes`. Ranks and planes preserve logical geometry
-order. Each unit occupies `ceil(unit_bytes / 4096) * 4096` bytes, including its
-padding. A page record is page-major, then rank-major, then plane-major. A row
-record is rank-major. The descriptor's last two fields must equal the sums of
-the corresponding padded units. Sizes and derived offsets must not overflow
-u64, and all rank entries must fit in the Flare header defined below.
+A stream that makes no progress for 3 s is failed with `DEADLINE_EXCEEDED`;
+replicas treat that as a session failure and rebuild the channel and `Hello`
+with backoff.
 
-The namespace directory is the lowercase hex of the 32-byte namespace id:
-BLAKE2b-256 over `selene-ns-v1`, the full identity, the full fingerprint, the
-tenant length byte and the tenant. The full descriptor is persisted and compared
-alongside the name, so directory-name collisions are rejected. A namespace with
-different sizes, full identity, fingerprint, tenant, or page_tokens cannot join
-an existing descriptor. Different TP widths use different namespaces.
+## Namespace and tenant identity
 
-## Message layouts
+A `Descriptor` names one model package and storage geometry: the 32-byte
+identity, the 16-byte layout fingerprint, the tenant, the page size in tokens
+and the rank/plane layout with each record's page and row bytes. The namespace
+id is BLAKE2b-256 over `selene-ns-v1`, the identity, the fingerprint, the tenant
+length byte and the tenant.
 
-An empty payload has zero bytes. `result` is `u8 status`: 0 means success with
-no further bytes; 1 means failure followed by `text reason`. Reasons are diagnostic
-strings, not stable enumerations. Receivers must not infer retry policy from text.
+The same descriptor is passed to `Hello`, `Subscribe` and `PutBegin` and must
+match every time; a mismatch fails the call (`FAILED_PRECONDITION` or
+`INVALID_ARGUMENT`, depending on the RPC). Different identities, tenants or
+layout fingerprints — including different TP widths — are different namespaces
+and never share records. A descriptor with different geometry under the same
+namespace id is refused rather than mixed. `HelloReply.namespace_id` is the
+32-byte id clients must use in later requests.
 
-| Tag | Direction | Name | Payload in order |
-|---:|---|---|---|
-| 1 | C→M | Hello | u32 protocol_version, text replica_name, u32 pid, descriptor |
-| 2 | M→C | Welcome | u32 version, u32 max_frame, u32 open_puts, u32 open_gets, u32 window_pages, u32 outbound_credits, u32 inbound_credits, u32 deadline_ms |
-| 3 | M→C | Reject | text reason |
-| 4 | M→C | Snapshot | u64 seq, u64 entry_count |
-| 5 | M→C | Entry | entry, defined below |
-| 6 | M→C | SnapshotEnd | u64 seq |
-| 7 | M→C | Delta | u64 seq, u8 kind, entry for Added/Changed or key for Removed |
-| 8 | M→C | Room | empty |
-| 9 | C→M | Put | key, optional published_parent, bucket[16], u32 chain_pages, u32 tail_pages, u64 page_record_bytes, u64 row_record_bytes |
-| 10 | M→C | Accept | u32 first_page, optional selected_parent |
-| 11 | M→C | Present | empty |
-| 12 | M→C | Retry | u8 reason: 0 Queue, 1 Budget, 2 Inflight |
-| 13 | M→C | Oversize | empty |
-| 14 | C→M | Window | u32 index, u32 pages, pages × u64 checksums |
-| 15 | C→M | Data | u64 record_offset, remaining payload bytes |
-| 15 | M→C | Data | u32 record_index, u64 record_offset, remaining payload bytes |
-| 16 | C→M | Row | u64 checksum |
-| 17 | C→M | Commit | u64 metadata_offset, remaining payload bytes |
-| 18 | M→C | Stored | result |
-| 19 | C→M | Get | u32 node_count, node_count × key, u32 skip_pages, u32 expected_pages, u8 row (must be 1) |
-| 20 | M→C | Done | result |
-| 21 | either | Cancel | empty; header op identifies the target operation |
-| 22 | C→M | Resync | u64 last_good_seq |
+## Shared-memory window model
 
-Welcome currently advertises version 1, max_frame 4,194,368, four Puts, four Gets,
-64 pages/window, two outbound and two inbound credits, and a 3000 ms deadline.
-Replica names contain 1–256 UTF-8 bytes. A Reject is sent before closing.
+`HelloReply` names two manager-owned files with their sizes: the retention
+arena and the staging region. Both sides map them `MAP_SHARED` at the returned
+paths. Payload never travels in gRPC messages; only metadata and checksums do.
 
-An entry is `key, optional parent, bucket[16], u32 tail_pages, u8 row,
-u8 tier, u8 durable, u64 bytes`. Tier 0 means DRAM, tier 1 means disk. A record
-may have both copies; tier reports DRAM when retained there. `durable` means the
-record and its entire ancestor chain have completed NVMe writes. `bytes` is the
-NVMe reservation including the 4096-byte manager envelope; compaction reduces
-it once the disk operation completes. Every entry is readable. Page-only
-ancestors have row=0 and contribute pages but are never lookup endpoints.
+A `WindowGrant` identifies one window as a region and byte range in
+`WindowRef{region, offset, length}`, plus the transfer id, the window ordinal
+(`index`, from 0 within the call) and the record-relative offset. A window
+length is a multiple of 4096 bytes, covers whole pages and/or the row, and never
+exceeds the negotiated maximum for page windows. `page_first` is the page index
+within the chain (the key's full page span), not the record; a row-only grant
+carries `page_first` 0 and `page_count` 0.
 
-Delta kind 0 is Added, 1 Changed, 2 Removed. Changed carries the complete current
-entry, including row/tier/durable/bytes, so it also covers a compacted endpoint's
-replacement. An Added parent precedes every Added child. Removed children precede
-Removed parents. Sequences increase by exactly one per namespace mutation.
+On `Put` the replica writes the payload into the granted range and then reports
+its checksums. On `Get` the manager writes the payload into the granted range
+and the replica copies it out before releasing the window. Neither side may
+read or write outside `[offset, offset + length)`, may assume the region persists
+across reconnects, or may keep a window after releasing it.
 
-## Snapshot and mirror
+## Put stream
 
-After Welcome, the manager queues a snapshot at a single state boundary seq₀.
-Exactly entry_count Entries follow, sorted by consumed count (parents first),
-then SnapshotEnd with seq₀. No mutation is interleaved into that snapshot.
-Subsequent Deltas start at seq₀+1, including mutations made while the writer
-was sending the snapshot. There is no replay log exposed to clients.
+`Put` is a bidirectional stream. The replica sends `PutBegin` with the key,
+`chain_pages`, the published parent and tail, the bucket, and the descriptor.
+The manager validates the geometry and the namespace, then answers with exactly
+one of:
 
-The client builds a fresh index off the worker thread and swaps it at
-SnapshotEnd. It applies at most 4096 queued delta entries per poll. A sequence
-gap, decode error, or receiver backlog above 65,536 entries clears the mirror
-and sends Resync with the last good sequence. Resync always produces a new full
-snapshot and establishes a new control op; the last_good_seq is diagnostic and
-does not request incremental replay. Ignore queued notifications from the old
-control op after replacing the mirror. An empty mirror produces misses. The
-manager confirms both Put deduplication and every Get independently of the mirror.
+- `Accept{transfer, first_page, parent, record_bytes}` — the selected parent
+  (which may differ from the published one) and the record length. The manager
+  then sends `WindowGrant` messages, at most two unfilled windows at a time.
+- `Refused{reason, detail}` with `PRESENT` when the record is already stored,
+  or a transient or terminal reason from the table below.
 
-## Put lifecycle
+For every accepted window the replica writes the bytes and sends
+`WindowFilled{transfer, index, page_xxh3[], row_xxh3, has_row}` with one 64-bit
+xxh3 per page the window carried and the row checksum when it carried the row.
+Once every granted window is filled, the replica sends `PutCommit` with the
+metadata fragments; concatenated in `metadata_offset` order they are exactly
+the 4096-byte `record::Header` followed by the padded checksum segment. The
+stream ends with `Stored{bytes}` (the record length) or `Refused`.
 
-`chain_pages == floor(key.consumed_tokens / page_tokens)`. The published parent,
-if present, has a lower consumed count; tail_pages equals the difference of their
-complete-page counts and never exceeds chain_pages. Without a parent, send the
-whole chain as tail_pages. Put's byte sizes equal the descriptor.
+`Present` is a successful deduplication: no bytes are transferred and the
+record is available. A replica may send `Cancel` before it has sent `Commit`;
+after `Commit` the operation runs to `Stored` or a refusal. A window's credit
+returns when its `WindowFilled` is accepted or when the operation ends.
 
-The manager answers once with Accept, Present, Retry, or Oversize. Present means
-an existing complete row endpoint; that op is finished. An open Put for the same
-namespace/key yields Retry{Inflight}, including cancelled disk work still draining.
-Queue limits yield Retry{Queue}. Budget admission, reservations and eviction
-happen before Accept. Oversize means the manager envelope plus the selected Flare
-record exceeds the NVMe byte limit; DRAM capacity alone never causes Oversize.
+## Get stream
 
-For a new key, a readable published parent with a row produces a child. Otherwise
-the manager selects a root holding the whole chain. For replacement of an existing
-page-only endpoint, its stored parent and page tail are preserved. `first_page`
-is the selected parent's complete-page count, or zero for a root. The client
-constructs its Header with the explicit selected_parent in Accept and
-`chain_pages - first_page` tail pages. The selected parent is necessary even
-when first_page is zero: a parent below one complete page is distinct from a
-root. It also disambiguates preserved replacement parents. This is a wire
-clarification of the design's shorthand `Accept{first_page}`.
-The manager pins the parent across Accept→Stored/Cancel. Replacement uses a new
-extent; old readers retain the original bytes/inode until their I/O ends.
+`Get` is a bidirectional stream. `GetBegin` names ascending chain nodes (at most
+65,536), the number of pages to skip from the front of the first record, the
+expected page count and whether the row is wanted. The manager pins the chain
+and answers `GetLeased{transfer, record_bytes[]}` — one record length per chain
+node — or `Refused`.
 
-Send windows in increasing page order. Window.index is the zero-based page index
-within the selected record's tail, not within the full published chain. Each
-window contains 1–64 pages; its checksums are xxh3-64 of each complete padded
-page record. The Data frames that follow cover exactly those pages, in file
-offset order, with no gaps, overlaps or extra bytes. All offsets and Data lengths
-are 4096-aligned; Data is nonempty. A page may span frames. Finish a window's
-Data before issuing the next Window. After all tail pages (including zero pages),
-send Row with xxh3-64 of the complete padded row, then its Data. No next window,
-row, or commit is valid while the current range is incomplete.
+For each record the manager sends one or more `RecordMeta` fragments (the
+`Header` then the padded checksum segment, concatenated by `metadata_offset`)
+with the source tier, then `WindowGrant` messages for the payload. After copying
+a window out, the replica must send `WindowReleased{transfer, index}`; that
+returns the credit and lets the manager reuse the window. `GetDone` arrives only
+after every record and window has been delivered and released. `Cancel` may be
+sent at any time.
 
-Finally send Commit fragments covering `[0, Header.page_segment)` in order:
-4096-byte encoded Header followed by its padded variable checksum segment.
-metadata_offset is relative to that metadata, begins at zero, and increases by
-the previous fragment's byte count. Fragments are nonempty, 4096-aligned and at
-most 4 MiB. The final fragment completes Commit; there is no separate end marker.
-Fragmentation permits checksum tables larger than the frame limit. No further
-Window, Row, or Data is allowed once Commit begins. The header's descriptor,
-key, selected parent, bucket, tail and offsets must agree with Accept; its row
-checksum must match Row; every checksum-table entry must match Window. Padding
-is included in checksums. Header/checksum padding should be zero.
+The replica validates the namespace, geometry, key, parent, metadata and every
+page and row checksum before using the restored bytes. A short stream, a stale
+key, a checksum failure, a deadline or a disconnect must fail the restore and
+fall back to recompute; a partially received record is never usable. Restores do
+not consume the durable budget: window traffic is bounded by the staging region.
 
-The manager verifies pages/row as Data lands. A mismatch, short committed stream,
-bad offset, invalid header or checksum table yields Stored{Err}, with no new
-publication. A valid DRAM record is published with Delta{Added/Changed} before
-Stored{Ok}, then written to NVMe asynchronously. A larger record streams through
-bounded staging into a temporary file and publishes once its disk write finishes.
-Streaming children wait for their parent's durable completion before disk Data
-writes. No child write can finish before its parent's write. Tier/durable changes
-are sent as Changed deltas.
+## Catalog subscription
 
-Stored{Ok} releases the client's publication pin. Present has the same successful
-outcome with zero transferred bytes. Retry or Cancel/disconnect maps to Deferred
-after the client's outstanding CUDA transfers drain; Oversize or Stored{Err}
-maps to an error. A record acknowledged in DRAM can be lost on manager death
-before it and its ancestor chain reach NVMe; clients do not wait for durability.
+`Subscribe{namespace_id, generation, descriptor}` opens the event stream for one
+connection and namespace. It begins with `SnapshotBegin{seq0}`, the current
+entries with parents before children, and `SnapshotEnd`, then carries live
+events. `sequence` increases by exactly one per event on that stream. `Added`
+introduces a node, `Changed` reports tier, durability, row or readability
+changes (never geometry), and `Removed` removes exactly one named node without
+cascading. `Room` is the connection's availability notification (below).
 
-After Retry{Budget}, the manager tracks the largest refused reservation for that
-connection. It sends one Room on the control op when freed/reclaimable capacity
-can admit that reservation, then clears the notification. A new Budget refusal
-can arm another Room. A retry may choose a different shape if its parent vanished.
-A steady Budget refusal is not client progress. Client progress advances only
-for snapshot application, Room, or freeing an open-op slot.
+A connection may have only one live subscription: a new `Subscribe` bumps the
+epoch and ends the previous stream. Events carry the generation and epoch of
+the subscription that produced them, so a replica discards events from a
+superseded subscription. A sequence gap, a decode error or an oversized backlog
+requires discarding the mirror and resubscribing; the mirror is rebuilt only
+from a new snapshot.
 
-## Get lifecycle and flow control
+## Budget, Room and refusal reasons
 
-Get names 1–65,536 ascending, consecutive chain nodes. Each node after the first
-must name its predecessor as parent. The first may have a parent outside the
-request. skip_pages cannot exceed the first node's tail. The sum of requested
-nodes' tail pages minus skip_pages must equal expected_pages. The last node must
-have a row. Missing keys, stale chain shape, or the Get concurrency limit yield
-Done{Err} without payload data. All chain nodes are pinned for the lease.
+A transient refusal is not a busy-wait signal. When a `Put` is refused
+`BUDGET`, the manager arms that connection's requirement, and later sends
+`Room{bytes}` on the connection's subscription once a retry can be admitted.
+The replica retries only after `Room` or another availability change; a steady
+`BUDGET` must produce no retry traffic.
 
-For each record in request order (record_index starts at zero), Data sends:
+| Reason | Meaning | Client action |
+|---|---|---|
+| `PRESENT` | The record is already stored. | Treat as success with zero transferred bytes. |
+| `INFLIGHT` | A duplicate operation for the same key is in flight. | Retry after it settles. |
+| `BUDGET` | The write budget or a capacity limit is exhausted. | Wait for `Room`; never spin. |
+| `QUEUE` | The connection's open-operation limit or an internal queue is full. | Retry after completions drain. |
+| `OVERSIZE` | The record can never be admitted in this configuration. | Report an error; retrying cannot succeed. |
+| `INVALID` | Malformed request, descriptor mismatch or geometry violation. | Fail the operation; do not retry. |
+| `IO` | A manager device operation failed. | Fail the operation and report the manager as unhealthy. |
+| `QUOTA`, `UNSPECIFIED` | Reserved; never produced by this manager. | Treat as a protocol error. |
 
-1. Its full Header and checksum segment, offsets `[0, page_segment)`.
-2. Its requested page range, skipping skip_pages only on the first record.
-3. The row only for the final record.
+## Checksums and durability
 
-Offsets refer to the Flare record, excluding the manager envelope. Skipped bytes
-are not sent. Each range is contiguous and ascending. Page Data is divided into
-windows of at most 64 pages from the first requested page in that record; a frame
-never crosses a window boundary or includes more than 4 MiB. Metadata and row
-also split into at most 4 MiB frames. Empty page ranges emit no page Data. Done{Ok}
-follows the final Data. Records remain pinned until completion/Cancel/EOF; their
-extents remain alive until the writer/disk reader's last reference disappears.
-NVMe reads refill DRAM when an arena extent is available; corrupt bytes are never
-retained by read-through.
+Every page and row carries a 64-bit xxh3 checksum supplied by the writer with
+`WindowFilled`. The manager verifies each window before accepting it, before
+committing a record and before serving it. On NVMe every record is stored behind
+a 4096-byte envelope with a CRC32 over the `Header` and padded checksum segment
+and a CRC32 over the envelope itself; recovery and reads verify both, and the
+manager removes detectably corrupt records rather than serving them.
 
-The client validates Header, namespace/key/parent, geometry, each requested page's
-xxh3 against its table, and the last row checksum before success. Done alone does
-not finish a fetch: all H2D replies must also have arrived. A short stream,
-mismatch, stale key, deadline or Done{Err} fails the fetch after H2D drain.
+A DRAM publication is acknowledged before it reaches NVMe, so a manager crash
+can lose recently acknowledged records whose ancestor chains are not yet
+durable. The replica must be prepared to republish; `Changed` events and the
+catalog snapshot are the only authority on what remains stored. Durable records
+survive manager restarts and are recovered into the disk tier.
 
-Credits are client-global across operations on this connection: two outbound
-and two inbound windows of at most 64 pages, plus one row slab per credit, for
-256 page slabs and four row slabs total. At most four operations per direction
-may be open; the client issues/consumes windows only against these credits and
-releases them after its corresponding D2H/send or H2D completion. Credits are
-local scheduling state, not extra wire messages. Stream backpressure bounds the
-manager writer while the client waits for an inbound credit. Never wait for a
-whole Get in staging before submitting H2D windows.
+## Client obligations
 
-## Cancellation and deadlines
+- Call `Hello` before any other RPC, keep the generation for the connection's
+  lifetime, and rebuild the session on `ABORTED` or a transport failure.
+- Map both region files after `Hello`, use only granted windows, and never
+  retain a window after `WindowReleased` or the end of its operation.
+- Validate every restored record before use and fail closed to recompute.
+- Retry only transient reasons, and only after `Room` or an availability change.
+- Discard catalog events from a superseded generation or subscription epoch.
+- Do not exceed the negotiated open-operation and window-credit limits; a
+  request beyond them is refused `QUEUE` or fails the stream.
+- Treat the manager's region files and namespace directories as manager-owned:
+  never open, truncate or delete them while the manager runs.
 
-Each data operation has a 3-second no-progress deadline. The manager counts a
-valid operation frame, disk completion, or successful outbound chunk as progress.
-The client counts its attributed frames, credits and CUDA replies. On expiry,
-send Cancel using the target op in the header; the receiver answers nothing.
-Cancel is idempotent via the unknown-op drop rule. No later continuation can
-reopen that op. The manager may also cancel an expired operation.
+## Versioning
 
-On Cancel/EOF the manager releases leases and parent pins in bounded cleanup
-steps and discards unpublished payloads. Disk/writer users retain references to
-buffers and temporary/final extents until their I/O finishes. Cancelled keys stay
-Inflight until that work drains, fencing delayed completion from a later Put.
-The client stops issuing windows, drains outstanding CUDA replies, then releases
-staging and publication pins or ticket ids. It discards old-generation work on
-reconnect, builds a fresh snapshot, and reoffers Deferred publications still on
-GPU. Recommended reconnect backoff is 100 ms increasing to 5 s.
-
-## Flare record format (version 1)
-
-All offsets below are relative to the Flare record. It begins 4096 bytes after
-the start of the manager's NVMe file. Alignment A=4096. `padded(n)=ceil(n/A)*A`.
-The checksum table is tail_pages little-endian u64 xxh3 values, padded to A.
-Its offset is 4096 and its length is padded(tail_pages*8), including zero for a
-zero-page tail. `page_segment = 4096 + checksum_bytes`;
-`row_segment = page_segment + tail_pages*page_record_bytes`;
-`length_with_row = row_segment + row_record_bytes`.
-
-The Header occupies exactly 4096 bytes:
-
-| Offset | Bytes | Field |
-|---:|---:|---|
-| 0 | 8 | ASCII `FLARECKP` |
-| 8 | 4 | record version = 1 |
-| 12 | 4 | flags = 0 |
-| 16 | 32 | identity |
-| 48 | 16 | fingerprint |
-| 64 | 8 | key consumed_tokens, nonzero |
-| 72 | 16 | key digest |
-| 88 | 1 | parent present, 0 or 1 |
-| 89 | 8 | parent consumed_tokens, zero when absent |
-| 97 | 16 | parent digest, zero when absent |
-| 113 | 16 | bucket |
-| 129 | 8 | page_tokens |
-| 137 | 4 | tail_pages |
-| 141 | 8 | page_segment |
-| 149 | 8 | row_segment |
-| 157 | 8 | row_checksum |
-| 165 | 8 | created, Unix seconds |
-| 173 | 4 | rank_count |
-| 177 | variable | rank entries in the descriptor's rank-entry encoding |
-| after ranks | remaining | zero padding |
-
-Parent tokens are less than key tokens, and tail_pages equals the difference
-of floor-divided complete-page counts. Roots use parent tokens zero. Zero tail
-pages are legal when a checkpoint advances only the continuation row. A compacted
-record has all metadata and pages but no row, ends at row_segment, and retains
-its original Header/row checksum. It can supply pages to descendants but cannot
-be fetched as an endpoint. Compaction and leaf eviction follow Flare's LRU:
-choose the oldest ready, unpinned eligible leaf or single-child row ancestor;
-compact the latter by dropping only its row. Removing a leaf cascades through
-unpinned, childless page-only ancestors. Parents are never removed before children.
-
-## Manager NVMe envelope and recovery
-
-Each `<root>/<namespace>/<consumed:016x>-<digest:032hex>.rec` is a 4096-byte envelope
-followed by the Flare record. The envelope contains:
-
-| Offset | Bytes | Field |
-|---:|---:|---|
-| 0 | 8 | ASCII `FLCMREC1` |
-| 8 | 4 | envelope version = 1 |
-| 12 | 4 | row present: 0 or 1 |
-| 16 | 8 | Flare record length, excluding envelope |
-| 24 | 4 | CRC32 of Header + complete padded checksum segment |
-| 28 | 4 | CRC32 of envelope bytes 0..28 |
-| 32 | 4064 | zero padding |
-
-CRC32 is IEEE reflected polynomial 0xedb88320, initial 0xffffffff, final XOR
-0xffffffff. CRC covers metadata; per-page xxh3 and row xxh3 protect payload.
-The embedded metadata supplies the full namespace, key, parent, bucket, tail,
-payload length and checksum table. Descriptor files contain the wire descriptor
-followed by its CRC32. The root's `.lock` is exclusively flocked for its lifetime,
-including outstanding disk users. Each namespace has one ordered disk writer.
-
-Writes use aligned O_DIRECT buffers, fdatasync (`File::sync_data`), same-directory
-rename, then directory fsync. Compaction atomically installs a page-only copy,
-so an interrupted compaction keeps the previous valid record. Recovery ignores
-symlinks, removes regular `.*.tmp` files, checks envelope/header/layout/name/length
-and metadata CRC, sorts parents first, and removes orphan descendants. Unreadable
-files fail startup without deletion. Recovered entries start in the disk tier;
-DRAM copies are lost at restart. The pooled record files are manager-owned and
-must not be opened as Flare's local `.ckpt` cache.
+The protocol version is carried in `Hello` and is currently 1; a mismatch fails
+the call. Both repositories pin the sha256 of `proto/selene.proto` in a test
+(`PROTO_SHA256`): any change to the schema updates the digest in the manager and
+in Flare together. Message additions that stay wire-compatible still require
+that update, and any change to stream sequencing, window semantics, checksums or
+refusal behavior requires a new protocol version.
