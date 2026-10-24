@@ -814,7 +814,7 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
 
 #[test]
 fn l0_14_throughput() {
-    support::throughput::run(false);
+    support::throughput::smoke();
 }
 
 #[test]
