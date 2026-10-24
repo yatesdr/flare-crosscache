@@ -36,10 +36,11 @@ The negotiated limits are:
 | Chain length per request | 65,536 nodes |
 | No-progress deadline | 3 s |
 
-A stream that makes no progress for 3 s is failed with `DEADLINE_EXCEEDED`, and
-a message that races the teardown can still receive `Refused{INVALID}`;
-replicas treat either as a session failure and rebuild the channel and `Hello`
-with backoff.
+A stream that makes no progress for 3 s is ended. The manager's stream task
+fails it with `DEADLINE_EXCEEDED`, and the store's own timer refuses the
+operation with `Refused{INVALID}`; a message that races the teardown can
+receive either. Replicas treat both as a session failure and rebuild the
+channel and `Hello` with backoff.
 
 ## Namespace and tenant identity
 
@@ -181,10 +182,12 @@ Every page and row carries a 64-bit xxh3 checksum supplied by the writer with
 `WindowFilled`. The manager verifies every Put window before accepting it and a
 record's metadata before committing it. On an NVMe read it does not re-verify
 the payload: the stored metadata, including every page and row xxh3, is served
-to the replica, which must validate every page and row it restores. On NVMe every record is stored behind
-a 4096-byte envelope with a CRC32 over the `Header` and padded checksum segment
-and a CRC32 over the envelope itself; recovery and reads verify both, and the
-manager removes detectably corrupt records rather than serving them.
+to the replica, which must validate every page and row it restores. Every
+NVMe record is stored behind a 4096-byte envelope with a CRC32 over the
+`Header` and padded checksum segment and a CRC32 over the envelope itself.
+Recovery verifies both and removes detectably corrupt records; a streamed
+read serves the stored metadata and payload without re-checking the envelope,
+and a read failure does not remove the record.
 
 A DRAM publication is acknowledged before it reaches NVMe, so a manager crash
 can lose recently acknowledged records whose ancestor chains are not yet
