@@ -77,11 +77,12 @@ record is rank-major. The descriptor's last two fields must equal the sums of
 the corresponding padded units. Sizes and derived offsets must not overflow
 u64, and all rank entries must fit in the Flare header defined below.
 
-The namespace directory is the lowercase hex of identity's first eight bytes,
-a hyphen, then the full fingerprint's lowercase hex. The full descriptor is
-persisted and compared, so truncated-identity directory collisions are rejected.
-A namespace with different sizes, full identity, fingerprint, or page_tokens
-cannot join an existing descriptor. Different TP widths use different namespaces.
+The namespace directory is the lowercase hex of the 32-byte namespace id:
+BLAKE2b-256 over `selene-ns-v1`, the full identity, the full fingerprint, the
+tenant length byte and the tenant. The full descriptor is persisted and compared
+alongside the name, so directory-name collisions are rejected. A namespace with
+different sizes, full identity, fingerprint, tenant, or page_tokens cannot join
+an existing descriptor. Different TP widths use different namespaces.
 
 ## Message layouts
 

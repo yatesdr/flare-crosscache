@@ -23,30 +23,34 @@ target/release/selene \
 Run with the same effective uid and gid as the replicas. Parent socket-directory
 permissions are set to 0770, socket permissions to 0660. One process exclusively
 locks each root, and startup refuses to replace a live socket. A stale socket
-from a killed manager is removed after acquiring the root lock. The NVMe file
-system must support 4096-byte O_DIRECT reads/writes, rename and file/directory
-sync. Do not use a network file system.
+from a killed manager is removed once startup confirms nothing is listening. The
+NVMe file system must support 4096-byte O_DIRECT reads/writes, rename and
+file/directory sync. Do not use a network file system.
 
 Options accept bytes or binary K/M/G/T suffixes. Defaults:
 
 | Option | Default |
 |---|---|
-| `--socket` | `/run/flare-cache/manager.sock` |
-| `--root` | `/var/lib/flare-cache` |
+| `--name` | `default`; names the shared-memory instance and the default socket |
+| `--socket` | `/run/selene/<name>.sock` |
+| `--root` | none; records stay in DRAM until evicted |
 | `--memory` | 1 GiB |
-| `--nvme` | 64 GiB |
-| `--staging` | 64 MiB (minimum 8 MiB) |
+| `--nvme` | 0 without `--root`; required with `--root` |
+| `--staging` | 256 MiB (minimum 8 MiB) |
+| `--write-budget` | 0 (unlimited) |
 | `--metrics` | disabled; when set, HTTP `GET /metrics` |
 
-DRAM is an anonymous THP-advised mapping with 4096-aligned, reference-counted
-size-class extents. Size classes round allocations to powers of two; usable
+The arena and staging are preallocated files under `/dev/shm/selene/<name>`,
+mapped shared with THP advice and split into 4096-aligned, reference-counted
+size-class extents, so the shared-memory mount must hold at least
+`--memory + --staging`. Size classes round allocations to powers of two; usable
 record capacity can therefore be lower than the configured mapping size.
-Staging is a separate bounded mapping. Budgets cover cache/storage extents,
-not total process RSS: trees, checksum tables, bounded frame channels and each
-disk worker's small aligned scratch buffers also consume memory. NVMe admission
-includes the 4096-byte manager envelope and complete padded Flare record.
-All namespaces share these budgets. Only records larger than the retention
-arena stream directly through staging; a fitting record waits for DRAM room.
+Budgets cover cache/storage extents, not total process RSS: trees, checksum
+tables, bounded frame channels and each disk worker's small aligned scratch
+buffers also consume memory. NVMe admission includes the 4096-byte manager
+envelope and complete padded Flare record. All namespaces share these budgets.
+Only records larger than the retention arena stream through staging; a fitting
+record waits for DRAM room.
 
 A DRAM publication is acknowledged before NVMe durability. A manager crash can
 lose recently acknowledged records whose ancestor chains have not reached NVMe.
