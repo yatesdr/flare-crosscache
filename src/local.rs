@@ -271,11 +271,9 @@ impl Local {
     ) -> Result<Self> {
         validate_instance(instance)?;
         let root = Path::new(SHM_ROOT);
-        fs::create_dir_all(root)?;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o770))?;
+        create_private_directory(root)?;
         let directory = root.join(instance);
-        fs::create_dir_all(&directory)?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770))?;
+        create_private_directory(&directory)?;
 
         let lock_path = directory.join("lock");
         let lock = OpenOptions::new()
@@ -904,6 +902,42 @@ impl Local {
     }
 }
 
+/// Creates `directory` with mode 0770 when it is missing. An existing directory
+/// keeps its mode and ownership: the manager only sets a mode on a directory it
+/// created. A directory this process cannot write is reported with its path and
+/// owner instead of a bare `EPERM`, which usually only says the caller is not
+/// the owner.
+fn create_private_directory(directory: &Path) -> Result<()> {
+    match fs::create_dir(directory) {
+        Ok(()) => return fs::set_permissions(directory, fs::Permissions::from_mode(0o770)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if directory_writable(directory) {
+        return Ok(());
+    }
+    let owner = fs::metadata(directory)
+        .map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            format!(" (owned by uid {} gid {})", metadata.uid(), metadata.gid())
+        })
+        .unwrap_or_default();
+    Err(invalid(format!(
+        "{}: existing directory is not writable by this process{owner}",
+        directory.display()
+    )))
+}
+
+/// Whether this process may create files in `directory`, judged by its
+/// effective uid and gid.
+fn directory_writable(directory: &Path) -> bool {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let Ok(path) = CString::new(directory.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::W_OK, libc::AT_EACCESS) == 0 }
+}
+
 fn validate_instance(instance: &str) -> Result<()> {
     if instance.is_empty()
         || instance == "."
@@ -1140,6 +1174,44 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o660);
+    }
+
+    #[test]
+    fn an_existing_instance_directory_keeps_its_mode() {
+        let name = instance("mode");
+        let directory = Path::new(SHM_ROOT).join(&name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let local = Local::open(&name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024).unwrap();
+        let _cleanup = Cleanup(directory.clone());
+        let mode = fs::metadata(local.directory())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "an existing directory keeps its mode");
+    }
+
+    #[test]
+    fn an_unwritable_instance_directory_names_itself() {
+        if unsafe { libc::geteuid() } == 0 {
+            // Root may write any directory, so this failure cannot be staged.
+            return;
+        }
+        let name = instance("unwritable");
+        let directory = Path::new(SHM_ROOT).join(&name);
+        fs::create_dir_all(&directory).unwrap();
+        let _cleanup = Cleanup(directory.clone());
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+        let error = Local::open(&name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024)
+            .err()
+            .unwrap()
+            .to_string();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            error.contains(&directory.display().to_string()) && error.contains("uid"),
+            "{error}"
+        );
     }
 
     #[test]
