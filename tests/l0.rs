@@ -3048,3 +3048,22 @@ async fn l0_64_refuses_a_record_whose_admission_charge_cannot_fit() {
         PutOutcome::Stored(_)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_65_rootless_tail_counts_every_retained_ancestor() {
+    // A 64 KiB arena holds a five-page root and a five-page tail. The next
+    // four-page tail needs 32 KiB beside both retained ancestors (96 KiB in
+    // total), and the whole-chain fallback needs 128 KiB, so no shape can ever
+    // fit: the refusal is OVERSIZE, not a Room that never arrives.
+    let mut host = Host::dram_only(64 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(5 * 64), None).await;
+    client.store(key(10 * 64), Some(key(5 * 64))).await;
+    assert_eq!(
+        client
+            .put(key(14 * 64), Some(key(10 * 64)), PutOptions::default())
+            .await,
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
+    );
+}

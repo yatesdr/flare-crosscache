@@ -1071,6 +1071,27 @@ impl Store {
         })));
     }
 
+    /// Arena extents of a record's retained ancestry. A node with a child is
+    /// never removed, so every ancestor's extent stays resident while the
+    /// child is admitted; a rootless arena must hold all of them together.
+    fn retained_ancestry_extent(&self, id: NamespaceId, key: Option<Key>) -> u64 {
+        let Some(namespace) = self.namespaces.get(&id) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        let mut next = key;
+        while let Some(key) = next {
+            let Some(node) = namespace.tree.node(&key) else {
+                break;
+            };
+            if let Some(extent) = &node.location.memory {
+                total = total.saturating_add(extent.capacity() as u64);
+            }
+            next = node.parent;
+        }
+        total
+    }
+
     fn begin_put(&mut self, pending: PendingPut) {
         let PendingPut {
             connection,
@@ -1194,16 +1215,8 @@ impl Store {
         // OVERSIZE; otherwise a shortage is a Budget wait.
         if rootless {
             let extent = |header: &Header| header.length_with_row().max(4096).next_power_of_two();
-            let parent_extent = initial_parent
-                .and_then(|parent| {
-                    self.namespaces
-                        .get(&id)
-                        .and_then(|namespace| namespace.tree.node(&parent))
-                        .and_then(|node| node.location.memory.as_ref())
-                        .map(|extent| extent.capacity() as u64)
-                })
-                .unwrap_or(0);
-            if extent(&child_header).saturating_add(parent_extent) > arena_bytes
+            let retained = self.retained_ancestry_extent(id, initial_parent);
+            if extent(&child_header).saturating_add(retained) > arena_bytes
                 && extent(&root_header) > arena_bytes
             {
                 self.metrics.oversize += 1;
