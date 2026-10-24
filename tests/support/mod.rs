@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-use flare_crosscache::{
+use selene::{
     Key,
     codec::Encoder,
     control,
-    crosscache::{
+    proto::{
         self, CatalogEntry, CatalogEvent, GetMessage, HelloRequest, PutMessage, PutReply,
         SubscribeRequest, get_message, get_reply, local_cache_client::LocalCacheClient,
         put_message, put_reply,
@@ -115,29 +115,29 @@ pub fn wait(mut condition: impl FnMut() -> bool) {
     }
 }
 
-pub fn key_msg(key: Key) -> crosscache::Key {
-    crosscache::Key {
+pub fn key_msg(key: Key) -> proto::Key {
+    proto::Key {
         consumed_tokens: key.consumed_tokens,
         digest: key.digest.to_vec(),
     }
 }
 
-pub fn key_from_msg(key: &crosscache::Key) -> Key {
+pub fn key_from_msg(key: &proto::Key) -> Key {
     Key {
         consumed_tokens: key.consumed_tokens,
         digest: key.digest.as_slice().try_into().unwrap(),
     }
 }
 
-pub fn descriptor_msg(descriptor: &Descriptor) -> crosscache::Descriptor {
-    crosscache::Descriptor {
+pub fn descriptor_msg(descriptor: &Descriptor) -> proto::Descriptor {
+    proto::Descriptor {
         identity: descriptor.identity.to_vec(),
         fingerprint: descriptor.fingerprint.to_vec(),
         page_tokens: descriptor.page_tokens,
         ranks: descriptor
             .ranks
             .iter()
-            .map(|rank| crosscache::RankPlanes {
+            .map(|rank| proto::RankPlanes {
                 plane_bytes: rank.planes.clone(),
                 row_bytes: rank.row_bytes,
             })
@@ -269,7 +269,7 @@ impl Host {
             let _ = thread.join();
         }
         if let Some(root) = &self.config.root {
-            wait(|| flare_crosscache::disk::RootLock::acquire(root).is_ok());
+            wait(|| selene::disk::RootLock::acquire(root).is_ok());
         }
     }
 
@@ -322,7 +322,7 @@ impl Host {
     }
 
     pub fn shm_directory(&self) -> PathBuf {
-        PathBuf::from("/dev/shm/flare-crosscache").join(&self.config.name)
+        PathBuf::from("/dev/shm/selene").join(&self.config.name)
     }
 }
 
@@ -503,14 +503,14 @@ impl Client {
     pub fn request<T>(&self, message: T) -> Request<T> {
         let mut request = Request::new(message);
         request.metadata_mut().insert(
-            "x-crosscache-generation",
+            "x-selene-generation",
             self.generation.to_string().parse().unwrap(),
         );
         request
     }
 
     pub fn begin(&self, key: Key, parent: Option<Key>) -> put_message::M {
-        put_message::M::Begin(crosscache::PutBegin {
+        put_message::M::Begin(proto::PutBegin {
             namespace_id: self.descriptor.namespace_id().to_vec(),
             key: Some(key_msg(key)),
             chain_pages: key.consumed_tokens / self.descriptor.page_tokens,
@@ -600,7 +600,7 @@ impl Client {
                     if options.cancel == Some(CancelAt::Accept) {
                         let _ = sender
                             .send(PutMessage {
-                                m: Some(put_message::M::Cancel(crosscache::Cancel {})),
+                                m: Some(put_message::M::Cancel(proto::Cancel {})),
                             })
                             .await;
                         let _ = tokio::time::timeout(Duration::from_millis(500), replies.message())
@@ -618,7 +618,7 @@ impl Client {
                     if options.cancel == Some(CancelAt::Grant) {
                         let _ = sender
                             .send(PutMessage {
-                                m: Some(put_message::M::Cancel(crosscache::Cancel {})),
+                                m: Some(put_message::M::Cancel(proto::Cancel {})),
                             })
                             .await;
                         let _ = tokio::time::timeout(Duration::from_millis(500), replies.message())
@@ -628,7 +628,7 @@ impl Client {
                     let header = header.as_ref().unwrap().clone();
                     let source = bytes.as_mut().unwrap();
                     let memory = grant.memory.as_ref().unwrap();
-                    let region = if memory.region == crosscache::Region::Arena as i32 {
+                    let region = if memory.region == proto::Region::Arena as i32 {
                         Reg::Arena
                     } else {
                         Reg::Staging
@@ -660,7 +660,7 @@ impl Client {
                         // deliberately never acknowledge this window
                     } else if sender
                         .send(PutMessage {
-                            m: Some(put_message::M::Filled(crosscache::WindowFilled {
+                            m: Some(put_message::M::Filled(proto::WindowFilled {
                                 transfer: grant.transfer,
                                 index: grant.index,
                                 page_xxh3: page_hashes,
@@ -691,7 +691,7 @@ impl Client {
                     {
                         let _ = sender
                             .send(PutMessage {
-                                m: Some(put_message::M::Cancel(crosscache::Cancel {})),
+                                m: Some(put_message::M::Cancel(proto::Cancel {})),
                             })
                             .await;
                         let _ = tokio::time::timeout(Duration::from_millis(500), replies.message())
@@ -706,7 +706,7 @@ impl Client {
                         if options.cancel == Some(CancelAt::Filled) {
                             let _ = sender
                                 .send(PutMessage {
-                                    m: Some(put_message::M::Cancel(crosscache::Cancel {})),
+                                    m: Some(put_message::M::Cancel(proto::Cancel {})),
                                 })
                                 .await;
                             let _ =
@@ -718,7 +718,7 @@ impl Client {
                             let fragment = vec![0u8; 4096];
                             let _ = sender
                                 .send(PutMessage {
-                                    m: Some(put_message::M::Commit(crosscache::PutCommit {
+                                    m: Some(put_message::M::Commit(proto::PutCommit {
                                         transfer: grant.transfer,
                                         metadata_offset: 0,
                                         metadata: fragment,
@@ -732,7 +732,7 @@ impl Client {
                             {
                                 let _ = sender
                                     .send(PutMessage {
-                                        m: Some(put_message::M::Commit(crosscache::PutCommit {
+                                        m: Some(put_message::M::Commit(proto::PutCommit {
                                             transfer: grant.transfer,
                                             metadata_offset: (index * 4096) as u64,
                                             metadata: chunk.to_vec(),
@@ -751,7 +751,7 @@ impl Client {
                         if options.cancel == Some(CancelAt::Commit) {
                             let _ = sender
                                 .send(PutMessage {
-                                    m: Some(put_message::M::Cancel(crosscache::Cancel {})),
+                                    m: Some(put_message::M::Cancel(proto::Cancel {})),
                                 })
                                 .await;
                         }
@@ -863,7 +863,7 @@ impl Client {
             descriptor: Some(descriptor_msg(descriptor)),
         });
         request.metadata_mut().insert(
-            "x-crosscache-generation",
+            "x-selene-generation",
             self.generation.to_string().parse().unwrap(),
         );
         self.inner.subscribe(request).await
@@ -879,7 +879,7 @@ impl Client {
             descriptor: Some(descriptor_msg(&self.descriptor)),
         });
         request.metadata_mut().insert(
-            "x-crosscache-generation",
+            "x-selene-generation",
             generation.to_string().parse().unwrap(),
         );
         let stream = self.inner.subscribe(request).await?.into_inner();
@@ -930,11 +930,11 @@ impl Subscription {
             let event = self.stream.message().await.unwrap().unwrap();
             self.seq = event.sequence;
             match event.event.unwrap() {
-                crosscache::catalog_event::Event::SnapshotBegin(_) => {
+                proto::catalog_event::Event::SnapshotBegin(_) => {
                     self.entries.clear();
                     self.snapshot.clear();
                 }
-                crosscache::catalog_event::Event::Entry(entry) => {
+                proto::catalog_event::Event::Entry(entry) => {
                     let entry = entry_from_proto(&entry);
                     assert!(
                         entry
@@ -945,7 +945,7 @@ impl Subscription {
                     self.snapshot.push(entry.key);
                     self.entries.insert(entry.key, entry);
                 }
-                crosscache::catalog_event::Event::SnapshotEnd(_) => {
+                proto::catalog_event::Event::SnapshotEnd(_) => {
                     self.snapshots.push(self.snapshot.clone());
                     return;
                 }
@@ -954,18 +954,18 @@ impl Subscription {
         }
     }
 
-    pub async fn next(&mut self) -> Option<crosscache::catalog_event::Event> {
+    pub async fn next(&mut self) -> Option<proto::catalog_event::Event> {
         let event = self.stream.message().await.ok()??;
         assert_eq!(event.sequence, self.seq + 1, "catalog sequence gap");
         self.seq = event.sequence;
         let event = event.event?;
         match &event {
-            crosscache::catalog_event::Event::Added(entry)
-            | crosscache::catalog_event::Event::Changed(entry) => {
+            proto::catalog_event::Event::Added(entry)
+            | proto::catalog_event::Event::Changed(entry) => {
                 let entry = entry_from_proto(entry);
                 self.entries.insert(entry.key, entry);
             }
-            crosscache::catalog_event::Event::Removed(key) => {
+            proto::catalog_event::Event::Removed(key) => {
                 let key = key_from_msg(key);
                 self.entries.remove(&key);
             }
@@ -982,7 +982,7 @@ impl Subscription {
 
     pub async fn until_room(&mut self) -> u64 {
         loop {
-            if let crosscache::catalog_event::Event::Room(room) =
+            if let proto::catalog_event::Event::Room(room) =
                 self.next().await.expect("catalog stream ended")
             {
                 return room.bytes;
@@ -1047,7 +1047,7 @@ pub fn content_for(
 }
 
 pub fn recovered_keys(root: &Path) -> Vec<Key> {
-    flare_crosscache::disk::recover(root)
+    selene::disk::recover(root)
         .unwrap()
         .iter()
         .flat_map(|namespace| namespace.records.iter().map(|(header, _, _)| header.key))
@@ -1069,7 +1069,7 @@ async fn get_once(
     let (sender, receiver) = mpsc::channel(8);
     let mut request = Request::new(ReceiverStream::new(receiver));
     request.metadata_mut().insert(
-        "x-crosscache-generation",
+        "x-selene-generation",
         generation.to_string().parse().unwrap(),
     );
     let mut replies = match inner.get(request).await {
@@ -1078,7 +1078,7 @@ async fn get_once(
     };
     if sender
         .send(GetMessage {
-            m: Some(get_message::M::Begin(crosscache::GetBegin {
+            m: Some(get_message::M::Begin(proto::GetBegin {
                 namespace_id: descriptor.namespace_id().to_vec(),
                 chain: keys.iter().map(|key| key_msg(*key)).collect(),
                 skip_pages: u64::from(skip),
@@ -1130,7 +1130,7 @@ async fn get_once(
                 if options.cancel == Some(CancelAt::Grant) {
                     let _ = sender
                         .send(GetMessage {
-                            m: Some(get_message::M::Cancel(crosscache::Cancel {})),
+                            m: Some(get_message::M::Cancel(proto::Cancel {})),
                         })
                         .await;
                     let _ =
@@ -1138,7 +1138,7 @@ async fn get_once(
                     return GetOutcome::Cancelled;
                 }
                 let memory = grant.memory.as_ref().unwrap();
-                let region = if memory.region == crosscache::Region::Arena as i32 {
+                let region = if memory.region == proto::Region::Arena as i32 {
                     Reg::Arena
                 } else {
                     Reg::Staging
@@ -1153,7 +1153,7 @@ async fn get_once(
                 records[record][start..start + length].copy_from_slice(&data);
                 let _ = sender
                     .send(GetMessage {
-                        m: Some(get_message::M::Released(crosscache::WindowReleased {
+                        m: Some(get_message::M::Released(proto::WindowReleased {
                             transfer: grant.transfer,
                             index: grant.index,
                         })),

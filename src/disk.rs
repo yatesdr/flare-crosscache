@@ -1,7 +1,7 @@
 use crate::{
     Result,
     arena::{Arena, Extent, ExtentSlice},
-    crosscache, invalid,
+    invalid, proto,
     record::{self, Descriptor, Header},
 };
 use prost::Message;
@@ -600,15 +600,15 @@ pub fn descriptor(root: &Path, value: &Descriptor) -> Result<()> {
     File::open(directory)?.sync_all()
 }
 
-fn proto_descriptor(value: &Descriptor) -> crosscache::Descriptor {
-    crosscache::Descriptor {
+fn proto_descriptor(value: &Descriptor) -> proto::Descriptor {
+    proto::Descriptor {
         identity: value.identity.to_vec(),
         fingerprint: value.fingerprint.to_vec(),
         page_tokens: value.page_tokens,
         ranks: value
             .ranks
             .iter()
-            .map(|rank| crosscache::RankPlanes {
+            .map(|rank| proto::RankPlanes {
                 plane_bytes: rank.planes.clone(),
                 row_bytes: rank.row_bytes,
             })
@@ -619,7 +619,7 @@ fn proto_descriptor(value: &Descriptor) -> crosscache::Descriptor {
     }
 }
 
-fn record_descriptor(value: crosscache::Descriptor) -> Result<Descriptor> {
+fn record_descriptor(value: proto::Descriptor) -> Result<Descriptor> {
     let identity: [u8; 32] = value
         .identity
         .as_slice()
@@ -670,7 +670,7 @@ fn load_descriptor(path: &Path) -> Result<Descriptor> {
     if crc32(&bytes[..tail]) != u32::from_le_bytes(bytes[tail..].try_into().unwrap()) {
         return Err(invalid("descriptor CRC"));
     }
-    record_descriptor(crosscache::Descriptor::decode(&bytes[12..tail])?)
+    record_descriptor(proto::Descriptor::decode(&bytes[12..tail])?)
 }
 
 pub fn recover(root: &Path) -> Result<Vec<Recovered>> {

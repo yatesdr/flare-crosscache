@@ -1,5 +1,5 @@
 syntax = "proto3";
-package crosscache.v1;
+package selene.v1;
 
 service LocalCache {
   rpc Hello(HelloRequest) returns (HelloReply);

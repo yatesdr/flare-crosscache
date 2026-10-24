@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
 };
 
-pub const SHM_ROOT: &str = "/dev/shm/flare-crosscache";
+pub const SHM_ROOT: &str = "/dev/shm/selene";
 pub const PAGE_BYTES: u64 = 4096;
 pub const MAX_WINDOW_PAGES: u32 = 64;
 /// Granted windows per direction per connection (§8.2).
@@ -260,7 +260,7 @@ pub struct Local {
 }
 
 impl Local {
-    /// Owns `/dev/shm/flare-crosscache/<instance>`: takes the exclusive lock, removes
+    /// Owns `/dev/shm/selene/<instance>`: takes the exclusive lock, removes
     /// stale `arena-*`/`staging-*` files and creates fresh, preallocated regions.
     pub fn open(
         instance: &str,

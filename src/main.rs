@@ -1,4 +1,4 @@
-use flare_crosscache::{Result, control, invalid, store::Config};
+use selene::{Result, control, invalid, store::Config};
 use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
@@ -33,7 +33,7 @@ fn parse_name(value: &str) -> Result<String> {
 
 fn main() {
     if let Err(error) = start() {
-        eprintln!("flare-crosscache: {error}");
+        eprintln!("selene: {error}");
         std::process::exit(1);
     }
 }
@@ -51,7 +51,7 @@ fn start() -> Result<()> {
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
             println!(
-                "flare-crosscache [--name NAME] [--socket PATH] [--root PATH] [--memory BYTES] \
+                "selene [--name NAME] [--socket PATH] [--root PATH] [--memory BYTES] \
                  [--nvme BYTES] [--staging BYTES] [--write-budget BYTES/s] [--metrics HOST:PORT]\n\
                  Sizes accept binary K, M, G, T suffixes. Linux only; same uid and gid as clients."
             );
@@ -93,8 +93,7 @@ fn start() -> Result<()> {
         (None, None | Some(0)) => 0,
         (None, Some(_)) => return Err(invalid("--nvme must be 0 when --root is omitted")),
     };
-    let socket =
-        socket.unwrap_or_else(|| PathBuf::from(format!("/run/flare-crosscache/{name}.sock")));
+    let socket = socket.unwrap_or_else(|| PathBuf::from(format!("/run/selene/{name}.sock")));
     if socket.as_os_str().len() > 107 {
         return Err(invalid("--socket must be at most 107 bytes"));
     }
@@ -108,7 +107,7 @@ fn start() -> Result<()> {
         metrics,
         faults: Default::default(),
         write_budget,
-        max_window_bytes: flare_crosscache::store::DEFAULT_MAX_WINDOW,
+        max_window_bytes: selene::store::DEFAULT_MAX_WINDOW,
     };
     control::run(config, Arc::new(AtomicBool::new(false)))
 }

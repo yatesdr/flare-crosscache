@@ -6,5 +6,5 @@ COPY src ./src
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
-COPY --from=build /build/target/release/flare-crosscache /usr/local/bin/flare-crosscache
-ENTRYPOINT ["/usr/local/bin/flare-crosscache"]
+COPY --from=build /build/target/release/selene /usr/local/bin/selene
+ENTRYPOINT ["/usr/local/bin/selene"]

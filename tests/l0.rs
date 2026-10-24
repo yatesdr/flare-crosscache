@@ -1,7 +1,7 @@
 mod support;
-use flare_crosscache::{
+use selene::{
     arena::{Arena, ExtentSlice},
-    crosscache, disk,
+    disk, proto,
     record::{self, Header},
     store::Config,
     tree::{Eviction, Tree},
@@ -125,11 +125,11 @@ async fn l0_03_accept_shapes_and_present_inflight() {
     // A second connection sees INFLIGHT while the first Put is open.
     assert_eq!(
         b.put(key(128), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Inflight as u8)
+        PutOutcome::Refused(proto::Reason::Inflight as u8)
     );
     sender
-        .send(crosscache::PutMessage {
-            m: Some(crosscache::put_message::M::Cancel(crosscache::Cancel {})),
+        .send(proto::PutMessage {
+            m: Some(proto::put_message::M::Cancel(proto::Cancel {})),
         })
         .await
         .unwrap();
@@ -140,7 +140,7 @@ async fn l0_03_accept_shapes_and_present_inflight() {
     assert!(!bytes.is_empty());
     assert_eq!(
         b.put(key(128), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Present as u8)
+        PutOutcome::Refused(proto::Reason::Present as u8)
     );
     let mut c = host.client().await;
     let mut open = Vec::new();
@@ -149,7 +149,7 @@ async fn l0_03_accept_shapes_and_present_inflight() {
     }
     assert_eq!(
         c.put(key(1152), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Queue as u8)
+        PutOutcome::Refused(proto::Reason::Queue as u8)
     );
     drop(open);
     host.wait(|host| host.gauge("open_ops") == 0);
@@ -204,7 +204,7 @@ async fn l0_04_invalid_checksum_short_payload_and_offsets() {
         let mut client = host.client().await;
         let outcome = client.put(key(tokens), None, options).await;
         assert!(
-            matches!(outcome, PutOutcome::Refused(reason) if reason == crosscache::Reason::Invalid as u8),
+            matches!(outcome, PutOutcome::Refused(reason) if reason == proto::Reason::Invalid as u8),
             "{tokens}: {outcome:?}"
         );
     }
@@ -286,7 +286,7 @@ fn l0_06_multiprocess_kill_recovery() {
         config.faults.pause_at = Some(point.clone());
         config.faults.signal = Some(base.join("gate"));
         if let Ok(dump) = std::env::var(CHILD_DUMP) {
-            let store = flare_crosscache::store::Store::open(config).unwrap();
+            let store = selene::store::Store::open(config).unwrap();
             let snapshot = store
                 .namespace_id()
                 .and_then(|id| store.snapshot(id))
@@ -397,7 +397,7 @@ async fn l0_07_streaming_and_nvme_oversize() {
         client
             .put(key(1024 * 64), None, PutOptions::default())
             .await,
-        PutOutcome::Refused(crosscache::Reason::Oversize as u8)
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
     );
     host.stop();
     host.start();
@@ -423,14 +423,14 @@ async fn l0_08_refill_and_split_units() {
     let subscription = client.subscribe().await;
     assert_eq!(
         subscription.entries[&key(128)].tier,
-        crosscache::Tier::Nvme as i32
+        proto::Tier::Nvme as i32
     );
     client.fetch(&[key(128)], 0, 2).await;
     refill.wait(|host| host.gauge("memory_allocated_bytes") > 0);
     let subscription = client.subscribe().await;
     assert_eq!(
         subscription.entries[&key(128)].tier,
-        crosscache::Tier::Dram as i32
+        proto::Tier::Dram as i32
     );
 
     let mut split = Host::new(4096, 32 * 1024 * 1024);
@@ -463,7 +463,7 @@ async fn l0_09_disk_failure_is_refused_io() {
     // The record does not fit the tiny arena, so it streams through staging.
     assert_eq!(
         client.put(key(512 * 64), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Io as u8)
+        PutOutcome::Refused(proto::Reason::Io as u8)
     );
     host.wait(|host| host.gauge("nvme_errors_total") > 0);
     // A single-window stream must also get its IO refusal: the failing chunk is
@@ -471,7 +471,7 @@ async fn l0_09_disk_failure_is_refused_io() {
     let mut single = host.client().await;
     assert_eq!(
         single.put(key(64 * 64), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Io as u8)
+        PutOutcome::Refused(proto::Reason::Io as u8)
     );
     fs::remove_file(full).unwrap();
     let bytes = client.store(key(128), None).await;
@@ -576,8 +576,8 @@ async fn l0_12_round_robin_and_dead_client_cleanup() {
             .await
             .unwrap();
         sender
-            .send(crosscache::GetMessage {
-                m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+            .send(proto::GetMessage {
+                m: Some(proto::get_message::M::Begin(proto::GetBegin {
                     namespace_id: dead.descriptor.namespace_id().to_vec(),
                     chain: keys.iter().map(|key| key_msg(*key)).collect(),
                     skip_pages: 0,
@@ -606,8 +606,8 @@ async fn l0_12_round_robin_and_dead_client_cleanup() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::GetMessage {
-            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+        .send(proto::GetMessage {
+            m: Some(proto::get_message::M::Begin(proto::GetBegin {
                 namespace_id: unknown.descriptor.namespace_id().to_vec(),
                 chain: vec![key_msg(key(64))],
                 skip_pages: 0,
@@ -621,31 +621,26 @@ async fn l0_12_round_robin_and_dead_client_cleanup() {
         .unwrap();
     let _leased = loop {
         let reply = replies.message().await.unwrap().unwrap();
-        if matches!(reply.r, Some(crosscache::get_reply::R::Leased(_))) {
+        if matches!(reply.r, Some(proto::get_reply::R::Leased(_))) {
             break reply;
         }
     };
     sender
-        .send(crosscache::GetMessage {
-            m: Some(crosscache::get_message::M::Released(
-                crosscache::WindowReleased {
-                    transfer: 999_999,
-                    index: 0,
-                },
-            )),
+        .send(proto::GetMessage {
+            m: Some(proto::get_message::M::Released(proto::WindowReleased {
+                transfer: 999_999,
+                index: 0,
+            })),
         })
         .await
         .unwrap();
     let refused = loop {
         let reply = replies.message().await.unwrap().unwrap();
-        if matches!(reply.r, Some(crosscache::get_reply::R::Refused(_))) {
+        if matches!(reply.r, Some(proto::get_reply::R::Refused(_))) {
             break reply;
         }
     };
-    assert!(matches!(
-        refused.r,
-        Some(crosscache::get_reply::R::Refused(_))
-    ));
+    assert!(matches!(refused.r, Some(proto::get_reply::R::Refused(_))));
     let start = Instant::now();
     a.fetch(&[key(64)], 0, 1).await;
     assert!(start.elapsed() < Duration::from_millis(500));
@@ -661,7 +656,7 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
     // A second Hello on the same transport supersedes the previous generation.
     let hello = client
         .inner
-        .hello(tonic::Request::new(crosscache::HelloRequest {
+        .hello(tonic::Request::new(proto::HelloRequest {
             protocol: 1,
             replica: "again".into(),
             descriptor: Some(descriptor_msg(&client.descriptor)),
@@ -669,20 +664,20 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
         .await
         .unwrap()
         .into_inner();
-    let mut request = tonic::Request::new(crosscache::SubscribeRequest {
+    let mut request = tonic::Request::new(proto::SubscribeRequest {
         namespace_id: client.descriptor.namespace_id().to_vec(),
         generation: old,
         descriptor: Some(descriptor_msg(&client.descriptor)),
     });
     request
         .metadata_mut()
-        .insert("x-crosscache-generation", old.to_string().parse().unwrap());
+        .insert("x-selene-generation", old.to_string().parse().unwrap());
     let status = client.inner.subscribe(request).await.err().unwrap();
     assert_eq!(status.code(), tonic::Code::Aborted);
     client.generation = hello.generation;
 
     // Missing metadata is UNAUTHENTICATED.
-    let request = tonic::Request::new(crosscache::SubscribeRequest {
+    let request = tonic::Request::new(proto::SubscribeRequest {
         namespace_id: client.descriptor.namespace_id().to_vec(),
         generation: client.generation,
         descriptor: Some(descriptor_msg(&client.descriptor)),
@@ -699,34 +694,32 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::PutMessage {
+        .send(proto::PutMessage {
             m: Some(client.begin(key(256), None)),
         })
         .await
         .unwrap();
     let _accept = replies.message().await.unwrap().unwrap();
     sender
-        .send(crosscache::PutMessage {
-            m: Some(crosscache::put_message::M::Filled(
-                crosscache::WindowFilled {
-                    transfer: 999_999,
-                    index: 0,
-                    page_xxh3: vec![0],
-                    row_xxh3: 0,
-                    has_row: false,
-                },
-            )),
+        .send(proto::PutMessage {
+            m: Some(proto::put_message::M::Filled(proto::WindowFilled {
+                transfer: 999_999,
+                index: 0,
+                page_xxh3: vec![0],
+                row_xxh3: 0,
+                has_row: false,
+            })),
         })
         .await
         .unwrap();
     let refused = loop {
         match replies.message().await.unwrap().unwrap().r {
-            Some(crosscache::put_reply::R::Refused(refused)) => break refused,
+            Some(proto::put_reply::R::Refused(refused)) => break refused,
             Some(_) => continue,
             None => panic!("ended"),
         }
     };
-    assert_eq!(refused.reason, crosscache::Reason::Invalid as i32);
+    assert_eq!(refused.reason, proto::Reason::Invalid as i32);
 
     // A Commit before Begin is a malformed stream.
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
@@ -737,8 +730,8 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::PutMessage {
-            m: Some(crosscache::put_message::M::Commit(crosscache::PutCommit {
+        .send(proto::PutMessage {
+            m: Some(proto::put_message::M::Commit(proto::PutCommit {
                 transfer: 1,
                 metadata_offset: 0,
                 metadata: vec![0; 4096],
@@ -749,10 +742,10 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
     let refused = replies.message().await.unwrap().unwrap();
     assert!(matches!(
         refused.r,
-        Some(crosscache::put_reply::R::Refused(crosscache::Refused {
+        Some(proto::put_reply::R::Refused(proto::Refused {
             reason,
             ..
-        })) if reason == crosscache::Reason::Invalid as i32
+        })) if reason == proto::Reason::Invalid as i32
     ));
     drop(sender);
     drop(replies);
@@ -769,10 +762,10 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
     let refused = replies.message().await.unwrap().unwrap();
     assert!(matches!(
         refused.r,
-        Some(crosscache::put_reply::R::Refused(crosscache::Refused {
+        Some(proto::put_reply::R::Refused(proto::Refused {
             reason,
             ..
-        })) if reason == crosscache::Reason::Invalid as i32
+        })) if reason == proto::Reason::Invalid as i32
     ));
 
     // LocalCache.Get must reject destinations as a terminal refusal too.
@@ -784,16 +777,16 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::GetMessage {
-            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+        .send(proto::GetMessage {
+            m: Some(proto::get_message::M::Begin(proto::GetBegin {
                 namespace_id: client.descriptor.namespace_id().to_vec(),
                 chain: vec![key_msg(key(128))],
                 skip_pages: 0,
                 expected_pages: 2,
                 row: true,
-                destinations: vec![crosscache::GetDestination {
+                destinations: vec![proto::GetDestination {
                     record: 0,
-                    region: crosscache::Region::Arena as i32,
+                    region: proto::Region::Arena as i32,
                     offset: 0,
                     bytes: 4096,
                 }],
@@ -805,10 +798,10 @@ async fn l0_13_generation_fencing_and_malformed_streams() {
     let refused = replies.message().await.unwrap().unwrap();
     assert!(matches!(
         refused.r,
-        Some(crosscache::get_reply::R::Refused(crosscache::Refused {
+        Some(proto::get_reply::R::Refused(proto::Refused {
             reason,
             ..
-        })) if reason == crosscache::Reason::Invalid as i32
+        })) if reason == proto::Reason::Invalid as i32
     ));
 }
 
@@ -822,12 +815,12 @@ fn l0_15_namespace_id_vectors() {
     let id = record::namespace_id(&[0x63; 32], &[0x1b; 16], "test");
     assert_eq!(
         record::hex(&id),
-        "010a5fe4fa734a28b9b50699d208f60110b851e60a87ebc6e576d675f29aebb4"
+        "83bbb4befe798c5d717456d55695acc1d166d45c214e54e253f249cd025d4040"
     );
     let id = record::namespace_id(&[0x63; 32], &[0x1b; 16], "");
     assert_eq!(
         record::hex(&id),
-        "ced386eec7bca02f955a4e337b4d950c0a12dc9f7b61ab9b08a30a82971f330c"
+        "6fbf3a101213ca13f48c6ab6ae91e7e1e35fd409de023b30696e32b18c97ed74"
     );
 }
 
@@ -926,7 +919,7 @@ async fn l0_17_write_budget_and_room() {
     a.fetch(&[key(128)], 0, 2).await;
     assert_eq!(
         a.put(key(256), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
     let room = subscription.until_room().await;
     assert!(room > 0);
@@ -1066,7 +1059,7 @@ async fn l0_21_live_disconnected_client_quarantine() {
     let mut probe = host.client().await;
     assert_eq!(
         probe.put(key(256), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
     child.kill().unwrap();
     child.wait().unwrap();
@@ -1074,7 +1067,7 @@ async fn l0_21_live_disconnected_client_quarantine() {
     loop {
         match probe.put(key(256), None, PutOptions::default()).await {
             PutOutcome::Stored(_) => break,
-            PutOutcome::Refused(reason) if reason == crosscache::Reason::Budget as u8 => {
+            PutOutcome::Refused(reason) if reason == proto::Reason::Budget as u8 => {
                 assert!(Instant::now() < deadline, "quarantine was not reclaimed");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1176,7 +1169,7 @@ fn l0_24_signal_handling() {
     let base = base("signal");
     fs::create_dir_all(base.join("run")).unwrap();
     let socket = base.join("run/manager.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_flare-crosscache"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_selene"))
         .args([
             "--name",
             &instance_name("signal"),
@@ -1216,17 +1209,14 @@ async fn l0_25_verify_before_window_reuse() {
             },
         )
         .await;
-    assert_eq!(
-        outcome,
-        PutOutcome::Refused(crosscache::Reason::Invalid as u8)
-    );
+    assert_eq!(outcome, PutOutcome::Refused(proto::Reason::Invalid as u8));
     host.wait(|host| host.gauge("staging_allocated_bytes") == 0);
     let mut fresh = host.client().await;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match fresh.put(key(128), None, PutOptions::default()).await {
             PutOutcome::Stored(_) => break,
-            PutOutcome::Refused(reason) if reason == crosscache::Reason::Inflight as u8 => {
+            PutOutcome::Refused(reason) if reason == proto::Reason::Inflight as u8 => {
                 assert!(Instant::now() < deadline, "inflight did not drain");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1259,8 +1249,8 @@ async fn l0_26_namespace_registration_and_mismatch() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::PutMessage {
-            m: Some(crosscache::put_message::M::Begin(crosscache::PutBegin {
+        .send(proto::PutMessage {
+            m: Some(proto::put_message::M::Begin(proto::PutBegin {
                 namespace_id: other.namespace_id().to_vec(),
                 key: Some(key_msg(key(64))),
                 chain_pages: 1,
@@ -1294,14 +1284,14 @@ async fn l0_27_no_progress_timeout_ends_the_call() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::PutMessage {
+        .send(proto::PutMessage {
             m: Some(client.begin(key(256), None)),
         })
         .await
         .unwrap();
     loop {
         match replies.message().await.unwrap().unwrap().r {
-            Some(crosscache::put_reply::R::Accept(_)) => break,
+            Some(proto::put_reply::R::Accept(_)) => break,
             Some(_) => continue,
             None => panic!("reply stream ended"),
         }
@@ -1316,8 +1306,8 @@ async fn l0_27_no_progress_timeout_ends_the_call() {
                 break;
             }
             Ok(Some(reply)) => match reply.r {
-                Some(crosscache::put_reply::R::Refused(refused)) => {
-                    assert_eq!(refused.reason, crosscache::Reason::Invalid as i32);
+                Some(proto::put_reply::R::Refused(refused)) => {
+                    assert_eq!(refused.reason, proto::Reason::Invalid as i32);
                     timed_out = true;
                     break;
                 }
@@ -1393,7 +1383,7 @@ async fn l0_29_cancel_retires_blocked_chunks() {
             )
             .await;
         match outcome {
-            PutOutcome::Refused(reason) if reason == crosscache::Reason::Inflight as u8 => {
+            PutOutcome::Refused(reason) if reason == proto::Reason::Inflight as u8 => {
                 assert!(Instant::now() < deadline, "INFLIGHT did not drain");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -1513,8 +1503,8 @@ async fn l0_32_streaming_reservation_includes_the_disk_record() {
     let before = host.gauge("nvme_reserved_bytes");
     assert!(before >= 24576 + 32768, "hold was not included: {before}");
     sender
-        .send(crosscache::PutMessage {
-            m: Some(crosscache::put_message::M::Cancel(crosscache::Cancel {})),
+        .send(proto::PutMessage {
+            m: Some(proto::put_message::M::Cancel(proto::Cancel {})),
         })
         .await
         .unwrap();
@@ -1552,7 +1542,7 @@ async fn l0_33_write_budget_uses_the_streaming_charge() {
     client.store(key(2048 * 64), None).await;
     assert_eq!(
         client.put(key(256), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
     let room = subscription.until_room().await;
     assert!(room > 0);
@@ -1599,7 +1589,7 @@ async fn l0_35_generation_fencing_reaches_the_owner_thread() {
     // A second Hello on the same transport supersedes generation 1.
     let hello = client
         .inner
-        .hello(tonic::Request::new(crosscache::HelloRequest {
+        .hello(tonic::Request::new(proto::HelloRequest {
             protocol: 1,
             replica: "again".into(),
             descriptor: Some(descriptor_msg(&client.descriptor)),
@@ -1610,7 +1600,7 @@ async fn l0_35_generation_fencing_reaches_the_owner_thread() {
     client.generation = hello.generation;
     // The old stream must not be able to begin into the new session.
     sender
-        .send(crosscache::PutMessage {
+        .send(proto::PutMessage {
             m: Some(client.begin(key(256), None)),
         })
         .await
@@ -1619,7 +1609,7 @@ async fn l0_35_generation_fencing_reaches_the_owner_thread() {
         match replies.message().await {
             Err(status) => break status,
             Ok(Some(reply)) => match reply.r {
-                Some(crosscache::put_reply::R::Refused(_)) => {
+                Some(proto::put_reply::R::Refused(_)) => {
                     panic!("stale stream reached the new session")
                 }
                 _ => continue,
@@ -1820,7 +1810,7 @@ async fn l0_41_streaming_windows_respect_the_nvme_cap() {
     // The disk record fits the cap but its first staging window does not.
     assert_eq!(
         client.put(key(128), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
     assert!(host.gauge("nvme_reserved_bytes") <= 24 * 1024);
     // A row-only record whose window does fit still streams.
@@ -1841,14 +1831,14 @@ async fn l0_42_cancel_before_dispatch_withdraws_the_put() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::PutMessage {
+        .send(proto::PutMessage {
             m: Some(client.begin(key(128), None)),
         })
         .await
         .unwrap();
     sender
-        .send(crosscache::PutMessage {
-            m: Some(crosscache::put_message::M::Cancel(crosscache::Cancel {})),
+        .send(proto::PutMessage {
+            m: Some(proto::put_message::M::Cancel(proto::Cancel {})),
         })
         .await
         .unwrap();
@@ -1886,7 +1876,7 @@ async fn l0_43_failed_get_drains_release_every_pin() {
         .get(&[key(128), key(256)], 0, 4, GetOptions::default())
         .await;
     assert!(
-        matches!(outcome, GetOutcome::Refused(reason) if reason == crosscache::Reason::Io as u8),
+        matches!(outcome, GetOutcome::Refused(reason) if reason == proto::Reason::Io as u8),
         "{outcome:?}"
     );
     host.wait(|host| host.gauge("cleanup_records") == 0 && host.gauge("leases") == 0);
@@ -1908,8 +1898,8 @@ async fn l0_44_wrong_namespace_get_is_refused_invalid() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::GetMessage {
-            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+        .send(proto::GetMessage {
+            m: Some(proto::get_message::M::Begin(proto::GetBegin {
                 namespace_id: other.namespace_id().to_vec(),
                 chain: vec![key_msg(key(128))],
                 skip_pages: 0,
@@ -1924,10 +1914,10 @@ async fn l0_44_wrong_namespace_get_is_refused_invalid() {
     let reply = replies.message().await.unwrap().unwrap();
     assert!(matches!(
         reply.r,
-        Some(crosscache::get_reply::R::Refused(crosscache::Refused {
+        Some(proto::get_reply::R::Refused(proto::Refused {
             reason,
             ..
-        })) if reason == crosscache::Reason::Invalid as i32
+        })) if reason == proto::Reason::Invalid as i32
     ));
     drop(sender);
     drop(replies);
@@ -1966,7 +1956,7 @@ async fn l0_45_reserve_before_pin_with_four_open_puts() {
             .unwrap()
             .into_inner();
         sender
-            .send(crosscache::PutMessage {
+            .send(proto::PutMessage {
                 m: Some(client.begin(key(128 + index * 64), Some(key(64)))),
             })
             .await
@@ -1978,17 +1968,17 @@ async fn l0_45_reserve_before_pin_with_four_open_puts() {
     for (_, replies) in streams.iter_mut() {
         loop {
             match replies.message().await.unwrap().unwrap().r {
-                Some(crosscache::put_reply::R::Accept(_)) => {
+                Some(proto::put_reply::R::Accept(_)) => {
                     accepts += 1;
                     break;
                 }
-                Some(crosscache::put_reply::R::Refused(refused))
-                    if refused.reason == crosscache::Reason::Budget as i32 =>
+                Some(proto::put_reply::R::Refused(refused))
+                    if refused.reason == proto::Reason::Budget as i32 =>
                 {
                     budget += 1;
                     break;
                 }
-                Some(crosscache::put_reply::R::Grant(_)) => continue,
+                Some(proto::put_reply::R::Grant(_)) => continue,
                 Some(_) => break,
                 None => break,
             }
@@ -2046,7 +2036,7 @@ async fn l0_47_dram_only_evicts_the_parent_to_store_the_root() {
     assert_eq!(fetched[0], stored);
     assert_eq!(
         client.get(&[key(128)], 0, 2, GetOptions::default()).await,
-        GetOutcome::Refused(crosscache::Reason::Invalid as u8)
+        GetOutcome::Refused(proto::Reason::Invalid as u8)
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }
@@ -2077,15 +2067,15 @@ async fn l0_48_streaming_reserves_both_grantable_windows() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::PutMessage {
+        .send(proto::PutMessage {
             m: Some(client.begin(key(128 * 64), None)),
         })
         .await
         .unwrap();
     let first = replies.message().await.unwrap().unwrap();
     match first.r {
-        Some(crosscache::put_reply::R::Refused(refused)) => {
-            assert_eq!(refused.reason, crosscache::Reason::Budget as i32);
+        Some(proto::put_reply::R::Refused(refused)) => {
+            assert_eq!(refused.reason, proto::Reason::Budget as i32);
         }
         other => panic!("Put was accepted before its reservation fitted: {other:?}"),
     }
@@ -2137,7 +2127,7 @@ async fn l0_49_oversized_window_never_earns_room() {
     let mut subscription = client.subscribe().await;
     assert_eq!(
         client.put(key(64), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
@@ -2173,15 +2163,15 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::PutMessage {
+        .send(proto::PutMessage {
             m: Some(client.begin(key(192 * 64), None)),
         })
         .await
         .unwrap();
     let first = replies.message().await.unwrap().unwrap();
     match first.r {
-        Some(crosscache::put_reply::R::Refused(refused)) => {
-            assert_eq!(refused.reason, crosscache::Reason::Budget as i32);
+        Some(proto::put_reply::R::Refused(refused)) => {
+            assert_eq!(refused.reason, proto::Reason::Budget as i32);
         }
         other => panic!("Put was accepted before the hold fitted: {other:?}"),
     }
@@ -2225,7 +2215,7 @@ async fn l0_51_rootless_child_waiting_for_its_parent_earns_no_room() {
         client
             .put(key(384), Some(key(128)), PutOptions::default())
             .await,
-        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
@@ -2262,7 +2252,7 @@ async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::PutMessage {
+        .send(proto::PutMessage {
             m: Some(client.begin(record, None)),
         })
         .await
@@ -2278,19 +2268,19 @@ async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
     while !stored {
         let reply = replies.message().await.unwrap().unwrap();
         match reply.r {
-            Some(crosscache::put_reply::R::Accept(accept)) => {
+            Some(proto::put_reply::R::Accept(accept)) => {
                 first = u32::try_from(accept.first_page).unwrap();
                 let parent = accept.parent.as_ref().map(key_from_msg);
                 let (value, data, _) = client.content(record, parent, first);
                 header = Some(value);
                 source = Some(data);
             }
-            Some(crosscache::put_reply::R::Grant(grant)) => {
+            Some(proto::put_reply::R::Grant(grant)) => {
                 grants.push(Instant::now());
                 let value = header.as_ref().unwrap();
                 let data = source.as_mut().unwrap();
                 let memory = grant.memory.as_ref().unwrap();
-                let region = if memory.region == crosscache::Region::Arena as i32 {
+                let region = if memory.region == proto::Region::Arena as i32 {
                     Reg::Arena
                 } else {
                     Reg::Staging
@@ -2311,16 +2301,14 @@ async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
                 };
                 client.write(region, memory.offset, &data[start..start + length]);
                 sender
-                    .send(crosscache::PutMessage {
-                        m: Some(crosscache::put_message::M::Filled(
-                            crosscache::WindowFilled {
-                                transfer: grant.transfer,
-                                index: grant.index,
-                                page_xxh3: hashes,
-                                row_xxh3: row_hash.unwrap_or(0),
-                                has_row: grant.row,
-                            },
-                        )),
+                    .send(proto::PutMessage {
+                        m: Some(proto::put_message::M::Filled(proto::WindowFilled {
+                            transfer: grant.transfer,
+                            index: grant.index,
+                            page_xxh3: hashes,
+                            row_xxh3: row_hash.unwrap_or(0),
+                            has_row: grant.row,
+                        })),
                     })
                     .await
                     .unwrap();
@@ -2334,14 +2322,12 @@ async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
                         .enumerate()
                     {
                         sender
-                            .send(crosscache::PutMessage {
-                                m: Some(crosscache::put_message::M::Commit(
-                                    crosscache::PutCommit {
-                                        transfer: grant.transfer,
-                                        metadata_offset: (index * 4096) as u64,
-                                        metadata: chunk.to_vec(),
-                                    },
-                                )),
+                            .send(proto::PutMessage {
+                                m: Some(proto::put_message::M::Commit(proto::PutCommit {
+                                    transfer: grant.transfer,
+                                    metadata_offset: (index * 4096) as u64,
+                                    metadata: chunk.to_vec(),
+                                })),
                             })
                             .await
                             .unwrap();
@@ -2349,8 +2335,8 @@ async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
                     commit_sent = true;
                 }
             }
-            Some(crosscache::put_reply::R::Stored(_)) => stored = true,
-            Some(crosscache::put_reply::R::Refused(refused)) => {
+            Some(proto::put_reply::R::Stored(_)) => stored = true,
+            Some(proto::put_reply::R::Refused(refused)) => {
                 panic!("streamed Put refused: {refused:?}")
             }
             None => break,
@@ -2405,8 +2391,8 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
         .unwrap()
         .into_inner();
     lease_sender
-        .send(crosscache::GetMessage {
-            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+        .send(proto::GetMessage {
+            m: Some(proto::get_message::M::Begin(proto::GetBegin {
                 namespace_id: resident.descriptor.namespace_id().to_vec(),
                 chain: vec![key_msg(key(64))],
                 skip_pages: 0,
@@ -2425,20 +2411,20 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
         tokio::time::timeout(Duration::from_millis(100), lease_replies.message()).await
     {
         match reply.r {
-            Some(crosscache::get_reply::R::Ready(grant)) => {
+            Some(proto::get_reply::R::Ready(grant)) => {
                 held.push((grant.transfer, grant.index));
             }
-            Some(crosscache::get_reply::R::Refused(refused)) => {
+            Some(proto::get_reply::R::Refused(refused)) => {
                 panic!("lease Get refused: {refused:?}")
             }
-            Some(crosscache::get_reply::R::Done(_)) | None => break,
+            Some(proto::get_reply::R::Done(_)) | None => break,
             Some(_) => continue,
         }
     }
     assert!(!held.is_empty(), "lease Get granted no window");
     assert_eq!(
         waiter.put(key(64), None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+        PutOutcome::Refused(proto::Reason::Budget as u8)
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
@@ -2448,17 +2434,18 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
     );
     for (transfer, index) in held {
         lease_sender
-            .send(crosscache::GetMessage {
-                m: Some(crosscache::get_message::M::Released(
-                    crosscache::WindowReleased { transfer, index },
-                )),
+            .send(proto::GetMessage {
+                m: Some(proto::get_message::M::Released(proto::WindowReleased {
+                    transfer,
+                    index,
+                })),
             })
             .await
             .unwrap();
     }
     loop {
         match lease_replies.message().await.unwrap().unwrap().r {
-            Some(crosscache::get_reply::R::Done(_)) | None => break,
+            Some(proto::get_reply::R::Done(_)) | None => break,
             Some(_) => continue,
         }
     }
@@ -2476,11 +2463,11 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
 
 async fn diagnostic_lease_all(
     client: &mut Client,
-    keys: Vec<flare_crosscache::Key>,
+    keys: Vec<selene::Key>,
     pages: u32,
 ) -> (
-    tokio::sync::mpsc::Sender<crosscache::GetMessage>,
-    tonic::Streaming<crosscache::GetReply>,
+    tokio::sync::mpsc::Sender<proto::GetMessage>,
+    tonic::Streaming<proto::GetReply>,
     Vec<(u64, u32)>,
 ) {
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
@@ -2491,8 +2478,8 @@ async fn diagnostic_lease_all(
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::GetMessage {
-            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+        .send(proto::GetMessage {
+            m: Some(proto::get_message::M::Begin(proto::GetBegin {
                 namespace_id: client.descriptor.namespace_id().to_vec(),
                 chain: keys.iter().map(|key| key_msg(*key)).collect(),
                 skip_pages: 0,
@@ -2509,13 +2496,13 @@ async fn diagnostic_lease_all(
         tokio::time::timeout(Duration::from_millis(100), replies.message()).await
     {
         match reply.r {
-            Some(crosscache::get_reply::R::Ready(grant)) => {
+            Some(proto::get_reply::R::Ready(grant)) => {
                 held.push((grant.transfer, grant.index));
             }
-            Some(crosscache::get_reply::R::Refused(refused)) => {
+            Some(proto::get_reply::R::Refused(refused)) => {
                 panic!("diagnostic lease Get refused: {refused:?}")
             }
-            Some(crosscache::get_reply::R::Done(_)) | None => break,
+            Some(proto::get_reply::R::Done(_)) | None => break,
             Some(_) => continue,
         }
     }
@@ -2523,16 +2510,17 @@ async fn diagnostic_lease_all(
 }
 
 async fn diagnostic_release_all(
-    sender: tokio::sync::mpsc::Sender<crosscache::GetMessage>,
-    mut replies: tonic::Streaming<crosscache::GetReply>,
+    sender: tokio::sync::mpsc::Sender<proto::GetMessage>,
+    mut replies: tonic::Streaming<proto::GetReply>,
     held: Vec<(u64, u32)>,
 ) {
     for (transfer, index) in held {
         sender
-            .send(crosscache::GetMessage {
-                m: Some(crosscache::get_message::M::Released(
-                    crosscache::WindowReleased { transfer, index },
-                )),
+            .send(proto::GetMessage {
+                m: Some(proto::get_message::M::Released(proto::WindowReleased {
+                    transfer,
+                    index,
+                })),
             })
             .await
             .unwrap();
@@ -2540,7 +2528,7 @@ async fn diagnostic_release_all(
     while let Ok(Ok(Some(reply))) =
         tokio::time::timeout(Duration::from_millis(100), replies.message()).await
     {
-        if matches!(reply.r, Some(crosscache::get_reply::R::Done(_)) | None) {
+        if matches!(reply.r, Some(proto::get_reply::R::Done(_)) | None) {
             break;
         }
     }
@@ -2624,8 +2612,8 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
         .unwrap()
         .into_inner();
     sender
-        .send(crosscache::GetMessage {
-            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+        .send(proto::GetMessage {
+            m: Some(proto::get_message::M::Begin(proto::GetBegin {
                 namespace_id: client.descriptor.namespace_id().to_vec(),
                 chain: vec![key_msg(key(64))],
                 skip_pages: 0,
@@ -2639,9 +2627,9 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
         .unwrap();
     let (region, offset, length, record_offset) = loop {
         match replies.message().await.unwrap().unwrap().r {
-            Some(crosscache::get_reply::R::Ready(grant)) => {
+            Some(proto::get_reply::R::Ready(grant)) => {
                 let memory = grant.memory.unwrap();
-                let region = if memory.region == crosscache::Region::Arena as i32 {
+                let region = if memory.region == proto::Region::Arena as i32 {
                     Reg::Arena
                 } else {
                     Reg::Staging
@@ -2653,7 +2641,7 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
                     usize::try_from(grant.record_offset).unwrap(),
                 );
             }
-            Some(crosscache::get_reply::R::Refused(refused)) => {
+            Some(proto::get_reply::R::Refused(refused)) => {
                 panic!("diagnostic Get refused: {refused:?}")
             }
             Some(_) => continue,
@@ -2661,8 +2649,8 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
         }
     };
     sender
-        .send(crosscache::GetMessage {
-            m: Some(crosscache::get_message::M::Cancel(crosscache::Cancel {})),
+        .send(proto::GetMessage {
+            m: Some(proto::get_message::M::Cancel(proto::Cancel {})),
         })
         .await
         .unwrap();
@@ -2671,9 +2659,7 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
     {
         if matches!(
             reply.r,
-            Some(crosscache::get_reply::R::Done(_))
-                | Some(crosscache::get_reply::R::Refused(_))
-                | None
+            Some(proto::get_reply::R::Done(_)) | Some(proto::get_reply::R::Refused(_)) | None
         ) {
             break;
         }
@@ -2695,7 +2681,7 @@ async fn l0_56_dram_only_arena_boundary_ignores_the_envelope() {
     let mut host = Host::dram_only(16 * 1024 * 1024);
     host.start();
     let mut value = descriptor();
-    value.ranks = vec![flare_crosscache::record::RankSizes {
+    value.ranks = vec![selene::record::RankSizes {
         planes: vec![65_539, 4_100],
         row_bytes: 1_000_003,
     }];
@@ -2719,6 +2705,6 @@ async fn l0_56_dram_only_arena_boundary_ignores_the_envelope() {
     assert!(header.length_with_row() > 16 * 1024 * 1024);
     assert_eq!(
         client.put(larger, None, PutOptions::default()).await,
-        PutOutcome::Refused(crosscache::Reason::Oversize as u8)
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
     );
 }

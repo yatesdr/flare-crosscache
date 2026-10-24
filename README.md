@@ -13,7 +13,7 @@ and `twox-hash`; there is no async runtime.
 ```sh
 cargo build --release --locked
 mkdir -p /run/flare-cache /nvme/flare-cache
-target/release/flare-crosscache \
+target/release/selene \
   --socket /run/flare-cache/manager.sock \
   --root /nvme/flare-cache \
   --memory 8G --nvme 256G --staging 64M \
@@ -66,12 +66,12 @@ cancellations, discarded frames and arena allocations.
 ## Docker
 
 ```sh
-docker build -t flare-crosscache .
-docker run --rm --name flare-crosscache \
+docker build -t selene .
+docker run --rm --name selene \
   --user "$(id -u):$(id -g)" --pid=host --network=host \
   -v /run/flare-cache:/run/flare-cache \
   -v /nvme/flare-cache:/var/lib/flare-cache \
-  flare-crosscache --memory 8G --nvme 256G \
+  selene --memory 8G --nvme 256G \
   --metrics 127.0.0.1:9108
 ```
 

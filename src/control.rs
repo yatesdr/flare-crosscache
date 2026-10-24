@@ -1,10 +1,9 @@
 use crate::{
-    Key, Result, crosscache,
-    crosscache::{
+    Key, Result, invalid, proto,
+    proto::{
         get_message, get_reply, local_cache_server::LocalCache,
         local_cache_server::LocalCacheServer, put_message, put_reply,
     },
-    invalid,
     record::{Descriptor, RankSizes},
     store::{self, Config, GetAnswer, NO_PROGRESS, PutAnswer, Store, StoreCommand},
 };
@@ -34,7 +33,7 @@ use tonic::{
 };
 
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
-const GENERATION: &str = "x-crosscache-generation";
+const GENERATION: &str = "x-selene-generation";
 
 #[derive(Clone)]
 pub struct PeerInfo {
@@ -153,14 +152,14 @@ impl Service {
     }
 }
 
-pub fn key_to_proto(key: &Key) -> crosscache::Key {
-    crosscache::Key {
+pub fn key_to_proto(key: &Key) -> proto::Key {
+    proto::Key {
         consumed_tokens: key.consumed_tokens,
         digest: key.digest.to_vec(),
     }
 }
 
-fn key_from_proto(key: Option<crosscache::Key>) -> std::result::Result<Key, Status> {
+fn key_from_proto(key: Option<proto::Key>) -> std::result::Result<Key, Status> {
     let key = key.ok_or_else(|| Status::invalid_argument("missing key"))?;
     let digest: [u8; 16] = key
         .digest
@@ -177,7 +176,7 @@ fn key_from_proto(key: Option<crosscache::Key>) -> std::result::Result<Key, Stat
 }
 
 fn descriptor_from_proto(
-    value: Option<crosscache::Descriptor>,
+    value: Option<proto::Descriptor>,
 ) -> std::result::Result<Descriptor, Status> {
     let value = value.ok_or_else(|| Status::invalid_argument("missing descriptor"))?;
     let identity: [u8; 32] = value
@@ -216,8 +215,8 @@ fn descriptor_from_proto(
     Ok(descriptor)
 }
 
-pub fn entry_to_proto(entry: &store::EntryData) -> crosscache::CatalogEntry {
-    crosscache::CatalogEntry {
+pub fn entry_to_proto(entry: &store::EntryData) -> proto::CatalogEntry {
+    proto::CatalogEntry {
         key: Some(key_to_proto(&entry.key)),
         parent: entry.parent.map(|parent| key_to_proto(&parent)),
         has_parent: entry.parent.is_some(),
@@ -225,9 +224,9 @@ pub fn entry_to_proto(entry: &store::EntryData) -> crosscache::CatalogEntry {
         tail_pages: u64::from(entry.tail_pages),
         row: entry.row,
         tier: if entry.tier == 0 {
-            crosscache::Tier::Dram as i32
+            proto::Tier::Dram as i32
         } else {
-            crosscache::Tier::Nvme as i32
+            proto::Tier::Nvme as i32
         },
         durable: entry.durable,
         bytes: entry.bytes,
@@ -246,10 +245,10 @@ fn map_hello_error(error: io::Error) -> Status {
     }
 }
 
-fn put_reply(answer: PutAnswer) -> crosscache::PutReply {
+fn put_reply(answer: PutAnswer) -> proto::PutReply {
     use put_reply::R;
     let r = match answer {
-        PutAnswer::Accept(accept) => R::Accept(crosscache::PutAccept {
+        PutAnswer::Accept(accept) => R::Accept(proto::PutAccept {
             transfer: accept.transfer,
             first_page: u64::from(accept.first_page),
             parent: accept.parent.map(|parent| key_to_proto(&parent)),
@@ -257,22 +256,22 @@ fn put_reply(answer: PutAnswer) -> crosscache::PutReply {
             record_bytes: accept.record_bytes,
         }),
         PutAnswer::Grant(grant) => R::Grant(window_grant(grant)),
-        PutAnswer::Stored { bytes } => R::Stored(crosscache::Stored { bytes }),
-        PutAnswer::Refused(refused) => R::Refused(crosscache::Refused {
+        PutAnswer::Stored { bytes } => R::Stored(proto::Stored { bytes }),
+        PutAnswer::Refused(refused) => R::Refused(proto::Refused {
             reason: i32::from(refused.reason),
             detail: refused.detail,
         }),
     };
-    crosscache::PutReply { r: Some(r) }
+    proto::PutReply { r: Some(r) }
 }
 
-fn get_reply(answer: GetAnswer) -> crosscache::GetReply {
+fn get_reply(answer: GetAnswer) -> proto::GetReply {
     use get_reply::R;
     let r = match answer {
         GetAnswer::Leased {
             transfer,
             record_bytes,
-        } => R::Leased(crosscache::GetLeased {
+        } => R::Leased(proto::GetLeased {
             transfer,
             record_bytes,
         }),
@@ -281,30 +280,30 @@ fn get_reply(answer: GetAnswer) -> crosscache::GetReply {
             metadata_offset,
             metadata,
             source,
-        } => R::Meta(crosscache::RecordMeta {
+        } => R::Meta(proto::RecordMeta {
             record,
             metadata_offset,
             metadata,
             source,
         }),
         GetAnswer::Ready(grant) => R::Ready(window_grant(grant)),
-        GetAnswer::Done => R::Done(crosscache::GetDone {}),
-        GetAnswer::Refused(refused) => R::Refused(crosscache::Refused {
+        GetAnswer::Done => R::Done(proto::GetDone {}),
+        GetAnswer::Refused(refused) => R::Refused(proto::Refused {
             reason: i32::from(refused.reason),
             detail: refused.detail,
         }),
     };
-    crosscache::GetReply { r: Some(r) }
+    proto::GetReply { r: Some(r) }
 }
 
-fn window_grant(grant: store::WindowGrant) -> crosscache::WindowGrant {
-    crosscache::WindowGrant {
+fn window_grant(grant: store::WindowGrant) -> proto::WindowGrant {
+    proto::WindowGrant {
         transfer: grant.transfer,
         index: grant.index,
         record: grant.record,
         record_offset: grant.record_offset,
         length: grant.length,
-        memory: Some(crosscache::WindowRef {
+        memory: Some(proto::WindowRef {
             region: grant.region,
             offset: grant.offset,
             length: grant.length,
@@ -315,18 +314,18 @@ fn window_grant(grant: store::WindowGrant) -> crosscache::WindowGrant {
     }
 }
 
-fn refused(reason: crosscache::Reason) -> crosscache::PutReply {
-    crosscache::PutReply {
-        r: Some(put_reply::R::Refused(crosscache::Refused {
+fn refused(reason: proto::Reason) -> proto::PutReply {
+    proto::PutReply {
+        r: Some(put_reply::R::Refused(proto::Refused {
             reason: reason as i32,
             detail: String::new(),
         })),
     }
 }
 
-fn refused_get(reason: crosscache::Reason) -> crosscache::GetReply {
-    crosscache::GetReply {
-        r: Some(get_reply::R::Refused(crosscache::Refused {
+fn refused_get(reason: proto::Reason) -> proto::GetReply {
+    proto::GetReply {
+        r: Some(get_reply::R::Refused(proto::Refused {
             reason: reason as i32,
             detail: String::new(),
         })),
@@ -378,27 +377,21 @@ impl Service {
 impl LocalCache for Service {
     type SubscribeStream = Pin<
         Box<
-            dyn tokio_stream::Stream<Item = std::result::Result<crosscache::CatalogEvent, Status>>
+            dyn tokio_stream::Stream<Item = std::result::Result<proto::CatalogEvent, Status>>
                 + Send,
         >,
     >;
     type PutStream = Pin<
-        Box<
-            dyn tokio_stream::Stream<Item = std::result::Result<crosscache::PutReply, Status>>
-                + Send,
-        >,
+        Box<dyn tokio_stream::Stream<Item = std::result::Result<proto::PutReply, Status>> + Send>,
     >;
     type GetStream = Pin<
-        Box<
-            dyn tokio_stream::Stream<Item = std::result::Result<crosscache::GetReply, Status>>
-                + Send,
-        >,
+        Box<dyn tokio_stream::Stream<Item = std::result::Result<proto::GetReply, Status>> + Send>,
     >;
 
     async fn hello(
         &self,
-        request: Request<crosscache::HelloRequest>,
-    ) -> std::result::Result<Response<crosscache::HelloReply>, Status> {
+        request: Request<proto::HelloRequest>,
+    ) -> std::result::Result<Response<proto::HelloReply>, Status> {
         let peer = Self::peer(&request)?;
         let message = request.into_inner();
         if message.protocol != 1 {
@@ -427,7 +420,7 @@ impl LocalCache for Service {
             generation.current = answer.generation;
             generation.issued.insert(answer.generation);
         }
-        Ok(Response::new(crosscache::HelloReply {
+        Ok(Response::new(proto::HelloReply {
             namespace_id: answer.namespace.to_vec(),
             generation: answer.generation,
             arena_path: answer.arena_path,
@@ -443,7 +436,7 @@ impl LocalCache for Service {
 
     async fn subscribe(
         &self,
-        request: Request<crosscache::SubscribeRequest>,
+        request: Request<proto::SubscribeRequest>,
     ) -> std::result::Result<Response<Self::SubscribeStream>, Status> {
         let peer = Self::peer(&request)?;
         let generation = self.generation(&request, &peer)?;
@@ -489,14 +482,14 @@ impl LocalCache for Service {
 
     async fn locate(
         &self,
-        _request: Request<crosscache::LocateRequest>,
-    ) -> std::result::Result<Response<crosscache::LocateReply>, Status> {
+        _request: Request<proto::LocateRequest>,
+    ) -> std::result::Result<Response<proto::LocateReply>, Status> {
         Err(Status::unimplemented("Locate is P2"))
     }
 
     async fn put(
         &self,
-        request: Request<Streaming<crosscache::PutMessage>>,
+        request: Request<Streaming<proto::PutMessage>>,
     ) -> std::result::Result<Response<Self::PutStream>, Status> {
         let peer = Self::peer(&request)?;
         let generation = self.generation(&request, &peer)?;
@@ -512,7 +505,7 @@ impl LocalCache for Service {
 
     async fn get(
         &self,
-        request: Request<Streaming<crosscache::GetMessage>>,
+        request: Request<Streaming<proto::GetMessage>>,
     ) -> std::result::Result<Response<Self::GetStream>, Status> {
         let peer = Self::peer(&request)?;
         let generation = self.generation(&request, &peer)?;
@@ -561,16 +554,16 @@ async fn pending_get_terminal(
 
 async fn put_task(
     peer: PeerInfo,
-    mut stream: Streaming<crosscache::PutMessage>,
+    mut stream: Streaming<proto::PutMessage>,
     commands: mpsc::Sender<StoreCommand>,
     transfer: u64,
     generation: u64,
-    output: mpsc::Sender<std::result::Result<crosscache::PutReply, Status>>,
+    output: mpsc::Sender<std::result::Result<proto::PutReply, Status>>,
 ) {
     let first = match stream.message().await {
         Ok(Some(message)) => message,
         Ok(None) => {
-            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
             return;
         }
         Err(status) => {
@@ -581,49 +574,49 @@ async fn put_task(
     let begin = match first.m {
         Some(put_message::M::Begin(begin)) => begin,
         _ => {
-            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
             return;
         }
     };
     let namespace: [u8; 32] = match begin.namespace_id.as_slice().try_into() {
         Ok(namespace) => namespace,
         Err(_) => {
-            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
             return;
         }
     };
     let descriptor = match descriptor_from_proto(begin.descriptor) {
         Ok(descriptor) => descriptor,
         Err(_) => {
-            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
             return;
         }
     };
     let key = match key_from_proto(begin.key) {
         Ok(key) => key,
         Err(_) => {
-            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
             return;
         }
     };
     let bucket: [u8; 16] = match begin.bucket.as_slice().try_into() {
         Ok(bucket) => bucket,
         Err(_) => {
-            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
             return;
         }
     };
     let chain_pages = match u32::try_from(begin.chain_pages) {
         Ok(pages) => pages,
         Err(_) => {
-            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
             return;
         }
     };
     let tail_pages = match u32::try_from(begin.published_tail_pages) {
         Ok(pages) => pages,
         Err(_) => {
-            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
             return;
         }
     };
@@ -632,13 +625,13 @@ async fn put_task(
             if begin.published_parent.as_ref().is_some_and(|key| {
                 key.consumed_tokens == 0 && key.digest.iter().all(|byte| *byte == 0)
             }) {
-                let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+                let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
                 return;
             }
             match key_from_proto(begin.published_parent) {
                 Ok(key) => Some(key),
                 Err(_) => {
-                    let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+                    let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
                     return;
                 }
             }
@@ -715,7 +708,7 @@ async fn put_task(
                     Ok(Some(message)) => match message.m {
                         Some(put_message::M::Filled(filled)) => {
                             if filled.transfer != transfer {
-                                let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+                                let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
                                 break;
                             }
                             let (reply, ack) = oneshot::channel();
@@ -741,7 +734,7 @@ async fn put_task(
                                         let _ = output.send(Ok(put_reply(answer))).await;
                                     }
                                     None => {
-                                        let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+                                        let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
                                     }
                                 }
                                 break;
@@ -749,7 +742,7 @@ async fn put_task(
                         }
                         Some(put_message::M::Commit(commit)) => {
                             if commit.transfer != transfer {
-                                let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+                                let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
                                 break;
                             }
                             let (reply, ack) = oneshot::channel();
@@ -774,7 +767,7 @@ async fn put_task(
                                         let _ = output.send(Ok(put_reply(answer))).await;
                                     }
                                     None => {
-                                        let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+                                        let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
                                     }
                                 }
                                 break;
@@ -797,7 +790,7 @@ async fn put_task(
                             break;
                         }
                         Some(put_message::M::Begin(_)) | None => {
-                            let _ = output.send(Ok(refused(crosscache::Reason::Invalid))).await;
+                            let _ = output.send(Ok(refused(proto::Reason::Invalid))).await;
                             let _ = commands.send(StoreCommand::Cancel {
                                 connection: peer.connection,
                                 generation,
@@ -839,18 +832,16 @@ async fn put_task(
 
 async fn get_task(
     peer: PeerInfo,
-    mut stream: Streaming<crosscache::GetMessage>,
+    mut stream: Streaming<proto::GetMessage>,
     commands: mpsc::Sender<StoreCommand>,
     transfer: u64,
     generation: u64,
-    output: mpsc::Sender<std::result::Result<crosscache::GetReply, Status>>,
+    output: mpsc::Sender<std::result::Result<proto::GetReply, Status>>,
 ) {
     let first = match stream.message().await {
         Ok(Some(message)) => message,
         Ok(None) => {
-            let _ = output
-                .send(Ok(refused_get(crosscache::Reason::Invalid)))
-                .await;
+            let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
             return;
         }
         Err(status) => {
@@ -861,25 +852,19 @@ async fn get_task(
     let begin = match first.m {
         Some(get_message::M::Begin(begin)) => begin,
         _ => {
-            let _ = output
-                .send(Ok(refused_get(crosscache::Reason::Invalid)))
-                .await;
+            let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
             return;
         }
     };
     let namespace: [u8; 32] = match begin.namespace_id.as_slice().try_into() {
         Ok(namespace) => namespace,
         Err(_) => {
-            let _ = output
-                .send(Ok(refused_get(crosscache::Reason::Invalid)))
-                .await;
+            let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
             return;
         }
     };
     if !begin.destinations.is_empty() || begin.transfer != 0 {
-        let _ = output
-            .send(Ok(refused_get(crosscache::Reason::Invalid)))
-            .await;
+        let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
         return;
     }
     let mut chain = Vec::with_capacity(begin.chain.len());
@@ -887,34 +872,26 @@ async fn get_task(
         match key_from_proto(Some(key)) {
             Ok(key) => chain.push(key),
             Err(_) => {
-                let _ = output
-                    .send(Ok(refused_get(crosscache::Reason::Invalid)))
-                    .await;
+                let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
                 return;
             }
         }
     }
     if chain.is_empty() || chain.len() > store::MAX_CHAIN {
-        let _ = output
-            .send(Ok(refused_get(crosscache::Reason::Invalid)))
-            .await;
+        let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
         return;
     }
     let skip_pages = match u32::try_from(begin.skip_pages) {
         Ok(pages) => pages,
         Err(_) => {
-            let _ = output
-                .send(Ok(refused_get(crosscache::Reason::Invalid)))
-                .await;
+            let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
             return;
         }
     };
     let expected_pages = match u32::try_from(begin.expected_pages) {
         Ok(pages) => pages,
         Err(_) => {
-            let _ = output
-                .send(Ok(refused_get(crosscache::Reason::Invalid)))
-                .await;
+            let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
             return;
         }
     };
@@ -983,7 +960,7 @@ async fn get_task(
                     Ok(Some(message)) => match message.m {
                         Some(get_message::M::Released(released)) => {
                             if released.transfer != transfer {
-                                let _ = output.send(Ok(refused_get(crosscache::Reason::Invalid))).await;
+                                let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
                                 break;
                             }
                             let (reply, ack) = oneshot::channel();
@@ -1007,7 +984,7 @@ async fn get_task(
                                         let _ = output.send(Ok(get_reply(answer))).await;
                                     }
                                     None => {
-                                        let _ = output.send(Ok(refused_get(crosscache::Reason::Invalid))).await;
+                                        let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
                                     }
                                 }
                                 break;
@@ -1022,7 +999,7 @@ async fn get_task(
                             break;
                         }
                         Some(get_message::M::Begin(_)) | None => {
-                            let _ = output.send(Ok(refused_get(crosscache::Reason::Invalid))).await;
+                            let _ = output.send(Ok(refused_get(proto::Reason::Invalid))).await;
                             let _ = commands.send(StoreCommand::Cancel {
                                 connection: peer.connection,
                                 generation,

@@ -259,7 +259,7 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 pub fn namespace_id(identity: &[u8; 32], fingerprint: &[u8; 16], tenant: &str) -> NamespaceId {
     let mut hasher = Blake2bVar::new(32).unwrap();
-    hasher.update(b"crosscache-ns-v1");
+    hasher.update(b"selene-ns-v1");
     hasher.update(identity);
     hasher.update(fingerprint);
     hasher.update(&[tenant.len() as u8]);

@@ -1,10 +1,10 @@
 use crate::{
     Key, Result,
     arena::{Arena, Extent, ExtentSlice},
-    crosscache,
     disk::{self, DiskExtent, RecordData, Task},
     invalid,
     local::{GrantError, Local, Region, WindowShape},
+    proto,
     record::{self, Descriptor, Header, NamespaceId},
     tree::{Eviction, Tree},
 };
@@ -380,7 +380,7 @@ enum LiveEvent {
 
 struct Subscription {
     namespace: NamespaceId,
-    sender: tokio::sync::mpsc::Sender<crosscache::CatalogEvent>,
+    sender: tokio::sync::mpsc::Sender<proto::CatalogEvent>,
     sequence: u64,
     seq0: u64,
     snapshot: Option<VecDeque<EntryData>>,
@@ -924,7 +924,7 @@ impl Store {
         if open + queued >= OPEN_PUTS {
             self.metrics.retry_queue += 1;
             let _ = events.try_send(Ok(PutAnswer::Refused(Refused {
-                reason: crosscache::Reason::Queue as u8,
+                reason: proto::Reason::Queue as u8,
                 detail: "open Put limit".into(),
             })));
             return;
@@ -961,7 +961,7 @@ impl Store {
         if open + queued >= OPEN_GETS {
             self.metrics.gets_error += 1;
             let _ = events.try_send(Ok(GetAnswer::Refused(Refused {
-                reason: crosscache::Reason::Invalid as u8,
+                reason: proto::Reason::Invalid as u8,
                 detail: "open Get limit".into(),
             })));
             return;
@@ -1091,7 +1091,7 @@ impl Store {
             .get(&id)
             .map(|namespace| namespace.descriptor.clone())
         else {
-            self.reject_put(&events, crosscache::Reason::Invalid as u8);
+            self.reject_put(&events, proto::Reason::Invalid as u8);
             return;
         };
         let invalid_geometry = request.key.consumed_tokens == 0
@@ -1108,7 +1108,7 @@ impl Store {
             });
         if invalid_geometry {
             self.metrics.puts_error += 1;
-            self.reject_put(&events, crosscache::Reason::Invalid as u8);
+            self.reject_put(&events, proto::Reason::Invalid as u8);
             return;
         }
         let initial_old = self.namespaces[&id].tree.node(&request.key).cloned();
@@ -1118,23 +1118,23 @@ impl Store {
                 .is_some_and(|node| !node.row && node.pinned())
         {
             self.metrics.retry_inflight += 1;
-            self.reject_put(&events, crosscache::Reason::Inflight as u8);
+            self.reject_put(&events, proto::Reason::Inflight as u8);
             return;
         }
         if initial_old.as_ref().is_some_and(|node| node.row) {
             self.metrics.present += 1;
-            self.reject_put(&events, crosscache::Reason::Present as u8);
+            self.reject_put(&events, proto::Reason::Present as u8);
             return;
         }
         if Self::put_count(&self.sessions[&connection]) >= OPEN_PUTS {
             self.metrics.retry_queue += 1;
-            self.reject_put(&events, crosscache::Reason::Queue as u8);
+            self.reject_put(&events, proto::Reason::Queue as u8);
             return;
         }
         let initial_bucket = match &initial_old {
             Some(node) => {
                 if node.bucket != request.bucket {
-                    self.reject_put(&events, crosscache::Reason::Invalid as u8);
+                    self.reject_put(&events, proto::Reason::Invalid as u8);
                     return;
                 }
                 node.bucket
@@ -1156,7 +1156,7 @@ impl Store {
             .chain_pages
             .checked_sub(u32::try_from(initial_first).unwrap_or(u32::MAX))
         else {
-            self.reject_put(&events, crosscache::Reason::Invalid as u8);
+            self.reject_put(&events, proto::Reason::Invalid as u8);
             return;
         };
         let child_header = match Header::new(
@@ -1168,7 +1168,7 @@ impl Store {
         ) {
             Ok(header) => header,
             Err(_) => {
-                self.reject_put(&events, crosscache::Reason::Invalid as u8);
+                self.reject_put(&events, proto::Reason::Invalid as u8);
                 return;
             }
         };
@@ -1181,7 +1181,7 @@ impl Store {
         ) {
             Ok(header) => header,
             Err(_) => {
-                self.reject_put(&events, crosscache::Reason::Invalid as u8);
+                self.reject_put(&events, proto::Reason::Invalid as u8);
                 return;
             }
         };
@@ -1197,7 +1197,7 @@ impl Store {
                 > self.config.nvme
         {
             self.metrics.oversize += 1;
-            self.reject_put(&events, crosscache::Reason::Oversize as u8);
+            self.reject_put(&events, proto::Reason::Oversize as u8);
             return;
         }
         // Pick the shape by asking the arena allocator. A failed allocation
@@ -1241,12 +1241,12 @@ impl Store {
                             RootChoice::Wait(requirement, protected) => {
                                 self.metrics.retry_budget += 1;
                                 self.arm(connection, requirement, protected, None);
-                                self.reject_put(&events, crosscache::Reason::Budget as u8);
+                                self.reject_put(&events, proto::Reason::Budget as u8);
                                 return;
                             }
                             RootChoice::Oversize => {
                                 self.metrics.oversize += 1;
-                                self.reject_put(&events, crosscache::Reason::Oversize as u8);
+                                self.reject_put(&events, proto::Reason::Oversize as u8);
                                 return;
                             }
                         }
@@ -1275,12 +1275,12 @@ impl Store {
                     RootChoice::Wait(requirement, protected) => {
                         self.metrics.retry_budget += 1;
                         self.arm(connection, requirement, protected, None);
-                        self.reject_put(&events, crosscache::Reason::Budget as u8);
+                        self.reject_put(&events, proto::Reason::Budget as u8);
                         return;
                     }
                     RootChoice::Oversize => {
                         self.metrics.oversize += 1;
-                        self.reject_put(&events, crosscache::Reason::Oversize as u8);
+                        self.reject_put(&events, proto::Reason::Oversize as u8);
                         return;
                     }
                 }
@@ -1300,7 +1300,7 @@ impl Store {
                 requirement
             };
             self.arm(connection, waiting, pins.clone(), alternative);
-            self.reject_put(&events, crosscache::Reason::Budget as u8);
+            self.reject_put(&events, proto::Reason::Budget as u8);
             return;
         }
         for key in &pins {
@@ -1308,7 +1308,7 @@ impl Store {
                 for key in &pins {
                     let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                 }
-                self.reject_put(&events, crosscache::Reason::Invalid as u8);
+                self.reject_put(&events, proto::Reason::Invalid as u8);
                 return;
             }
         }
@@ -1319,7 +1319,7 @@ impl Store {
             }
             self.metrics.retry_budget += 1;
             self.arm(connection, requirement, pins.clone(), alternative);
-            self.reject_put(&events, crosscache::Reason::Budget as u8);
+            self.reject_put(&events, proto::Reason::Budget as u8);
             return;
         }
         let staging_hold = if requirement.streaming {
@@ -1332,7 +1332,7 @@ impl Store {
                     }
                     self.metrics.retry_budget += 1;
                     self.arm(connection, requirement, pins.clone(), alternative);
-                    self.reject_put(&events, crosscache::Reason::Budget as u8);
+                    self.reject_put(&events, proto::Reason::Budget as u8);
                     return;
                 }
             }
@@ -1347,7 +1347,7 @@ impl Store {
             }
             self.metrics.retry_budget += 1;
             self.arm(connection, requirement, pins.clone(), alternative);
-            self.reject_put(&events, crosscache::Reason::Budget as u8);
+            self.reject_put(&events, proto::Reason::Budget as u8);
             return;
         }
         let temporary = if requirement.streaming {
@@ -1361,7 +1361,7 @@ impl Store {
                     for key in &pins {
                         let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                     }
-                    self.reject_put(&events, crosscache::Reason::Io as u8);
+                    self.reject_put(&events, proto::Reason::Io as u8);
                     return;
                 }
             }
@@ -1843,12 +1843,7 @@ impl Store {
         ) {
             Ok(shape) => shape,
             Err(error) => {
-                self.fail_put(
-                    connection,
-                    transfer,
-                    crosscache::Reason::Invalid as u8,
-                    error,
-                );
+                self.fail_put(connection, transfer, proto::Reason::Invalid as u8, error);
                 return false;
             }
         };
@@ -1859,7 +1854,7 @@ impl Store {
                     self.fail_put(
                         connection,
                         transfer,
-                        crosscache::Reason::Invalid as u8,
+                        proto::Reason::Invalid as u8,
                         invalid("missing staging hold"),
                     );
                     return false;
@@ -1907,7 +1902,7 @@ impl Store {
                 self.fail_put(
                     connection,
                     transfer,
-                    crosscache::Reason::Budget as u8,
+                    proto::Reason::Budget as u8,
                     invalid("window budget"),
                 );
                 false
@@ -1916,7 +1911,7 @@ impl Store {
                 self.fail_put(
                     connection,
                     transfer,
-                    crosscache::Reason::Invalid as u8,
+                    proto::Reason::Invalid as u8,
                     invalid(detail),
                 );
                 false
@@ -1982,9 +1977,9 @@ impl Store {
                 return progressed;
             };
             let source = if get.records[get.next_meta].memory.is_some() {
-                crosscache::Tier::Dram as i32
+                proto::Tier::Dram as i32
             } else {
-                crosscache::Tier::Nvme as i32
+                proto::Tier::Nvme as i32
             };
             for (index, chunk) in metadata.chunks(4096).enumerate() {
                 get.outbox.push_back(Ok(GetAnswer::Meta {
@@ -2069,12 +2064,7 @@ impl Store {
                 ) {
                     Ok(shape) => shape,
                     Err(error) => {
-                        self.fail_get(
-                            connection,
-                            transfer,
-                            crosscache::Reason::Invalid as u8,
-                            error,
-                        );
+                        self.fail_get(connection, transfer, proto::Reason::Invalid as u8, error);
                         return false;
                     }
                 };
@@ -2103,7 +2093,7 @@ impl Store {
                                 record: plan.record,
                                 record_offset: plan.record_offset,
                                 length: plan.length,
-                                region: crosscache::Region::Staging as i32,
+                                region: proto::Region::Staging as i32,
                                 offset: granted.offset,
                                 page_first: plan.page_first,
                                 page_count: plan.pages,
@@ -2129,7 +2119,7 @@ impl Store {
                         self.fail_get(
                             connection,
                             transfer,
-                            crosscache::Reason::Budget as u8,
+                            proto::Reason::Budget as u8,
                             invalid("staging grant"),
                         );
                         return false;
@@ -2138,7 +2128,7 @@ impl Store {
                         self.fail_get(
                             connection,
                             transfer,
-                            crosscache::Reason::Invalid as u8,
+                            proto::Reason::Invalid as u8,
                             invalid(detail),
                         );
                         return false;
@@ -2180,7 +2170,7 @@ impl Store {
             .unwrap();
         enum Next {
             Stop,
-            Fail(crosscache::Reason, io::Error),
+            Fail(proto::Reason, io::Error),
             Lease { header: Header, memory: Arc<Extent> },
             Read { file: Arc<File> },
         }
@@ -2207,7 +2197,7 @@ impl Store {
                 } else if let Some(file) = &record.file {
                     Next::Read { file: file.clone() }
                 } else {
-                    Next::Fail(crosscache::Reason::Io, invalid("record file closed"))
+                    Next::Fail(proto::Reason::Io, invalid("record file closed"))
                 }
             }
         };
@@ -2234,12 +2224,7 @@ impl Store {
                 ) {
                     Ok(shape) => shape,
                     Err(error) => {
-                        self.fail_get(
-                            connection,
-                            transfer,
-                            crosscache::Reason::Invalid as u8,
-                            error,
-                        );
+                        self.fail_get(connection, transfer, proto::Reason::Invalid as u8, error);
                         return false;
                     }
                 };
@@ -2268,7 +2253,7 @@ impl Store {
                                 record: plan.record,
                                 record_offset: plan.record_offset,
                                 length: plan.length,
-                                region: crosscache::Region::Arena as i32,
+                                region: proto::Region::Arena as i32,
                                 offset: grant.offset,
                                 page_first: plan.page_first,
                                 page_count: plan.pages,
@@ -2283,7 +2268,7 @@ impl Store {
                         self.fail_get(
                             connection,
                             transfer,
-                            crosscache::Reason::Budget as u8,
+                            proto::Reason::Budget as u8,
                             invalid("window budget"),
                         );
                         return false;
@@ -2292,7 +2277,7 @@ impl Store {
                         self.fail_get(
                             connection,
                             transfer,
-                            crosscache::Reason::Invalid as u8,
+                            proto::Reason::Invalid as u8,
                             invalid(detail),
                         );
                         return false;
@@ -2306,7 +2291,7 @@ impl Store {
                     self.fail_get(
                         connection,
                         transfer,
-                        crosscache::Reason::Budget as u8,
+                        proto::Reason::Budget as u8,
                         invalid("staging capacity"),
                     );
                     return false;
@@ -2315,7 +2300,7 @@ impl Store {
                     self.fail_get(
                         connection,
                         transfer,
-                        crosscache::Reason::Budget as u8,
+                        proto::Reason::Budget as u8,
                         invalid("staging budget"),
                     );
                     return false;
@@ -2339,7 +2324,7 @@ impl Store {
             self.fail_get(
                 connection,
                 transfer,
-                crosscache::Reason::Io as u8,
+                proto::Reason::Io as u8,
                 invalid("record file closed"),
             );
             return false;
@@ -2423,7 +2408,7 @@ impl Store {
                 self.fail_get(
                     connection,
                     transfer,
-                    crosscache::Reason::Io as u8,
+                    proto::Reason::Io as u8,
                     invalid("no disk"),
                 );
             }
@@ -2491,7 +2476,7 @@ impl Store {
             self.fail_put(
                 connection,
                 transfer,
-                crosscache::Reason::Invalid as u8,
+                proto::Reason::Invalid as u8,
                 invalid("filled for an ungranted window"),
             );
             return Ok(());
@@ -2506,7 +2491,7 @@ impl Store {
             self.fail_put(
                 connection,
                 transfer,
-                crosscache::Reason::Invalid as u8,
+                proto::Reason::Invalid as u8,
                 invalid("window hash shape"),
             );
             return Ok(());
@@ -2526,7 +2511,7 @@ impl Store {
             self.fail_put(
                 connection,
                 transfer,
-                crosscache::Reason::Invalid as u8,
+                proto::Reason::Invalid as u8,
                 invalid("window vanished"),
             );
             return Ok(());
@@ -2541,7 +2526,7 @@ impl Store {
                 self.fail_put(
                     connection,
                     transfer,
-                    crosscache::Reason::Invalid as u8,
+                    proto::Reason::Invalid as u8,
                     invalid("page checksum"),
                 );
                 return Ok(());
@@ -2556,7 +2541,7 @@ impl Store {
                 self.fail_put(
                     connection,
                     transfer,
-                    crosscache::Reason::Invalid as u8,
+                    proto::Reason::Invalid as u8,
                     invalid("row checksum"),
                 );
                 return Ok(());
@@ -2593,7 +2578,7 @@ impl Store {
                 self.fail_put(
                     connection,
                     transfer,
-                    crosscache::Reason::Io as u8,
+                    proto::Reason::Io as u8,
                     invalid("missing temporary file"),
                 );
                 return Ok(());
@@ -2663,7 +2648,7 @@ impl Store {
                     self.fail_put(
                         connection,
                         transfer,
-                        crosscache::Reason::Io as u8,
+                        proto::Reason::Io as u8,
                         invalid("disk worker stopped"),
                     );
                 }
@@ -2700,7 +2685,7 @@ impl Store {
     ) -> Result<()> {
         enum Action {
             None,
-            Fail(crosscache::Reason, io::Error),
+            Fail(proto::Reason, io::Error),
             Publish,
         }
         let descriptor = self
@@ -2727,7 +2712,7 @@ impl Store {
             }
             if !put.owns_payload() {
                 Action::Fail(
-                    crosscache::Reason::Invalid,
+                    proto::Reason::Invalid,
                     invalid("commit before every payload range"),
                 )
             } else {
@@ -2738,16 +2723,13 @@ impl Store {
                     || put.commit_bytes.len() + metadata.len() > header_page_segment
                     || !(metadata_offset as usize).is_multiple_of(4096)
                 {
-                    Action::Fail(
-                        crosscache::Reason::Invalid,
-                        invalid("commit offset or length"),
-                    )
+                    Action::Fail(proto::Reason::Invalid, invalid("commit offset or length"))
                 } else {
                     put.commit_bytes.extend_from_slice(&metadata);
                     if put.commit_bytes.len() < header_page_segment {
                         Action::None
                     } else if let Err(error) = validate_commit(put, &descriptor) {
-                        Action::Fail(crosscache::Reason::Invalid, error)
+                        Action::Fail(proto::Reason::Invalid, error)
                     } else {
                         if let Some(memory) = &mut put.memory {
                             let checksum_segment =
@@ -2876,7 +2858,7 @@ impl Store {
             self.fail_put(
                 connection,
                 transfer,
-                crosscache::Reason::Invalid as u8,
+                proto::Reason::Invalid as u8,
                 invalid("publish insert"),
             );
             return;
@@ -2921,7 +2903,7 @@ impl Store {
             Err(error) => {
                 self.metrics.gets_error += 1;
                 let _ = events.try_send(Ok(GetAnswer::Refused(Refused {
-                    reason: crosscache::Reason::Invalid as u8,
+                    reason: proto::Reason::Invalid as u8,
                     detail: error.to_string(),
                 })));
                 return;
@@ -2933,7 +2915,7 @@ impl Store {
             for key in &pages {
                 if namespace.tree.pin(key).is_err() {
                     let _ = events.try_send(Ok(GetAnswer::Refused(Refused {
-                        reason: crosscache::Reason::Invalid as u8,
+                        reason: proto::Reason::Invalid as u8,
                         detail: "pin".into(),
                     })));
                     return;
@@ -3111,7 +3093,7 @@ impl Store {
                 self.fail_get(
                     connection,
                     transfer,
-                    crosscache::Reason::Io as u8,
+                    proto::Reason::Io as u8,
                     invalid("missing file"),
                 );
                 return;
@@ -3126,7 +3108,7 @@ impl Store {
                     self.fail_get(
                         connection,
                         transfer,
-                        crosscache::Reason::Budget as u8,
+                        proto::Reason::Budget as u8,
                         invalid("staging capacity"),
                     );
                     return;
@@ -3135,7 +3117,7 @@ impl Store {
                     self.fail_get(
                         connection,
                         transfer,
-                        crosscache::Reason::Budget as u8,
+                        proto::Reason::Budget as u8,
                         invalid("staging budget"),
                     );
                     return;
@@ -3324,12 +3306,7 @@ impl Store {
                 ) {
                     Ok(shape) => shape,
                     Err(error) => {
-                        self.fail_get(
-                            connection,
-                            transfer,
-                            crosscache::Reason::Invalid as u8,
-                            error,
-                        );
+                        self.fail_get(connection, transfer, proto::Reason::Invalid as u8, error);
                         return;
                     }
                 };
@@ -3359,7 +3336,7 @@ impl Store {
                                 record: plan.record,
                                 record_offset: plan.record_offset,
                                 length: plan.length,
-                                region: crosscache::Region::Staging as i32,
+                                region: proto::Region::Staging as i32,
                                 offset: granted.offset,
                                 page_first: plan.page_first,
                                 page_count: plan.pages,
@@ -3384,7 +3361,7 @@ impl Store {
                         self.fail_get(
                             connection,
                             transfer,
-                            crosscache::Reason::Invalid as u8,
+                            proto::Reason::Invalid as u8,
                             invalid(detail),
                         );
                     }
@@ -3392,7 +3369,7 @@ impl Store {
                         self.fail_get(
                             connection,
                             transfer,
-                            crosscache::Reason::Budget as u8,
+                            proto::Reason::Budget as u8,
                             invalid("staging grant"),
                         );
                     }
@@ -3437,7 +3414,7 @@ impl Store {
         self.fail_get(
             connection,
             transfer,
-            crosscache::Reason::Io as u8,
+            proto::Reason::Io as u8,
             invalid("disk read failed"),
         );
     }
@@ -3488,7 +3465,7 @@ impl Store {
             self.fail_get(
                 connection,
                 transfer,
-                crosscache::Reason::Invalid as u8,
+                proto::Reason::Invalid as u8,
                 invalid("release of an ungranted window"),
             );
         }
@@ -3990,7 +3967,7 @@ impl Store {
                             self.fail_put(
                                 connection,
                                 transfer,
-                                crosscache::Reason::Io as u8,
+                                proto::Reason::Io as u8,
                                 invalid("streaming disk write failed"),
                             );
                             self.settle_put(connection, transfer);
@@ -4036,7 +4013,7 @@ impl Store {
                             self.fail_put(
                                 connection,
                                 transfer,
-                                crosscache::Reason::Io as u8,
+                                proto::Reason::Io as u8,
                                 invalid("streaming disk write failed"),
                             );
                             self.settle_put(connection, transfer);
@@ -4184,7 +4161,7 @@ impl Store {
                         self.fail_put(
                             connection,
                             transfer,
-                            crosscache::Reason::Io as u8,
+                            proto::Reason::Io as u8,
                             invalid("no disk"),
                         );
                         break;
@@ -4232,7 +4209,7 @@ impl Store {
                             self.fail_put(
                                 connection,
                                 transfer,
-                                crosscache::Reason::Io as u8,
+                                proto::Reason::Io as u8,
                                 invalid("disk worker stopped"),
                             );
                             break;
@@ -4516,14 +4493,14 @@ impl Store {
                 self.fail_put(
                     connection,
                     transfer,
-                    crosscache::Reason::Invalid as u8,
+                    proto::Reason::Invalid as u8,
                     invalid("no progress"),
                 );
             } else {
                 self.fail_get(
                     connection,
                     transfer,
-                    crosscache::Reason::Invalid as u8,
+                    proto::Reason::Invalid as u8,
                     invalid("no progress"),
                 );
             }
@@ -4762,10 +4739,10 @@ impl Store {
                 };
                 let mut blocked = false;
                 if subscription.begin_pending {
-                    let value = crosscache::CatalogEvent {
+                    let value = proto::CatalogEvent {
                         sequence: subscription.sequence,
-                        event: Some(crosscache::catalog_event::Event::SnapshotBegin(
-                            crosscache::SnapshotBegin {
+                        event: Some(proto::catalog_event::Event::SnapshotBegin(
+                            proto::SnapshotBegin {
                                 seq0: subscription.seq0,
                             },
                         )),
@@ -4782,9 +4759,9 @@ impl Store {
                 if !blocked {
                     if let Some(queue) = &mut subscription.snapshot {
                         while let Some(entry) = queue.pop_front() {
-                            let value = crosscache::CatalogEvent {
+                            let value = proto::CatalogEvent {
                                 sequence: subscription.sequence,
-                                event: Some(crosscache::catalog_event::Event::Entry(
+                                event: Some(proto::catalog_event::Event::Entry(
                                     crate::control::entry_to_proto(&entry),
                                 )),
                             };
@@ -4802,10 +4779,10 @@ impl Store {
                             }
                         }
                         if !blocked && queue.is_empty() {
-                            let value = crosscache::CatalogEvent {
+                            let value = proto::CatalogEvent {
                                 sequence: subscription.sequence,
-                                event: Some(crosscache::catalog_event::Event::SnapshotEnd(
-                                    crosscache::SnapshotEnd {},
+                                event: Some(proto::catalog_event::Event::SnapshotEnd(
+                                    proto::SnapshotEnd {},
                                 )),
                             };
                             match subscription.sender.try_send(value) {
@@ -4854,7 +4831,7 @@ impl Store {
         namespace: NamespaceId,
         generation: u64,
         descriptor: Descriptor,
-        sender: tokio::sync::mpsc::Sender<crosscache::CatalogEvent>,
+        sender: tokio::sync::mpsc::Sender<proto::CatalogEvent>,
     ) -> Result<()> {
         descriptor.validate()?;
         if descriptor.namespace_id() != namespace {
@@ -5050,7 +5027,7 @@ pub enum PeerEvent {
     },
     Catalog {
         node: String,
-        event: crosscache::CatalogEvent,
+        event: proto::CatalogEvent,
     },
     Disconnected {
         node: String,
@@ -5137,7 +5114,7 @@ pub enum StoreCommand {
         namespace: NamespaceId,
         generation: u64,
         descriptor: Descriptor,
-        events: tokio::sync::mpsc::Sender<crosscache::CatalogEvent>,
+        events: tokio::sync::mpsc::Sender<proto::CatalogEvent>,
         reply: Reply<Result<()>>,
     },
     PutBegin {
@@ -5214,30 +5191,30 @@ pub enum StoreCommand {
     Shutdown,
 }
 
-fn live_event(live: &LiveEvent, sequence: u64) -> Option<crosscache::CatalogEvent> {
+fn live_event(live: &LiveEvent, sequence: u64) -> Option<proto::CatalogEvent> {
     match live {
         LiveEvent::Catalog {
             kind, key, entry, ..
         } => {
             let event = if *kind == 2 {
-                crosscache::catalog_event::Event::Removed(crate::control::key_to_proto(key))
+                proto::catalog_event::Event::Removed(crate::control::key_to_proto(key))
             } else {
                 let entry = entry.as_ref()?;
                 let proto = crate::control::entry_to_proto(entry);
                 if *kind == 0 {
-                    crosscache::catalog_event::Event::Added(proto)
+                    proto::catalog_event::Event::Added(proto)
                 } else {
-                    crosscache::catalog_event::Event::Changed(proto)
+                    proto::catalog_event::Event::Changed(proto)
                 }
             };
-            Some(crosscache::CatalogEvent {
+            Some(proto::CatalogEvent {
                 sequence,
                 event: Some(event),
             })
         }
-        LiveEvent::Room { bytes } => Some(crosscache::CatalogEvent {
+        LiveEvent::Room { bytes } => Some(proto::CatalogEvent {
             sequence,
-            event: Some(crosscache::catalog_event::Event::Room(crosscache::Room {
+            event: Some(proto::catalog_event::Event::Room(proto::Room {
                 bytes: *bytes,
             })),
         }),
@@ -5246,8 +5223,8 @@ fn live_event(live: &LiveEvent, sequence: u64) -> Option<crosscache::CatalogEven
 
 fn region_wire(region: Region) -> i32 {
     match region {
-        Region::Arena => crosscache::Region::Arena as i32,
-        Region::Staging => crosscache::Region::Staging as i32,
+        Region::Arena => proto::Region::Arena as i32,
+        Region::Staging => proto::Region::Staging as i32,
     }
 }
 
@@ -5515,7 +5492,7 @@ impl Store {
                     // registered is a terminal operation refusal.
                     let _ = reply.send(Ok(()));
                     let _ = events.try_send(Ok(GetAnswer::Refused(Refused {
-                        reason: crosscache::Reason::Invalid as u8,
+                        reason: proto::Reason::Invalid as u8,
                         detail: "Get namespace is not registered".into(),
                     })));
                     return;
@@ -5652,7 +5629,7 @@ mod tests {
         config.name = name.clone();
         config.staging = 8 * 1024 * 1024;
         let store = Store::open(config).unwrap();
-        (store, PathBuf::from("/dev/shm/flare-crosscache").join(name))
+        (store, PathBuf::from("/dev/shm/selene").join(name))
     }
 
     fn store_with_root(label: &str, memory: usize) -> (Store, PathBuf, PathBuf) {
@@ -5671,7 +5648,7 @@ mod tests {
         config.name = name.clone();
         config.staging = 8 * 1024 * 1024;
         let store = Store::open(config).unwrap();
-        let directory = PathBuf::from("/dev/shm/flare-crosscache").join(name);
+        let directory = PathBuf::from("/dev/shm/selene").join(name);
         (store, base, directory)
     }
 
@@ -6154,7 +6131,7 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Ok(Ok(PutAnswer::Refused(refused)))
-                if refused.reason == crosscache::Reason::Budget as u8
+                if refused.reason == proto::Reason::Budget as u8
         ));
         let requirement = store.armed.get(&1).unwrap().requirement;
         assert!(requirement.streaming);
@@ -6254,7 +6231,7 @@ mod tests {
         assert!(store.budget_balance(1).unwrap() >= 0);
         drop(store);
         let _ = fs::remove_dir_all(base);
-        let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/flare-crosscache").join(name));
+        let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/selene").join(name));
     }
 
     fn insert_node(
@@ -6316,9 +6293,9 @@ mod tests {
             store.pump_subscriptions();
             while let Ok(event) = receiver.try_recv() {
                 match event.event.unwrap() {
-                    crosscache::catalog_event::Event::Entry(_) => entries += 1,
-                    crosscache::catalog_event::Event::Added(_) => added += 1,
-                    crosscache::catalog_event::Event::SnapshotEnd(_) => ended = true,
+                    proto::catalog_event::Event::Entry(_) => entries += 1,
+                    proto::catalog_event::Event::Added(_) => added += 1,
+                    proto::catalog_event::Event::SnapshotEnd(_) => ended = true,
                     _ => {}
                 }
             }
@@ -6363,10 +6340,10 @@ mod tests {
         store.delta(id, 1, second);
         store.flush_events();
         let mut events = Vec::new();
-        while !events.iter().any(|event: &crosscache::CatalogEvent| {
+        while !events.iter().any(|event: &proto::CatalogEvent| {
             matches!(
                 event.event,
-                Some(crosscache::catalog_event::Event::SnapshotEnd(_))
+                Some(proto::catalog_event::Event::SnapshotEnd(_))
             )
         }) {
             store.pump_subscriptions();
@@ -6394,7 +6371,7 @@ mod tests {
         let live: Vec<u64> = events
             .iter()
             .filter_map(|event| match &event.event {
-                Some(crosscache::catalog_event::Event::Changed(entry)) => {
+                Some(proto::catalog_event::Event::Changed(entry)) => {
                     Some(entry.key.as_ref().unwrap().consumed_tokens)
                 }
                 _ => None,
@@ -6450,7 +6427,7 @@ mod tests {
             let slice = ExtentSlice::new(Arc::new(store.staging.allocate(4096).unwrap()), 0, 4096);
             put.blocked.push_back((999, 0, slice));
         }
-        store.fail_put(1, 1, crosscache::Reason::Io as u8, invalid("test"));
+        store.fail_put(1, 1, proto::Reason::Io as u8, invalid("test"));
         let operation = &store.sessions[&1].ops[&1].operation;
         let Operation::Put(put) = operation else {
             panic!("expected Put");
@@ -6668,9 +6645,9 @@ mod tests {
                 assert_eq!(event.sequence, sequence + 1);
                 sequence = event.sequence;
                 match event.event.unwrap() {
-                    crosscache::catalog_event::Event::SnapshotBegin(_) => begin += 1,
-                    crosscache::catalog_event::Event::Entry(_) => entries += 1,
-                    crosscache::catalog_event::Event::SnapshotEnd(_) => end += 1,
+                    proto::catalog_event::Event::SnapshotBegin(_) => begin += 1,
+                    proto::catalog_event::Event::Entry(_) => entries += 1,
+                    proto::catalog_event::Event::SnapshotEnd(_) => end += 1,
                     _ => {}
                 }
             }
@@ -6705,8 +6682,8 @@ mod tests {
             store.pump_subscriptions();
             while let Ok(event) = receiver.try_recv() {
                 match event.event.unwrap() {
-                    crosscache::catalog_event::Event::Entry(_) => entries += 1,
-                    crosscache::catalog_event::Event::SnapshotEnd(_) => end += 1,
+                    proto::catalog_event::Event::Entry(_) => entries += 1,
+                    proto::catalog_event::Event::SnapshotEnd(_) => end += 1,
                     _ => {}
                 }
             }

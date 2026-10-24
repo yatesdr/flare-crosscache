@@ -1,9 +1,9 @@
 pub mod arena;
 pub mod codec;
 pub mod control;
-pub mod crosscache;
 pub mod disk;
 pub mod local;
+pub mod proto;
 pub mod record;
 pub mod store;
 pub mod tree;
