@@ -1053,17 +1053,13 @@ struct Cleanup {
 impl Cleanup {
     fn finish(&mut self) {
         self.stop.store(true, Ordering::Release);
-        // The owner leaves on Shutdown even while a task still holds a sender. The channel
-        // can be busy at shutdown, so retry briefly rather than drop the command.
-        for _ in 0..100 {
-            match self.commands.try_send(StoreCommand::Shutdown) {
-                Ok(()) => break,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    thread::sleep(Duration::from_millis(1))
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-            }
-        }
+        // Unlink the socket while this process still holds the store's locks: no replacement
+        // manager can have bound a new socket under the same path yet.
+        let _ = fs::remove_file(&self.socket);
+        // Delivery is guaranteed even when another sender is alive (the tick thread or a
+        // handler task) and even with a full queue; the owner always exits, so the Store and
+        // its locks are released. `run` calls this from its own thread, not a runtime.
+        let _ = self.commands.blocking_send(StoreCommand::Shutdown);
         // The tick thread exits on the flag.
         if let Some(thread) = self.tick.take() {
             let _ = thread.join();
@@ -1074,7 +1070,6 @@ impl Cleanup {
         if let Some(thread) = self.metrics.take() {
             let _ = thread.join();
         }
-        let _ = fs::remove_file(&self.socket);
     }
 }
 
@@ -1303,4 +1298,65 @@ fn serve_metrics(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_stops_a_running_owner_and_removes_the_socket_first() {
+        use std::sync::atomic::AtomicBool as Flag;
+
+        let base = std::env::temp_dir().join(format!("selene-cleanup-{}", std::process::id()));
+        let config = crate::store::Config::new(
+            base.join("records"),
+            base.join("run/m.sock"),
+            64 * 1024,
+            64 << 20,
+        );
+        let store = crate::store::Store::open(config.clone()).unwrap();
+        fs::create_dir_all(config.socket.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&config.socket).unwrap();
+        let socket = config.socket.clone();
+        let worker_socket = socket.clone();
+        let root = config.root.clone().unwrap();
+        let (commands, mut receiver) = mpsc::channel::<StoreCommand>(1);
+        let removed_first = Arc::new(Flag::new(false));
+        let observed = removed_first.clone();
+        let mut cleanup = Cleanup {
+            stop: Arc::new(Flag::new(false)),
+            commands: commands.clone(),
+            owner: None,
+            tick: None,
+            metrics: None,
+            socket: socket.clone(),
+        };
+        cleanup.owner = Some(thread::spawn(move || {
+            let mut store = Some(store);
+            while let Some(command) = receiver.blocking_recv() {
+                if matches!(command, StoreCommand::Shutdown) {
+                    // The socket must be gone while the store (and its locks) still live.
+                    observed.store(!worker_socket.exists(), Ordering::Release);
+                    break;
+                }
+            }
+            drop(store.take());
+        }));
+        // A full queue would have dropped a non-blocking shutdown.
+        commands.try_send(StoreCommand::Tick).unwrap();
+        drop(commands);
+        drop(cleanup);
+        assert!(!socket.exists(), "cleanup removes the socket");
+        assert!(
+            removed_first.load(Ordering::Acquire),
+            "the socket is removed before the store drops"
+        );
+        assert!(
+            crate::disk::RootLock::acquire(&root).is_ok(),
+            "the owner released the root lock"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(base);
+    }
 }

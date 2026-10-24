@@ -308,7 +308,14 @@ impl Host {
     }
 
     pub async fn client(&self) -> Client {
-        Client::connect(&self.config, descriptor()).await.unwrap()
+        Client::connect(&self.config, descriptor())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a client could not connect to the manager at {}: {error}",
+                    self.config.socket.display()
+                )
+            })
     }
 
     pub async fn client_with(&self, descriptor: Descriptor) -> std::result::Result<Client, String> {
