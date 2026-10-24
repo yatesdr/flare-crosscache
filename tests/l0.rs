@@ -2686,3 +2686,39 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
     assert_eq!(window, stored[record_offset..record_offset + length]);
     host.wait(|host| host.gauge("open_ops") == 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_56_dram_only_arena_boundary_ignores_the_envelope() {
+    // The 4 KiB disk envelope lives outside the arena. The record's buddy
+    // extent includes its own header and checksums, so an extent of exactly
+    // the 16 MiB arena is storable; only a larger extent is OVERSIZE.
+    let mut host = Host::dram_only(16 * 1024 * 1024);
+    host.start();
+    let mut value = descriptor();
+    value.ranks = vec![flare_crosscache::record::RankSizes {
+        planes: vec![65_539, 4_100],
+        row_bytes: 1_000_003,
+    }];
+    let mut client = host.client_with(value.clone()).await.unwrap();
+    let fits = key(140 * 64 + 3);
+    let header = Header::new(&value, fits, None, [4; 16], 140).unwrap();
+    assert_eq!(header.length_with_row(), 11_907_072);
+    assert_eq!(
+        header.length_with_row().max(4096).next_power_of_two(),
+        16 * 1024 * 1024
+    );
+    assert!(
+        matches!(
+            client.put(fits, None, PutOptions::default()).await,
+            PutOutcome::Stored(_)
+        ),
+        "a 16 MiB extent must fit a 16 MiB DRAM-only arena"
+    );
+    let larger = key(220 * 64 + 3);
+    let header = Header::new(&value, larger, None, [4; 16], 220).unwrap();
+    assert!(header.length_with_row() > 16 * 1024 * 1024);
+    assert_eq!(
+        client.put(larger, None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Oversize as u8)
+    );
+}
