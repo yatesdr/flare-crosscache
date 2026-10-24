@@ -36,8 +36,9 @@ The negotiated limits are:
 | Chain length per request | 65,536 nodes |
 | No-progress deadline | 3 s |
 
-A stream that makes no progress for 3 s is failed with `DEADLINE_EXCEEDED`;
-replicas treat that as a session failure and rebuild the channel and `Hello`
+A stream that makes no progress for 3 s is failed with `DEADLINE_EXCEEDED`, and
+a message that races the teardown can still receive `Refused{INVALID}`;
+replicas treat either as a session failure and rebuild the channel and `Hello`
 with backoff.
 
 ## Namespace and tenant identity
@@ -65,14 +66,16 @@ paths. Payload never travels in gRPC messages; only metadata and checksums do.
 A `WindowGrant` identifies one window as a region and byte range in
 `WindowRef{region, offset, length}`, plus the transfer id, the window ordinal
 (`index`, from 0 within the call) and the record-relative offset. A window
-length is a multiple of 4096 bytes, covers whole pages and/or the row, and never
-exceeds the negotiated maximum for page windows. `page_first` is the page index
+length is a multiple of 4096 bytes and covers whole pages and/or the row. A
+page window stays within the negotiated maximum, except that a single page or
+the row can exceed it as a window of its own. `page_first` is the page index
 within the chain (the key's full page span), not the record; a row-only grant
 carries `page_first` 0 and `page_count` 0.
 
 On `Put` the replica writes the payload into the granted range and then reports
-its checksums. On `Get` the manager writes the payload into the granted range
-and the replica copies it out before releasing the window. Neither side may
+its checksums. On `Get` the window aliases immutable stored bytes (a DRAM
+record's extent) or a staging copy the manager read from NVMe; the replica
+copies the bytes out before releasing the window. Neither side may
 read or write outside `[offset, offset + length)`, may assume the region persists
 across reconnects, or may keep a window after releasing it.
 
@@ -110,7 +113,8 @@ peer pid), or when a remote session's streams end.
 
 `Get` is a bidirectional stream. `GetBegin` names ascending chain nodes (at most
 65,536), the number of pages to skip from the front of the first record, the
-expected page count and whether the row is wanted. The manager pins the chain
+expected page count and a row flag that must be true; a Get without the row is
+refused `INVALID`, as is a chain whose last node has none. The manager pins the chain
 and answers `GetLeased{transfer, record_bytes[]}` — one record length per chain
 node — or `Refused`.
 
@@ -145,9 +149,10 @@ changes (never geometry), and `Removed` removes exactly one named node without
 cascading. `Room` is the connection's availability notification (below).
 
 A connection may have only one live subscription: a new `Subscribe` bumps the
-epoch and ends the previous stream. Events carry the generation and epoch of
-the subscription that produced them, so a replica discards events from a
-superseded subscription. A sequence gap, a decode error or an oversized backlog
+epoch and ends the previous stream. Catalog events carry no generation or epoch
+field; a replica associates each event stream with the generation and epoch it
+subscribed with and discards events from a stream it has replaced. A sequence
+gap, a decode error or an oversized backlog
 requires discarding the mirror and resubscribing; the mirror is rebuilt only
 from a new snapshot.
 
@@ -173,8 +178,10 @@ The replica retries only after `Room` or another availability change; a steady
 ## Checksums and durability
 
 Every page and row carries a 64-bit xxh3 checksum supplied by the writer with
-`WindowFilled`. The manager verifies each window before accepting it, before
-committing a record and before serving it. On NVMe every record is stored behind
+`WindowFilled`. The manager verifies every Put window before accepting it and a
+record's metadata before committing it. On an NVMe read it does not re-verify
+the payload: the stored metadata, including every page and row xxh3, is served
+to the replica, which must validate every page and row it restores. On NVMe every record is stored behind
 a 4096-byte envelope with a CRC32 over the `Header` and padded checksum segment
 and a CRC32 over the envelope itself; recovery and reads verify both, and the
 manager removes detectably corrupt records rather than serving them.
@@ -199,7 +206,8 @@ survive manager restarts and are recovered into the disk tier.
 - Do not exceed the negotiated open-operation and window-credit limits; a
   request beyond them is refused `QUEUE` or fails the stream.
 - Treat the manager's region files and namespace directories as manager-owned:
-  never open, truncate or delete them while the manager runs.
+  map the regions exactly as `Hello` instructs, and never create, truncate or
+  delete them while the manager runs.
 
 ## Versioning
 
