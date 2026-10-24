@@ -1215,10 +1215,18 @@ impl Store {
             .into_iter()
             .chain(replacement.then_some(request.key))
             .collect();
-        if !rootless
-            && disk::ENVELOPE_BYTES.saturating_add(child_header.length_with_row())
-                > self.config.nvme
-        {
+        // Admission charges the durable budget with the shape's reservation:
+        // the envelope plus the rounded extent for a record the arena keeps,
+        // and the envelope plus the record for one that streams. A charge that
+        // can never fit is OVERSIZE; a tighter budget is a Budget wait, and a
+        // streamed window that does not fit the budget stays a Budget too.
+        let extent = child_header.length_with_row().max(4096).next_power_of_two();
+        let charge = if extent <= arena_bytes {
+            disk::ENVELOPE_BYTES.saturating_add(extent)
+        } else {
+            disk::ENVELOPE_BYTES.saturating_add(child_header.length_with_row())
+        };
+        if !rootless && charge > self.config.nvme {
             self.metrics.oversize += 1;
             self.reject_put(&events, proto::Reason::Oversize as u8);
             return;

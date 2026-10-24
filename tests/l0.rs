@@ -3008,3 +3008,43 @@ async fn l0_63_a_paused_put_keeps_its_window_past_the_deadline() {
     );
     assert_eq!(client.read(Reg::Arena, offset, length as usize), pattern);
 }
+
+fn charge_host(nvme: u64) -> Host {
+    let base = base("charge-oversize");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        2 * 1024 * 1024,
+        nvme,
+    );
+    config.name = instance_name("charge-oversize");
+    Host::open_config(config)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_64_refuses_a_record_whose_admission_charge_cannot_fit() {
+    // The record's logical length fits --nvme, but the arena keeps it in a
+    // rounded 2 MiB extent, so its admission charge is the envelope plus that
+    // extent and can never fit 1.5 MiB. The arena shape is the one admission
+    // selects and there is no streaming fallback for a budget refusal: that is
+    // OVERSIZE, not a permanent Budget.
+    let record = key(300 * 64);
+    let mut host = charge_host(1_500_000);
+    host.start();
+    let mut client = host.client().await;
+    assert_eq!(
+        client.put(record, None, PutOptions::default()).await,
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
+    );
+    drop(client);
+    drop(host);
+
+    // With room for the rounded extent the same record is admitted.
+    let mut host = charge_host(2_300_000);
+    host.start();
+    let mut client = host.client().await;
+    assert!(matches!(
+        client.put(record, None, PutOptions::default()).await,
+        PutOutcome::Stored(_)
+    ));
+}
