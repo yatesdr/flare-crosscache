@@ -7,8 +7,9 @@ The client contract is [PROTOCOL.md](PROTOCOL.md), protocol version 1.
 
 ## Build and run
 
-Use Rust 1.87 or newer (validated with 1.94.1 on Linux). Dependencies are `libc`
-and `twox-hash`; there is no async runtime.
+Use Rust 1.87 or newer (validated with 1.94.1 on Linux). Serving is async on
+tokio and speaks gRPC through tonic and prost over a Unix socket; it also
+depends on `blake2` and `twox-hash`.
 
 ```sh
 cargo build --release --locked
@@ -49,9 +50,10 @@ record capacity can therefore be lower than the configured mapping size.
 Budgets cover cache/storage extents, not total process RSS: trees, checksum
 tables, bounded frame channels and each disk worker's small aligned scratch
 buffers also consume memory. NVMe admission includes the 4096-byte manager
-envelope and complete padded Flare record. All namespaces share these budgets.
-Only records larger than the retention arena stream through staging; a fitting
-record waits for DRAM room.
+envelope and the complete padded Flare record. All namespaces share these
+budgets. Records whose rounded extent exceeds the arena stream through staging
+and also charge a fixed two-window staging hold; a record that fits the arena
+waits for DRAM room.
 
 A DRAM publication is acknowledged before NVMe durability. A manager crash can
 lose recently acknowledged records whose ancestor chains have not reached NVMe.
@@ -61,35 +63,37 @@ retries and a Room notification when capacity becomes available. DRAM eviction
 requires durability; NVMe eviction removes both copies. SIGTERM/SIGKILL ends the
 process; recovery removes unfinished files and orphaned descendants on restart.
 
-The service uses a state thread, an acceptor, reader/writer threads per
-connection, one ordered writer per namespace, and an optional metrics thread.
-Each connection has bounded queues and four open operations per direction.
-Metrics include namespace/tier inventory and hits, Put/Get outcomes, evictions,
-compactions, disk bytes/time/errors, connections, leases, open operations,
-cancellations, discarded frames and arena allocations.
+The service runs a state thread that owns the cache, a tokio gRPC runtime, an
+acceptor, one ordered writer per namespace, and an optional metrics thread.
+Each connection has bounded queues, four open operations per direction and two
+window credits per direction. Metrics include namespace/tier inventory and hits,
+Put/Get outcomes, evictions, compactions, disk bytes/time/errors, connections,
+leases, open operations, cancellations, discarded frames and arena allocations.
 
 ## Docker
 
 ```sh
 docker build -t selene .
 docker run --rm --name selene \
-  --user "$(id -u):$(id -g)" --pid=host --network=host \
-  -v /run/flare-cache:/run/flare-cache \
+  --user "$(id -u):$(id -g)" --pid=host --network=host --shm-size=16g \
+  -v /run/selene:/run/selene \
   -v /nvme/flare-cache:/var/lib/flare-cache \
-  selene --memory 8G --nvme 256G \
+  selene --root /var/lib/flare-cache --nvme 256G --memory 8G \
   --metrics 127.0.0.1:9108
 ```
 
-Create both host directories with ownership matching the runtime uid/gid.
-Share the socket volume and a PID namespace with the replicas so Hello's pid
-matches SO_PEERCRED. The example uses the host PID namespace. No GPU flags,
-CUDA libraries, privileges, or network cache transport are required.
+Create `/run/selene` and the root directory with ownership matching the runtime
+uid/gid. The shared-memory mount must hold `--memory + --staging`, so the
+container needs `--shm-size` above the default 64 MiB. Share the socket
+directory and a PID namespace with the replicas so the peer pid matches
+`SO_PEERCRED`; the example uses the host PID namespace. No GPU flags, CUDA
+libraries, privileges, or network cache transport are required.
 
 ## Tests
 
-Run on Linux. All fourteen L0 groups execute by default, including subprocess
-SIGKILL tests and exact-byte `/dev/shm`/real-NVMe throughput tests. There are no
-ignored tests or GPU requirements. Set scratch to a disposable directory on a
+Run on Linux. All 64 L0 tests, 41 library tests and the protocol test execute by
+default, including subprocess SIGKILL tests and exact-byte `/dev/shm` and
+real-NVMe throughput tests. There are no ignored tests or GPU requirements. Set scratch to a disposable directory on a
 real local NVMe file system; each test owns and removes its own subdirectory.
 
 ```sh
@@ -104,32 +108,40 @@ Run the tests on Linux with:
 cargo test --release --locked -- --nocapture
 ```
 
-The fourteen groups cover tree parity; eviction/compaction; accepted record
-shape and replacement; deduplication/limits; malformed payloads; ordered
-chain durability; manager crash/recovery; streaming/refill/Oversize;
-disk-full/Budget/Room; Cancel/EOF/replica SIGKILL and I/O lifetimes;
-snapshots/deltas/Resync/namespaces; round-robin service and bounded cleanup;
-generation/op fencing; and throughput. Fault gates exist only in the library's
-test configuration and are not exposed by the executable.
+The suite covers tree parity; eviction/compaction; accepted record shape and
+replacement; deduplication/limits; malformed payloads; ordered chain durability;
+manager crash/recovery; streaming/refill/Oversize and the admission charge;
+disk-full/Budget/Room; restore windows under a full durable budget;
+Cancel/EOF/replica SIGKILL and I/O lifetimes; paused Put windows and quarantine;
+snapshots/deltas/Resync/namespaces; socket and shared-memory directory modes;
+round-robin service and bounded cleanup; generation/op fencing; and throughput.
+Fault gates exist only in the library's test configuration and are not exposed
+by the executable.
 
 The throughput group uses a separate manager process and one client, three
 560 MiB payloads per mode, 64 KiB pages and 4 MiB Data frames. It verifies every
 page and row checksum during Get and compares exact bytes afterward. Put ends
 at Stored; chain durability has a separate timer. Payload construction and
-allocation happen before timing. The DRAM path must reach a median 3 GB/s in
-both directions. Streaming tmpfs and NVMe results are reported separately.
-The test needs at least 2 GiB free in `/dev/shm`; use a 4 GiB container shm mount.
-Test containers need .--shm-size=4g`.
+allocation happen before timing. Streaming tmpfs and NVMe results are reported
+separately. The test needs at least 2 GiB free in `/dev/shm`; test containers
+need `--shm-size=4g`.
 
 ```sh
 CM_NVME_SCRATCH=/nvme/cm-scratch cargo run --release --locked --example throughput
 ```
 
 See [PERFORMANCE.md](PERFORMANCE.md) for before/after results, profiling and
-measurement boundaries. These are CPU transport measurements. Run 2's Flare
-client and L1–L3 GPU/integration validation remain separate work.
+measurement boundaries. A local data-path benchmark with one manager, one or
+four clients and 64-560 MiB records measures 2.7-4.2 GB/s Put and 1.3-4.5 GB/s
+Get through the shared-memory windows for DRAM records, and 0.6-0.8 GB/s Put
+and 0.5-0.7 GB/s Get for streamed NVMe records; the manager stays at 8-31% CPU.
+Page and row checksums cost 5.5 GB/s and memcpy 15-17 GB/s on the same host, so
+a single client is limited by its window copies and the protocol roundtrip, not
+by the manager. These are CPU transport measurements; the Flare client and GPU
+integration validation live in the Flare repository.
 
-Validated on a Linux NVMe host with Rust 1.94.1: 14 L0 groups passed, 0 failed, 0 ignored;
-rustfmt and clippy (`-D warnings`) clean. The subprocess cases issue real
-SIGKILL at partial Data, before rename, after rename and during the parent
-write, and kill a replica holding a parent pin.
+Validated on a Linux NVMe host with Rust 1.94.1: 106 tests passed (41 library,
+64 L0, 1 protocol), 0 failed, 0 ignored; rustfmt and clippy (`-D warnings`)
+clean. The subprocess cases issue real SIGKILL at partial Data, before rename,
+after rename and during the parent write, and kill a replica holding a parent
+pin.
