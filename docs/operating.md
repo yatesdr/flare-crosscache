@@ -21,15 +21,14 @@ the next power of two and usable capacity can be materially below the mapping
 size; records of similar size converge on one class, records of very different
 sizes fragment it. A record whose rounded extent exceeds the whole arena is not
 dropped — with `--root` it streams to NVMe — but it will never be served from
-DRAM; without `--root` it can never be admitted and its retries report
-`BUDGET`.
+DRAM; without `--root` it can never be admitted and is refused `OVERSIZE`.
 
 `--staging` is a bounded scratch region. Each streamed Put reserves a fixed
 hold of two of its largest windows (a window is at most 4 MiB), and disk reads
 draw their windows from the same region. The minimum is 8 MiB and the default
 is 256 MiB; provision at least 8-16 MiB per concurrent streamed transfer. A
-streamed record whose largest window exceeds the whole staging region can never
-be admitted, and the refusal is a permanent `BUDGET` rather than an error.
+streamed record whose two-window hold exceeds the whole staging region can
+never be admitted, so admission refuses it `OVERSIZE`.
 
 `--nvme` is the durable budget and includes the 4096-byte manager envelope per
 record. It must exceed the largest record a replica can publish; otherwise the
@@ -58,9 +57,9 @@ Room notification that arrives when capacity or the budget frees up.
 | Reason | Meaning | Operator action |
 |---|---|---|
 | `PRESENT` | The record is already stored; no work is needed. | None. |
-| `BUDGET` | A capacity or rate limit is exhausted: a negative write-budget balance, no DRAM room that eviction can free, or a streamed window larger than staging. | Expect retries; a Room follows. Sustained `BUDGET` with no Room means staging is smaller than one window or the write budget is far below ingest. |
+| `BUDGET` | A capacity or rate limit is currently exhausted: a negative write-budget balance or no DRAM room that eviction can free. The manager arms a Room notification for the same connection. | Expect retries; a Room follows. Sustained `BUDGET` with no Room means the write budget is far below ingest, or other clients hold the space. |
 | `QUEUE` | The connection's open-operation limit (four per direction) or an internal queue is full. | None; retries drain. Persistent `QUEUE` means clients are not reaping completions. |
-| `OVERSIZE` | The record can never fit: with `--root`, record plus envelope exceeds `--nvme`; without `--root`, its length exceeds `--memory`. | Raise the budget, add `--root`, or publish a smaller record. Retrying cannot succeed. |
+| `OVERSIZE` | The record can never be admitted in this configuration: with `--root`, record plus envelope exceeds `--nvme`; without `--root`, its rounded extent exceeds `--memory`; or its two-window staging hold exceeds `--staging`. | Raise the budget, add `--root`, or publish a smaller record. Retrying cannot succeed. |
 | `INVALID` | Malformed request, namespace-descriptor mismatch or geometry disagreement between a replica and the manager. | Alert. Check the protocol version and that replicas and manager use the same prepared package. |
 | `IO` | An NVMe read or write failed. | Alert on `cm_nvme_errors_total`; check the device and file system. |
 | `INFLIGHT` | A duplicate operation for the same prefix is in flight. | None; retry after it settles. |

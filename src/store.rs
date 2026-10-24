@@ -1188,6 +1188,15 @@ impl Store {
         let rootless = self.config.root.is_none();
         let replacement = initial_old.is_some();
         let arena_bytes = self.memory.capacity() as u64;
+        // The arena rounds every record extent up to a power of two. Without a
+        // root there is no disk to stream to, so a record whose extent cannot
+        // fit the arena can never be stored; refusing it as BUDGET would arm a
+        // Room that can never arrive.
+        if rootless && child_header.length_with_row().max(4096).next_power_of_two() > arena_bytes {
+            self.metrics.oversize += 1;
+            self.reject_put(&events, proto::Reason::Oversize as u8);
+            return;
+        }
         let selected_pins: Vec<Key> = initial_parent
             .into_iter()
             .chain(replacement.then_some(request.key))
@@ -1224,13 +1233,7 @@ impl Store {
                     None if rootless => {
                         let root_pins: Vec<Key> =
                             replacement.then_some(request.key).into_iter().collect();
-                        match self.rootless_fallback(
-                            &child_header,
-                            &selected_pins,
-                            &root_header,
-                            root_pins,
-                            arena_bytes,
-                        ) {
+                        match self.rootless_fallback(&root_header, root_pins, arena_bytes) {
                             RootChoice::Store(extent) => {
                                 let requirement = PutRequirement::arena(extent.capacity() as u64);
                                 memory = Some(Arc::new(extent));
@@ -1256,50 +1259,24 @@ impl Store {
                         (child_header, initial_parent, selected_pins, requirement)
                     }
                 }
-            } else if rootless {
-                let root_pins: Vec<Key> = replacement.then_some(request.key).into_iter().collect();
-                match self.rootless_fallback(
-                    &child_header,
-                    &selected_pins,
-                    &root_header,
-                    root_pins,
-                    arena_bytes,
-                ) {
-                    RootChoice::Store(extent) => {
-                        let requirement = PutRequirement::arena(extent.capacity() as u64);
-                        memory = Some(Arc::new(extent));
-                        let root_pins: Vec<Key> =
-                            replacement.then_some(request.key).into_iter().collect();
-                        (root_header, None, root_pins, requirement)
-                    }
-                    RootChoice::Wait(requirement, protected) => {
-                        self.metrics.retry_budget += 1;
-                        self.arm(connection, requirement, protected, None);
-                        self.reject_put(&events, proto::Reason::Budget as u8);
-                        return;
-                    }
-                    RootChoice::Oversize => {
-                        self.metrics.oversize += 1;
-                        self.reject_put(&events, proto::Reason::Oversize as u8);
-                        return;
-                    }
-                }
             } else {
                 let requirement = self.put_requirement(&child_header, 0);
                 (child_header, initial_parent, selected_pins, requirement)
             };
         let length = header.length_with_row();
-        // A window larger than the whole staging region can never be
-        // granted. If the record still fits an arena extent, wait for arena
-        // space; otherwise it can never be stored as configured.
-        if requirement.streaming && requirement.unit > self.staging.capacity() as u64 {
+        // A streamed record reserves two windows in staging. When that hold
+        // cannot fit the whole region it can never be admitted: if the record
+        // has no arena shape either, no Room can ever arrive, so refuse it as
+        // OVERSIZE instead of arming a wait. A record that still fits an arena
+        // extent waits for arena space.
+        if requirement.streaming && requirement.allocation > self.staging.capacity() as u64 {
+            if selected.streaming {
+                self.metrics.oversize += 1;
+                self.reject_put(&events, proto::Reason::Oversize as u8);
+                return;
+            }
             self.metrics.retry_budget += 1;
-            let waiting = if !selected.streaming {
-                selected
-            } else {
-                requirement
-            };
-            self.arm(connection, waiting, pins.clone(), alternative);
+            self.arm(connection, selected, pins.clone(), alternative);
             self.reject_put(&events, proto::Reason::Budget as u8);
             return;
         }
@@ -1496,24 +1473,22 @@ impl Store {
             })
     }
 
-    /// A rootless manager can only store the record as a root once the
-    /// selected parent is evicted. Report the root extent when the allocator
-    /// can provide it, otherwise what the retry has to wait for.
+    /// Rootless fallback when the arena cannot hold the child beside its
+    /// parent: store the whole chain as one record instead, reporting the root
+    /// extent when the allocator can provide it or the requirement a retry has
+    /// to wait for. The caller has already refused records whose own extent
+    /// cannot fit the arena, so the full-chain record is the only remaining
+    /// shape; when that cannot fit either, no Room can ever arrive and the Put
+    /// is OVERSIZE.
     fn rootless_fallback(
         &mut self,
-        child: &Header,
-        child_pins: &[Key],
         root: &Header,
         root_pins: Vec<Key>,
         arena_bytes: u64,
     ) -> RootChoice {
-        if child.length_with_row() > arena_bytes {
-            return RootChoice::Oversize;
-        }
         let requirement = self.put_requirement(root, arena_bytes);
         if requirement.streaming {
-            let waiting = self.put_requirement(child, arena_bytes);
-            return RootChoice::Wait(waiting, child_pins.to_vec());
+            return RootChoice::Oversize;
         }
         match self.memory_room_excluding(root.length_with_row() as usize, false, &root_pins) {
             Some(extent) => RootChoice::Store(extent),

@@ -2106,10 +2106,10 @@ async fn l0_48_streaming_reserves_both_grantable_windows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_49_oversized_window_never_earns_room() {
+async fn l0_49_oversized_window_is_refused_oversize() {
     // A 16 MiB page cannot fit the 8 MiB staging region and the record does
-    // not fit the 16 MiB arena, so no staging retry can ever succeed. Room
-    // must not be offered even though a single window fits the arena.
+    // not fit the 16 MiB arena, so no shape can ever be admitted. The refusal
+    // is OVERSIZE: a Budget would arm a Room that can never arrive.
     let base = base("oversized-window");
     let mut config = Config::new(
         base.join("records"),
@@ -2124,16 +2124,9 @@ async fn l0_49_oversized_window_never_earns_room() {
     let mut value = descriptor();
     value.ranks[0].planes = vec![16 * 1024 * 1024];
     let mut client = host.client_with(value).await.unwrap();
-    let mut subscription = client.subscribe().await;
     assert_eq!(
         client.put(key(64), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered for a window the staging region can never hold"
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }
@@ -2202,26 +2195,20 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_51_rootless_child_waiting_for_its_parent_earns_no_room() {
-    // The 32 KiB arena holds a two-page parent. The four-page-tail child
-    // needs 32 KiB while its six-page root needs 64 KiB, so only the parent
-    // surviving can admit it; Room must not count that parent as reclaimable.
+async fn l0_51_rootless_child_that_needs_its_parent_is_refused_oversize() {
+    // The 32 KiB arena holds a two-page parent, and the parent's rounded
+    // extent fills it. The child's four-page tail needs the same 32 KiB next
+    // to the pinned parent while its six-page full-chain fallback needs
+    // 64 KiB, so no shape can be admitted: OVERSIZE.
     let mut host = Host::dram_only(32 * 1024);
     host.start();
     let mut client = host.client().await;
     client.store(key(128), None).await;
-    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(384), Some(key(128)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered for an allocation that needs the protected parent"
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }
@@ -2766,4 +2753,78 @@ fn l0_57_sigkill_never_blocks_a_restart_on_the_same_instance() {
         "missing reclaim log: {log}"
     );
     let _ = fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_58_dram_only_refuses_a_record_whose_rounded_extent_cannot_fit() {
+    // The arena rounds a record's length up to a power of two. A 12 MiB arena
+    // has no 16 MiB block, so a record just over 8 MiB can never be stored and
+    // a DRAM-only manager has nowhere to stream it: the refusal is OVERSIZE,
+    // not a BUDGET wait whose Room can never arrive.
+    let value = descriptor();
+    let mut host = Host::dram_only(12 * 1024 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    let large = key(2048 * 64);
+    let header = Header::new(&value, large, None, [4; 16], 2048).unwrap();
+    assert!(header.length_with_row() <= 12 * 1024 * 1024);
+    assert!(header.length_with_row().max(4096).next_power_of_two() > 12 * 1024 * 1024);
+    assert_eq!(
+        client.put(large, None, PutOptions::default()).await,
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
+    );
+    // A record whose rounded extent fits is still admitted.
+    let fits = key(1024 * 64);
+    assert!(matches!(
+        client.put(fits, None, PutOptions::default()).await,
+        PutOutcome::Stored(_)
+    ));
+}
+
+fn streaming_host(staging: usize) -> Host {
+    let base = base("staging-oversize");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        1024 * 1024,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("staging-oversize");
+    config.staging = staging;
+    Host::open_config(config)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_59_refuses_a_streamed_record_whose_staging_hold_cannot_fit() {
+    // The row is one indivisible window, and a streamed Put reserves a hold of
+    // two of its largest windows. An 8 MiB row in an 8 MiB staging region has
+    // a 16 MiB hold, so the record can never be admitted: OVERSIZE, not
+    // BUDGET. A 16 MiB region holds the same record.
+    let value = selene::record::Descriptor {
+        identity: [7; 32],
+        fingerprint: [3; 16],
+        page_tokens: 64,
+        ranks: vec![selene::record::RankSizes {
+            planes: vec![4000],
+            row_bytes: 8 * 1024 * 1024,
+        }],
+        tenant: String::new(),
+    };
+    let mut host = streaming_host(8 * 1024 * 1024);
+    host.start();
+    let mut client = host.client_with(value.clone()).await.unwrap();
+    assert_eq!(
+        client.put(key(64), None, PutOptions::default()).await,
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
+    );
+    drop(client);
+    drop(host);
+
+    let mut host = streaming_host(16 * 1024 * 1024);
+    host.start();
+    let mut client = host.client_with(value).await.unwrap();
+    assert!(matches!(
+        client.put(key(64), None, PutOptions::default()).await,
+        PutOutcome::Stored(_)
+    ));
 }
