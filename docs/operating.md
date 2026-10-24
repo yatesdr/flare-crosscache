@@ -1,0 +1,148 @@
+# Operating the cache manager
+
+This runbook covers sizing, refusal reasons, metrics, crash recovery and
+upgrades for `selene`. The client contract is [PROTOCOL.md](PROTOCOL.md); the
+build, test and container instructions are in [README.md](README.md).
+
+## Sizing
+
+The service is CPU-only and never touches GPU memory. Three budgets are
+configured separately and shared by every namespace: `--memory` (record
+retention), `--staging` (streamed transfers) and `--nvme` (durable records). A
+fourth, `--write-budget`, limits the DRAM-to-NVMe write rate. Size them from the
+Flare record geometry: one record is one checkpoint of one prefix, and its
+length grows with context length, rank count and plane sizes.
+
+`--memory` is the DRAM arena for records served without touching NVMe. Size it
+for the hot working set, not for the whole tree: the arena holds the records
+replicas restore from, while colder records stay durable on NVMe. Allocation
+uses power-of-two size classes, so a record consumes its length rounded up to
+the next power of two and usable capacity can be materially below the mapping
+size; records of similar size converge on one class, records of very different
+sizes fragment it. A record whose rounded extent exceeds the whole arena is not
+dropped — with `--root` it streams to NVMe — but it will never be served from
+DRAM; without `--root` it can never be admitted and its retries report
+`BUDGET`.
+
+`--staging` is a bounded scratch region. Each streamed Put reserves a fixed
+hold of two of its largest windows (a window is at most 4 MiB), and disk reads
+draw their windows from the same region. The minimum is 8 MiB and the default
+is 256 MiB; provision at least 8-16 MiB per concurrent streamed transfer. A
+streamed record whose largest window exceeds the whole staging region can never
+be admitted, and the refusal is a permanent `BUDGET` rather than an error.
+
+`--nvme` is the durable budget and includes the 4096-byte manager envelope per
+record. It must exceed the largest record a replica can publish; otherwise the
+Put is refused `OVERSIZE`. Size it for the durable working set, and keep it
+above `--memory`: DRAM eviction requires durability, so a full NVMe budget
+stops DRAM from making room. Restores also charge their in-flight windows
+against this budget, so leave headroom above the durable set.
+
+`--write-budget` is a token bucket in bytes per second with a burst of
+`max(rate, 1 MiB)`; `0` (the default) is unlimited. A Put is admitted only
+while the balance is non-negative, so a low budget delays durability and
+therefore DRAM eviction. Set it below the device's sustained write rate with
+room for compaction and recovery traffic.
+
+The arena and staging are preallocated files in `/dev/shm/selene/<name>`, so
+the shared-memory mount must provide at least `--memory + --staging` for each
+manager. A container's default 64 MiB `/dev/shm` is far too small; use
+`--shm-size` or the host IPC namespace.
+
+## Refusal reasons
+
+Clients retry on the transient reasons and must not retry `OVERSIZE` or
+`INVALID`. The manager never stalls a connection: a `BUDGET` refusal arms a
+Room notification that arrives when capacity or the budget frees up.
+
+| Reason | Meaning | Operator action |
+|---|---|---|
+| `PRESENT` | The record is already stored; no work is needed. | None. |
+| `BUDGET` | A capacity or rate limit is exhausted: a negative write-budget balance, no DRAM room that eviction can free, or a streamed window larger than staging. | Expect retries; a Room follows. Sustained `BUDGET` with no Room means staging is smaller than one window or the write budget is far below ingest. |
+| `QUEUE` | The connection's open-operation limit (four per direction) or an internal queue is full. | None; retries drain. Persistent `QUEUE` means clients are not reaping completions. |
+| `OVERSIZE` | The record can never fit: with `--root`, record plus envelope exceeds `--nvme`; without `--root`, its length exceeds `--memory`. | Raise the budget, add `--root`, or publish a smaller record. Retrying cannot succeed. |
+| `INVALID` | Malformed request, namespace-descriptor mismatch or geometry disagreement between a replica and the manager. | Alert. Check the protocol version and that replicas and manager use the same prepared package. |
+| `IO` | An NVMe read or write failed. | Alert on `cm_nvme_errors_total`; check the device and file system. |
+| `INFLIGHT` | A duplicate operation for the same prefix is in flight. | None; retry after it settles. |
+
+`QUOTA` and `UNSPECIFIED` are defined by the protocol but never produced by
+this manager.
+
+## Metrics
+
+`GET /metrics` on `--metrics HOST:PORT` returns Prometheus text (`cm_` prefix,
+content type `text/plain; version=0.0.4`); only that path is served. Collect
+the gauge proportions against the configured budgets, not absolute values.
+
+| Series | Meaning | Alert on |
+|---|---|---|
+| `cm_connections` | Live replica connections. | Dropping to zero while replicas serve. |
+| `cm_puts_total{outcome}` | `ok`, `error`, `present`, `queue`, `budget`, `inflight`, `oversize`. | Any `error`; `budget` growing faster than `ok`; any `oversize`. |
+| `cm_gets_total{outcome}` | `ok`, `error`. | Any `error`. |
+| `cm_nvme_errors_total` | NVMe read and write failures. | Any increase. |
+| `cm_nvme_bytes_total`, `cm_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes; write rate far from `--write-budget`. |
+| `cm_memory_allocated_bytes` | Arena bytes in use. | Near `--memory`, especially with rising evictions. |
+| `cm_staging_allocated_bytes` | Staging bytes in use. | Near `--staging`; streamed transfers are waiting. |
+| `cm_nvme_reserved_bytes` | Durable charge including envelopes. | Near `--nvme`: DRAM eviction stops when durability cannot be admitted. |
+| `cm_pending_puts`, `cm_pending_gets` | Operations queued across connections. | Sustained non-zero: clients outrun the manager. |
+| `cm_evictions_total`, `cm_compactions_total` | DRAM evictions and row compactions. | Evictions frequent enough that the hot set does not stay resident. |
+| `cm_hits_total{namespace,tier}`, `cm_records`, `cm_bytes` | Per-namespace hits and inventory. | Hit rate collapse, or a namespace that no longer matches a deployed package. |
+| `cm_unknown_frames_total` | Frames dropped as malformed. | Any sustained increase. |
+| `cm_leases`, `cm_open_ops`, `cm_cleanup_records`, `cm_cancels_total` | In-flight restores, open operations, pinned cleanup, cancellations. | Steadily growing leases or cleanup: stuck clients. |
+
+## Restart, crash and recovery
+
+Startup order is the root lock, NVMe recovery, shared-memory reclaim, then
+socket replacement. One manager owns a root at a time: it exclusive-locks
+`<root>/.lock`, and a second manager on the same root exits immediately.
+
+The shared-memory instance directory is reclaimed after taking its per-instance
+lock, so a killed manager never blocks a restart: stale region files are
+removed and one line is logged (`reclaimed stale instance '<name>' (N files)`).
+A stale socket is replaced only after confirming that nothing is listening.
+
+A DRAM publication is acknowledged before NVMe durability. A crash can
+therefore lose recently acknowledged records whose chains have not reached
+NVMe; replicas re-publish them. Durable records survive restarts, recovered
+records start in the disk tier, and DRAM is cold until replicas restore and
+re-publish. SIGTERM and SIGKILL both simply end the process; there is no
+shutdown flush beyond records already durable, but SIGTERM is the orderly
+choice.
+
+Recovery per namespace removes leftover `.*.tmp` files, validates every `.rec`
+envelope, header, layout, name, length and metadata checksum, sorts parents
+before children, and deletes orphaned descendants. A record that is corrupt in
+a detectable way is removed; a record that cannot be read because of an I/O
+error fails startup without deletion, so an operator can inspect or move it
+deliberately. A root that predates the descriptor format fails startup rather
+than being migrated.
+
+If the disk fills during a write, the manager retains the non-durable DRAM copies
+and retries every 100 ms; clients see `BUDGET` until space returns. Never free
+space by deleting files under a running manager: the root lock excludes a second
+manager, not an operator.
+
+## Upgrades and clearing the cache
+
+To upgrade, stop the manager, replace the binary and start it with the same
+`<root>`, `--name` and `--socket`. Durable records are validated and reused; no
+offline migration is needed and the DRAM cache warms again from replica traffic.
+The wire protocol version must match the replicas. Changing `--name` selects a
+different shared-memory instance and the default socket path, and does not
+affect the root.
+
+The root holds one opaque 64-hex directory per namespace plus `.lock`. Remove a
+namespace directory to drop that package's durable records; remove all namespace
+directories to clear the cache. Do this only while the manager is stopped;
+descriptors are written by the manager and must not be edited or created by
+hand. A changed package identity, geometry or tenant creates a new namespace,
+so the previous directory is safe to delete and cannot be reused accidentally.
+
+The root must be a local file system supporting 4096-byte `O_DIRECT` reads and
+writes, rename, and file and directory `fsync`. Network file systems are not
+supported. Run the manager with the same effective uid and gid as the replicas;
+it sets the socket to 0660 and its parent directory to 0770. The manager creates
+the socket directory when it can, but the default `/run/selene` lives under a
+root-owned `/run`, so create it with the runtime ownership first when running
+unprivileged. In containers, share the socket volume and the PID namespace with
+the replicas.
