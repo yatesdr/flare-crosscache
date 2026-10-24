@@ -1077,6 +1077,25 @@ mod tests {
         (local, cleanup)
     }
 
+    /// Reopening an instance right after its owner was dropped can transiently observe the
+    /// lock still held by a child this process spawned for another test: the child inherits
+    /// the lock descriptor and keeps the flock until its exec closes it (CLOEXEC). Retry that
+    /// window instead of assuming close and release are the same instant.
+    fn reopen(name: &str) -> Local {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match Local::open(name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024) {
+                Ok(local) => return local,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("reopening instance '{name}' failed: {error}"),
+            }
+        }
+    }
+
     fn shape(pages: u32, row: bool) -> WindowShape {
         WindowShape::new(pages, row, 4096, if row { 4096 } else { 0 }).unwrap()
     }
@@ -1126,7 +1145,7 @@ mod tests {
             "unexpected error: {error}"
         );
         drop(first);
-        let second = Local::open(&name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024).unwrap();
+        let second = reopen(&name);
         drop(second);
     }
 
@@ -1151,7 +1170,7 @@ mod tests {
         fs::write(directory.join("arena-0123456789abcdef"), b"stale").unwrap();
         fs::write(directory.join("staging-0123456789abcdef"), b"stale").unwrap();
         fs::write(directory.join("leftover.tmp"), b"stale").unwrap();
-        let second = Local::open(&name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024).unwrap();
+        let second = reopen(&name);
         let _cleanup = Cleanup(directory.clone());
         assert!(!directory.join("arena-0123456789abcdef").exists());
         assert!(!directory.join("staging-0123456789abcdef").exists());
