@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    arena::{Arena, Extent},
+    arena::{Arena, Extent, ExtentSlice},
     crosscache, invalid,
     record::{self, Descriptor, Header},
 };
@@ -161,7 +161,7 @@ pub enum Task {
         id: u64,
         temporary: Arc<DiskExtent>,
         offset: u64,
-        data: Vec<u8>,
+        data: ExtentSlice,
     },
     Compact {
         id: u64,
@@ -437,8 +437,8 @@ fn execute(task: Task, faults: &Faults) -> Result<u64> {
             ..
         } => {
             let file = open(&temporary.path, true)?;
-            write_at(&file, &data, ENVELOPE_BYTES + offset)?;
-            Ok(data.len() as u64)
+            write_at(&file, data.bytes(), ENVELOPE_BYTES + offset)?;
+            Ok(data.bytes().len() as u64)
         }
         Task::Publish {
             temporary,

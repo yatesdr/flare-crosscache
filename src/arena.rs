@@ -171,6 +171,30 @@ impl Arena {
     }
 }
 
+/// A window-sized view into a shared extent. Holding it keeps the extent
+/// allocation alive, so a queued write can read a staging hold slice after the
+/// window itself has been acknowledged.
+#[derive(Clone)]
+pub struct ExtentSlice {
+    extent: std::sync::Arc<Extent>,
+    within: usize,
+    length: usize,
+}
+
+impl ExtentSlice {
+    pub fn new(extent: std::sync::Arc<Extent>, within: usize, length: usize) -> Self {
+        Self {
+            extent,
+            within,
+            length,
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.extent.bytes()[self.within..self.within + self.length]
+    }
+}
+
 impl Extent {
     pub fn bytes(&self) -> &[u8] {
         unsafe {

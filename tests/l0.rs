@@ -1,6 +1,6 @@
 mod support;
 use flare_crosscache::{
-    arena::Arena,
+    arena::{Arena, ExtentSlice},
     crosscache, disk,
     record::{self, Header},
     store::Config,
@@ -851,9 +851,10 @@ fn l0_16_disk_queue_read_write_interleave() {
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let arena = Arena::new(8 * 4096).unwrap();
     let reader = worker.reader();
+    let write_arena = Arena::new(4 * 4096).unwrap();
     for index in 0..4 {
-        let mut data = vec![0u8; 4096];
-        data.fill(index as u8);
+        let mut extent = write_arena.allocate(4096).unwrap();
+        extent.bytes_mut().fill(index as u8);
         let temporary = Arc::new(disk::DiskExtent::new(base.join(format!("w-{index}.tmp"))));
         temporary.retire();
         worker
@@ -862,7 +863,7 @@ fn l0_16_disk_queue_read_write_interleave() {
                 id: index,
                 temporary,
                 offset: 0,
-                data,
+                data: ExtentSlice::new(Arc::new(extent), 0, 4096),
             })
             .unwrap();
     }
@@ -1696,9 +1697,10 @@ fn l0_38_async_reads_overtake_queued_writes() {
     fs::write(&source, vec![7u8; 4096]).unwrap();
     let file = Arc::new(disk::open_read(&source).unwrap());
     let arena = Arena::new(4096).unwrap();
+    let write_arena = Arena::new(8 * 4096).unwrap();
     for index in 0..8u64 {
-        let mut data = vec![0u8; 4096];
-        data.fill(index as u8);
+        let mut extent = write_arena.allocate(4096).unwrap();
+        extent.bytes_mut().fill(index as u8);
         let temporary = Arc::new(disk::DiskExtent::new(base.join(format!("w-{index}.tmp"))));
         temporary.retire();
         worker
@@ -1707,7 +1709,7 @@ fn l0_38_async_reads_overtake_queued_writes() {
                 id: index,
                 temporary,
                 offset: 0,
-                data,
+                data: ExtentSlice::new(Arc::new(extent), 0, 4096),
             })
             .unwrap();
     }
@@ -2049,10 +2051,10 @@ async fn l0_47_dram_only_evicts_the_parent_to_store_the_root() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_48_streaming_reserves_both_grantable_windows() {
-    // 128 pages and a 4 KiB row: 528 KiB of disk record plus the 256 KiB
-    // and 512 KiB windows pump_grants can issue at once. A 1,100 KiB budget
-    // cannot take the complete requirement even though disk plus one window
-    // would fit.
+    // 128 pages and a 4 KiB row: 528 KiB of disk record plus a fixed 1 MiB
+    // hold for two of the 512 KiB trailing windows. A 1,100 KiB budget
+    // cannot take the complete requirement even though disk plus the first
+    // two planned windows (1,296 KiB) once did.
     let tight = base("two-windows-small");
     let mut config = Config::new(
         tight.join("records"),
@@ -2146,8 +2148,8 @@ async fn l0_49_oversized_window_never_earns_room() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_50_streaming_reserves_the_largest_trailing_window() {
-    // 192 pages and a 4 KiB row: 784 KiB of disk record plus a 1 MiB hold
-    // for two of the 512 KiB trailing window. A 1,400 KiB budget cannot take
+    // 192 pages and a 4 KiB row: 784 KiB of disk record plus a fixed 1 MiB
+    // hold for two 512 KiB trailing windows. A 1,400 KiB budget cannot take
     // that complete requirement even though the first two windows would fit.
     let tight = base("trailing-window-tight");
     let mut config = Config::new(
@@ -2229,5 +2231,243 @@ async fn l0_51_rootless_child_waiting_for_its_parent_earns_no_room() {
             .is_err(),
         "Room was offered for an allocation that needs the protected parent"
     );
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
+    // With a slow writer, a third window can only be granted after one of
+    // the first two writes completes: the hold slots, not copied buffers,
+    // carry the in-flight windows.
+    let base = base("hold-drain");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        4 * 1024 * 1024,
+    );
+    config.name = instance_name("hold-drain");
+    config.faults.delay_ms = 300;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let record = key(192 * 64);
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(client.begin(record, None)),
+        })
+        .await
+        .unwrap();
+    let mut header: Option<Header> = None;
+    let mut source: Option<Vec<u8>> = None;
+    let mut first = 0u32;
+    let mut grants = Vec::new();
+    let mut fills = Vec::new();
+    let mut covered = 0u64;
+    let mut commit_sent = false;
+    let mut stored = false;
+    while !stored {
+        let reply = replies.message().await.unwrap().unwrap();
+        match reply.r {
+            Some(crosscache::put_reply::R::Accept(accept)) => {
+                first = u32::try_from(accept.first_page).unwrap();
+                let parent = accept.parent.as_ref().map(key_from_msg);
+                let (value, data, _) = client.content(record, parent, first);
+                header = Some(value);
+                source = Some(data);
+            }
+            Some(crosscache::put_reply::R::Grant(grant)) => {
+                grants.push(Instant::now());
+                let value = header.as_ref().unwrap();
+                let data = source.as_mut().unwrap();
+                let memory = grant.memory.as_ref().unwrap();
+                let region = if memory.region == crosscache::Region::Arena as i32 {
+                    Reg::Arena
+                } else {
+                    Reg::Staging
+                };
+                let length = usize::try_from(grant.length).unwrap();
+                let start = usize::try_from(grant.record_offset).unwrap();
+                let page_bytes = value.page_record_bytes() as usize;
+                let mut hashes = Vec::new();
+                for position in 0..grant.page_count as usize {
+                    let relative = (grant.page_first - u64::from(first)) as usize + position;
+                    let page = value.page_segment as usize + relative * page_bytes;
+                    hashes.push(record::checksum(&data[page..page + page_bytes]));
+                }
+                let row_hash = if grant.row {
+                    Some(record::checksum(&data[value.row_segment as usize..]))
+                } else {
+                    None
+                };
+                client.write(region, memory.offset, &data[start..start + length]);
+                sender
+                    .send(crosscache::PutMessage {
+                        m: Some(crosscache::put_message::M::Filled(
+                            crosscache::WindowFilled {
+                                transfer: grant.transfer,
+                                index: grant.index,
+                                page_xxh3: hashes,
+                                row_xxh3: row_hash.unwrap_or(0),
+                                has_row: grant.row,
+                            },
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                covered += grant.length;
+                fills.push(Instant::now());
+                let value = header.as_ref().unwrap();
+                let payload = value.length_with_row() - value.page_segment;
+                if !commit_sent && covered >= payload {
+                    for (index, chunk) in source.as_ref().unwrap()[..value.page_segment as usize]
+                        .chunks(4096)
+                        .enumerate()
+                    {
+                        sender
+                            .send(crosscache::PutMessage {
+                                m: Some(crosscache::put_message::M::Commit(
+                                    crosscache::PutCommit {
+                                        transfer: grant.transfer,
+                                        metadata_offset: (index * 4096) as u64,
+                                        metadata: chunk.to_vec(),
+                                    },
+                                )),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    commit_sent = true;
+                }
+            }
+            Some(crosscache::put_reply::R::Stored(_)) => stored = true,
+            Some(crosscache::put_reply::R::Refused(refused)) => {
+                panic!("streamed Put refused: {refused:?}")
+            }
+            None => break,
+        }
+    }
+    let data = source.unwrap();
+    assert_eq!(grants.len(), 3);
+    assert_eq!(fills.len(), 3);
+    assert!(
+        grants[2].duration_since(fills[1]) >= Duration::from_millis(150),
+        "the third window was granted before a slow write drained"
+    );
+    let fetched = client.fetch(&[record], 0, 192).await;
+    assert_eq!(fetched[0], data);
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
+    // 16 MiB arena, 8 MiB staging. An 8 MiB page record needs a 16 MiB
+    // arena extent but its streaming hold would be 16 MiB. While the
+    // resident record is leased the Put is refused; after the lease
+    // releases, Room must offer the arena retry and the Put must complete.
+    let base = base("room-arena-retry");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("room-arena-retry");
+    config.staging = 8 * 1024 * 1024;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut geometry = descriptor();
+    geometry.ranks[0].planes = vec![8 * 1024 * 1024];
+    let mut resident = host.client_with(geometry.clone()).await.unwrap();
+    let stored = resident.store(key(64), None).await;
+    host.durable(1);
+    // A second namespace (same geometry) for the Put that has to wait.
+    let mut other = geometry;
+    other.identity = [9; 32];
+    other.fingerprint = [4; 16];
+    let mut waiter = host.client_with(other).await.unwrap();
+    let mut subscription = waiter.subscribe().await;
+    // Lease the resident record and hold the window.
+    let (lease_sender, lease_receiver) = tokio::sync::mpsc::channel(8);
+    let mut lease_replies = resident
+        .inner
+        .get(resident.request(tokio_stream::wrappers::ReceiverStream::new(lease_receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    lease_sender
+        .send(crosscache::GetMessage {
+            m: Some(crosscache::get_message::M::Begin(crosscache::GetBegin {
+                namespace_id: resident.descriptor.namespace_id().to_vec(),
+                chain: vec![key_msg(key(64))],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+                destinations: Vec::new(),
+                transfer: 0,
+            })),
+        })
+        .await
+        .unwrap();
+    // Hold every lease window the record's Get grants (the 8 MiB page and
+    // the row arrive as separate windows).
+    let mut held = Vec::new();
+    while let Ok(Ok(Some(reply))) =
+        tokio::time::timeout(Duration::from_millis(100), lease_replies.message()).await
+    {
+        match reply.r {
+            Some(crosscache::get_reply::R::Ready(grant)) => {
+                held.push((grant.transfer, grant.index));
+            }
+            Some(crosscache::get_reply::R::Refused(refused)) => {
+                panic!("lease Get refused: {refused:?}")
+            }
+            Some(crosscache::get_reply::R::Done(_)) | None => break,
+            Some(_) => continue,
+        }
+    }
+    assert!(!held.is_empty(), "lease Get granted no window");
+    assert_eq!(
+        waiter.put(key(64), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered while the arena record was still leased"
+    );
+    for (transfer, index) in held {
+        lease_sender
+            .send(crosscache::GetMessage {
+                m: Some(crosscache::get_message::M::Released(
+                    crosscache::WindowReleased { transfer, index },
+                )),
+            })
+            .await
+            .unwrap();
+    }
+    loop {
+        match lease_replies.message().await.unwrap().unwrap().r {
+            Some(crosscache::get_reply::R::Done(_)) | None => break,
+            Some(_) => continue,
+        }
+    }
+    drop(lease_sender);
+    drop(lease_replies);
+    tokio::time::timeout(Duration::from_secs(2), subscription.until_room())
+        .await
+        .expect("Room never reconsidered the arena after the lease released");
+    let stored_again = waiter.store(key(64), None).await;
+    let fetched = waiter.fetch(&[key(64)], 0, 1).await;
+    assert_eq!(fetched[0], stored_again);
+    assert!(!stored.is_empty());
     host.wait(|host| host.gauge("open_ops") == 0);
 }

@@ -1,6 +1,6 @@
 use crate::{
     Key, Result,
-    arena::{Arena, Extent},
+    arena::{Arena, Extent, ExtentSlice},
     crosscache,
     disk::{self, DiskExtent, RecordData, Task},
     invalid,
@@ -151,10 +151,10 @@ struct FilledWindows {
 
 /// Physical resources a Put occupies, for the shape (arena or streamed) it
 /// will actually get. The arena shape is one buddy-rounded record extent plus
-/// the disk envelope; the streaming shape is the disk record plus every
-/// staging window the connection can hold at once. `unit` keeps the largest
-/// indivisible window separate from the simultaneous total so an oversized
-/// window is never mistaken for a whole-record requirement.
+/// the disk envelope; the streaming shape is the disk record plus one fixed
+/// staging hold of two of its largest windows. `unit` keeps the largest
+/// indivisible window separate so an oversized window is never mistaken for a
+/// whole-record requirement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PutRequirement {
     streaming: bool,
@@ -195,6 +195,30 @@ impl PutRequirement {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HoldSlot {
+    index: u32,
+    /// Chunk write still reading this slot; the slot is reusable once it
+    /// completes.
+    job: Option<u64>,
+}
+
+fn set_slot_job(put: &mut Put, index: u32, job: u64) {
+    for slot in put.hold_slots.iter_mut().flatten() {
+        if slot.index == index {
+            slot.job = Some(job);
+        }
+    }
+}
+
+fn release_slot_job(put: &mut Put, job: u64) {
+    for slot in &mut put.hold_slots {
+        if slot.is_some_and(|slot| slot.job == Some(job)) {
+            *slot = None;
+        }
+    }
+}
+
 enum RootChoice {
     Store(Extent),
     Wait(PutRequirement, Vec<Key>),
@@ -218,7 +242,7 @@ pub struct Put {
     terminal: bool,
     finished: bool,
     pending: usize,
-    blocked: VecDeque<(u64, u64, Vec<u8>)>,
+    blocked: VecDeque<(u64, u64, ExtentSlice)>,
     pins: VecDeque<Key>,
     replacement: bool,
     reservation: u64,
@@ -229,8 +253,8 @@ pub struct Put {
     staging_hold: Option<Arc<Extent>>,
     /// Slot size inside `staging_hold`.
     hold_unit: usize,
-    /// Window index occupying each hold slot.
-    hold_slots: [Option<u32>; 2],
+    /// Window occupying each hold slot, and the write draining it.
+    hold_slots: [Option<HoldSlot>; 2],
     events: tokio::sync::mpsc::Sender<Result<PutAnswer>>,
     outbox: VecDeque<Result<PutAnswer>>,
 }
@@ -485,6 +509,9 @@ struct PutDrain {
 #[derive(Clone, Debug)]
 struct ArmedRoom {
     requirement: PutRequirement,
+    /// Arena shape the same Put could take once space frees, when the refused
+    /// streaming shape cannot fit its hold.
+    alternative: Option<PutRequirement>,
     /// Keys the refused shape needs to survive the retry.
     protected: Vec<Key>,
 }
@@ -1178,6 +1205,9 @@ impl Store {
         // the parent and store the root. `memory` holds the extent the shape
         // was admitted with.
         let selected = self.put_requirement(&child_header, arena_bytes);
+        // A streaming refusal still has the arena shape as a retry candidate
+        // whenever the record fits an arena extent.
+        let alternative = (!selected.streaming).then_some(selected);
         let mut memory: Option<Arc<Extent>> = None;
         let (header, parent, pins, requirement): (Header, Option<Key>, Vec<Key>, PutRequirement) =
             if !selected.streaming {
@@ -1210,7 +1240,7 @@ impl Store {
                             }
                             RootChoice::Wait(requirement, protected) => {
                                 self.metrics.retry_budget += 1;
-                                self.arm(connection, requirement, protected);
+                                self.arm(connection, requirement, protected, None);
                                 self.reject_put(&events, crosscache::Reason::Budget as u8);
                                 return;
                             }
@@ -1244,7 +1274,7 @@ impl Store {
                     }
                     RootChoice::Wait(requirement, protected) => {
                         self.metrics.retry_budget += 1;
-                        self.arm(connection, requirement, protected);
+                        self.arm(connection, requirement, protected, None);
                         self.reject_put(&events, crosscache::Reason::Budget as u8);
                         return;
                     }
@@ -1269,7 +1299,7 @@ impl Store {
             } else {
                 requirement
             };
-            self.arm(connection, waiting, pins.clone());
+            self.arm(connection, waiting, pins.clone(), alternative);
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }
@@ -1288,7 +1318,7 @@ impl Store {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
             self.metrics.retry_budget += 1;
-            self.arm(connection, requirement, pins.clone());
+            self.arm(connection, requirement, pins.clone(), alternative);
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }
@@ -1301,7 +1331,7 @@ impl Store {
                         let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                     }
                     self.metrics.retry_budget += 1;
-                    self.arm(connection, requirement, pins.clone());
+                    self.arm(connection, requirement, pins.clone(), alternative);
                     self.reject_put(&events, crosscache::Reason::Budget as u8);
                     return;
                 }
@@ -1316,7 +1346,7 @@ impl Store {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
             self.metrics.retry_budget += 1;
-            self.arm(connection, requirement, pins.clone());
+            self.arm(connection, requirement, pins.clone(), alternative);
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }
@@ -1523,12 +1553,19 @@ impl Store {
     /// the keys it needs to survive. The latest refusal replaces the previous
     /// one, so an older, unserviceable requirement cannot keep Room tied to a
     /// charge this operation no longer needs.
-    fn arm(&mut self, connection: u64, requirement: PutRequirement, protected: Vec<Key>) {
+    fn arm(
+        &mut self,
+        connection: u64,
+        requirement: PutRequirement,
+        protected: Vec<Key>,
+        alternative: Option<PutRequirement>,
+    ) {
         self.local.arm_budget(connection, requirement.charge);
         self.armed.insert(
             connection,
             ArmedRoom {
                 requirement,
+                alternative,
                 protected,
             },
         );
@@ -1847,7 +1884,7 @@ impl Store {
                     };
                     put.windows.next += 1;
                     if let Some(slot) = slot {
-                        put.hold_slots[slot] = Some(index);
+                        put.hold_slots[slot] = Some(HoldSlot { index, job: None });
                     }
                     put.windows.granted.insert(index, plan);
                     put.outbox.push_back(Ok(PutAnswer::Grant(WindowGrant {
@@ -1868,7 +1905,7 @@ impl Store {
             }
             Err(GrantError::Credits) => false,
             Err(GrantError::Budget) => {
-                self.arm(connection, requirement, protected);
+                self.arm(connection, requirement, protected, None);
                 self.fail_put(
                     connection,
                     transfer,
@@ -2412,6 +2449,8 @@ impl Store {
         struct Prepared {
             plan: PlannedGrant,
             memory: Option<Arc<Extent>>,
+            hold: Option<Arc<Extent>>,
+            within: usize,
             header: Header,
             first_page: u32,
             temporary: Option<Arc<DiskExtent>>,
@@ -2431,6 +2470,10 @@ impl Store {
             if put.cancelled || put.terminal {
                 return Ok(());
             }
+            let slot = put
+                .hold_slots
+                .iter()
+                .position(|slot| slot.is_some_and(|slot| slot.index == index));
             put.windows
                 .granted
                 .get(&index)
@@ -2438,6 +2481,8 @@ impl Store {
                 .map(|plan| Prepared {
                     plan,
                     memory: put.memory.clone(),
+                    hold: put.staging_hold.clone(),
+                    within: slot.map_or(0, |slot| slot * put.hold_unit),
                     header: put.header.clone(),
                     first_page: put.first_page,
                     temporary: put.temporary.clone(),
@@ -2468,25 +2513,27 @@ impl Store {
             );
             return Ok(());
         }
-        let bytes: Vec<u8> = if let Some(memory) = &prepared.memory {
-            memory.bytes()[plan.record_offset as usize..(plan.record_offset + plan.length) as usize]
-                .to_vec()
+        // The window bytes stay in the arena extent or staging hold; a chunk
+        // keeps this slice alive until its write completes, so no copy is
+        // buffered in the manager.
+        let data = if let Some(memory) = &prepared.memory {
+            ExtentSlice::new(
+                memory.clone(),
+                plan.record_offset as usize,
+                plan.length as usize,
+            )
+        } else if let Some(hold) = &prepared.hold {
+            ExtentSlice::new(hold.clone(), prepared.within, plan.length as usize)
         } else {
-            let Some(bytes) = self
-                .local
-                .window_bytes(connection, transfer, index)
-                .map(<[u8]>::to_vec)
-            else {
-                self.fail_put(
-                    connection,
-                    transfer,
-                    crosscache::Reason::Invalid as u8,
-                    invalid("window vanished"),
-                );
-                return Ok(());
-            };
-            bytes
+            self.fail_put(
+                connection,
+                transfer,
+                crosscache::Reason::Invalid as u8,
+                invalid("window vanished"),
+            );
+            return Ok(());
         };
+        let bytes = data.bytes();
         let page_bytes = prepared.header.page_record_bytes() as usize;
         let mut verified = Vec::with_capacity(page_xxh3.len());
         for (position, hash) in page_xxh3.iter().enumerate() {
@@ -2517,11 +2564,6 @@ impl Store {
                 return Ok(());
             }
         }
-        let data = if prepared.streaming {
-            Some(bytes)
-        } else {
-            None
-        };
         {
             let Some(open) = self
                 .sessions
@@ -2534,9 +2576,7 @@ impl Store {
                 return Ok(());
             };
             put.windows.granted.remove(&index);
-            if let Some(slot) = put.hold_slots.iter().position(|slot| *slot == Some(index)) {
-                put.hold_slots[slot] = None;
-            }
+            // The slot stays occupied until the chunk write drains.
             for (position, hash) in verified.iter().enumerate() {
                 let relative =
                     (plan.page_first - u64::from(prepared.first_page)) as usize + position;
@@ -2551,15 +2591,6 @@ impl Store {
         }
         let _ = self.local.release(connection, transfer, index);
         if prepared.streaming {
-            let Some(data) = data else {
-                self.fail_put(
-                    connection,
-                    transfer,
-                    crosscache::Reason::Invalid as u8,
-                    invalid("staging window vanished"),
-                );
-                return Ok(());
-            };
             let Some(temporary) = prepared.temporary else {
                 self.fail_put(
                     connection,
@@ -2580,7 +2611,7 @@ impl Store {
             };
             enum ChunkAction {
                 Sent,
-                Blocked(Vec<u8>),
+                Blocked(ExtentSlice),
                 Failed,
             }
             let action = match &self.namespaces[&namespace].disk {
@@ -2613,6 +2644,7 @@ impl Store {
                     {
                         if let Operation::Put(put) = &mut open.operation {
                             put.pending += 1;
+                            set_slot_job(put, index, job);
                         }
                     }
                     self.config.faults.checkpoint("data");
@@ -2625,6 +2657,7 @@ impl Store {
                     {
                         if let Operation::Put(put) = &mut open.operation {
                             put.blocked.push_back((job, plan.record_offset, data));
+                            set_slot_job(put, index, job);
                         }
                     }
                 }
@@ -2648,8 +2681,12 @@ impl Store {
             .and_then(|session| session.ops.get_mut(&transfer))
         {
             if let Operation::Put(put) = &mut open.operation {
-                if let Some(slot) = put.hold_slots.iter().position(|slot| *slot == Some(index)) {
-                    put.hold_slots[slot] = None;
+                if let Some(slot) = put
+                    .hold_slots
+                    .iter_mut()
+                    .find(|slot| slot.is_some_and(|slot| slot.index == index))
+                {
+                    *slot = None;
                 }
             }
         }
@@ -3935,6 +3972,7 @@ impl Store {
                     {
                         if let Operation::Put(put) = &mut open.operation {
                             put.pending = put.pending.saturating_sub(1);
+                            release_slot_job(put, completion.id);
                             open.progress = Instant::now();
                             attached = true;
                         }
@@ -3942,6 +3980,7 @@ impl Store {
                     let mut detached_drained = false;
                     if let Some(put) = self.detached_puts.get_mut(&(connection, transfer)) {
                         put.pending = put.pending.saturating_sub(1);
+                        release_slot_job(put, completion.id);
                         if failed {
                             put.cancelled = true;
                             put.blocked.clear();
@@ -3985,6 +4024,7 @@ impl Store {
                     {
                         if let Operation::Put(put) = &mut open.operation {
                             put.pending = put.pending.saturating_sub(1);
+                            release_slot_job(put, completion.id);
                             open.progress = Instant::now();
                             attached = true;
                         }
@@ -4498,45 +4538,59 @@ impl Store {
             let Some(armed) = self.armed.get(&connection).cloned() else {
                 continue;
             };
-            let requirement = armed.requirement;
             let namespace = self
                 .sessions
                 .get(&connection)
                 .and_then(|session| session.namespace);
-            let _ = self.make_room_with(namespace, requirement.charge, &armed.protected);
+            let _ = self.make_room_with(namespace, armed.requirement.charge, &armed.protected);
             let budget_ok = self
                 .sessions
                 .get(&connection)
                 .is_some_and(|session| session.budget.balance() >= 0);
-            let capacity = if requirement.streaming {
-                // The disk record plus the fixed staging hold must fit.
-                self.charge_total().saturating_add(requirement.charge) <= self.config.nvme
-                    && requirement.allocation <= self.staging.capacity() as u64
-                    && self
-                        .staging
-                        .allocate(requirement.allocation as usize)
-                        .is_some()
-            } else {
-                let arena_ok = requirement.allocation <= self.memory.capacity() as u64
-                    && self
-                        .memory_room_excluding(
-                            requirement.allocation as usize,
-                            self.config.root.is_some(),
-                            &armed.protected,
-                        )
-                        .is_some();
-                arena_ok
-                    && (self.config.root.is_none()
-                        || self.charge_total().saturating_add(requirement.charge)
-                            <= self.config.nvme)
-            };
+            let mut bytes = armed.requirement.charge;
+            let mut capacity = self.room_capacity(armed.requirement, &armed.protected);
+            if !capacity {
+                // The refused streaming shape may still be unserviceable
+                // while the arena shape becomes possible again.
+                if let Some(alternative) = armed.alternative.filter(|alt| *alt != armed.requirement)
+                {
+                    let _ = self.make_room_with(namespace, alternative.charge, &armed.protected);
+                    if self.room_capacity(alternative, &armed.protected) {
+                        capacity = true;
+                        bytes = alternative.charge;
+                    }
+                }
+            }
             if budget_ok && capacity && self.local.take_armed(connection).is_some() {
                 self.armed.remove(&connection);
-                self.events.push(StoreEvent::Room {
-                    connection,
-                    bytes: requirement.charge,
-                });
+                self.events.push(StoreEvent::Room { connection, bytes });
             }
+        }
+    }
+
+    /// A retry can be admitted now when the same allocator path admission
+    /// uses succeeds: the fixed staging hold fits, or the arena allocation
+    /// succeeds with the shape's protected keys left in place.
+    fn room_capacity(&mut self, requirement: PutRequirement, protected: &[Key]) -> bool {
+        if requirement.streaming {
+            self.charge_total().saturating_add(requirement.charge) <= self.config.nvme
+                && requirement.allocation <= self.staging.capacity() as u64
+                && self
+                    .staging
+                    .allocate(requirement.allocation as usize)
+                    .is_some()
+        } else {
+            let arena_ok = requirement.allocation <= self.memory.capacity() as u64
+                && self
+                    .memory_room_excluding(
+                        requirement.allocation as usize,
+                        self.config.root.is_some(),
+                        protected,
+                    )
+                    .is_some();
+            arena_ok
+                && (self.config.root.is_none()
+                    || self.charge_total().saturating_add(requirement.charge) <= self.config.nvme)
         }
     }
 
@@ -5630,9 +5684,9 @@ mod tests {
         store
             .hello(1, "l0".into(), std::process::id(), value.clone())
             .unwrap();
-        // A record larger than staging still streams one window at a time:
-        // the requirement charges the whole disk record plus both windows,
-        // and Room only needs one window to fit the staging region.
+        // A record larger than staging still streams: the requirement
+        // charges the disk record plus a fixed hold of two of its largest
+        // windows, and Room only needs that hold to fit the staging region.
         let key = |tokens| Key {
             consumed_tokens: tokens,
             digest: [0; 16],
@@ -5642,7 +5696,7 @@ mod tests {
         assert!(requirement.streaming);
         assert!(requirement.reservation > 8 * 1024 * 1024);
         assert!(requirement.unit <= 4 * 1024 * 1024);
-        store.arm(1, requirement, Vec::new());
+        store.arm(1, requirement, Vec::new(), None);
         store.room();
         assert!(
             store
@@ -5672,8 +5726,8 @@ mod tests {
         assert_eq!(arena.reservation, 20 * 1024);
         assert_eq!(arena.allocation, 16 * 1024);
         assert_eq!(arena.unit, 16 * 1024);
-        // 128 pages and a 4 KiB row: 528 KiB of disk record plus the two
-        // simultaneously grantable windows (256 KiB and 512 KiB).
+        // 128 pages and a 4 KiB row: 528 KiB of disk record plus a fixed
+        // hold of two 512 KiB windows.
         let many = Header::new(&value, key(128 * 64), None, [0; 16], 128).unwrap();
         let stream = store.put_requirement(&many, 0);
         assert!(stream.streaming);
@@ -5884,6 +5938,7 @@ mod tests {
                 unit: 16 * 1024 * 1024,
             },
             Vec::new(),
+            None,
         );
         store.room();
         assert!(
@@ -5905,6 +5960,7 @@ mod tests {
                 unit: 4 * 1024 * 1024,
             },
             Vec::new(),
+            None,
         );
         store.room();
         assert!(
@@ -5949,7 +6005,8 @@ mod tests {
         };
         let mut put = *put;
         put.cancelled = true;
-        put.blocked.push_back((777, 0, vec![0; 4096]));
+        let slice = ExtentSlice::new(Arc::new(store.staging.allocate(4096).unwrap()), 0, 4096);
+        put.blocked.push_back((777, 0, slice));
         store.detached_puts.insert((1, 1), put);
         store.pump_chunks();
         assert!(!store.jobs.contains_key(&777));
@@ -6028,8 +6085,8 @@ mod tests {
             .unwrap();
         let large = PutRequirement::streaming(1024, 4096);
         let small = PutRequirement::arena(8192);
-        store.arm(1, large, Vec::new());
-        store.arm(1, small, Vec::new());
+        store.arm(1, large, Vec::new(), None);
+        store.arm(1, small, Vec::new(), None);
         assert_eq!(store.armed[&1].requirement, small);
         assert_eq!(store.local.armed_budget(1), Some(small.charge));
         assert_eq!(store.local.take_armed(1), Some(small.charge));
@@ -6055,6 +6112,7 @@ mod tests {
                 unit: capacity,
             },
             Vec::new(),
+            None,
         );
         store.room();
         assert!(
@@ -6136,7 +6194,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_admission_uses_the_planned_window() {
+    fn streaming_admission_uses_the_hold() {
         let name = format!(
             "cm-unit-{}-budget-staging-{}",
             std::process::id(),
@@ -6175,8 +6233,8 @@ mod tests {
             events.clone(),
         );
         store.dispatch_trace();
-        // The planned window is 12288 bytes (size class 16384), not the
-        // negotiated 4 MiB maximum, so the first Put stays in budget.
+        // The hold is two 16 KiB windows (32 KiB), not two negotiated 4 MiB
+        // maxima, so both Puts stay in budget.
         assert!(store.budget_balance(1).unwrap() >= 0);
         store.submit_put(
             1,
@@ -6391,7 +6449,8 @@ mod tests {
             let Operation::Put(put) = operation else {
                 panic!("expected Put");
             };
-            put.blocked.push_back((999, 0, vec![0; 4096]));
+            let slice = ExtentSlice::new(Arc::new(store.staging.allocate(4096).unwrap()), 0, 4096);
+            put.blocked.push_back((999, 0, slice));
         }
         store.fail_put(1, 1, crosscache::Reason::Io as u8, invalid("test"));
         let operation = &store.sessions[&1].ops[&1].operation;
