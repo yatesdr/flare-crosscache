@@ -506,9 +506,10 @@ async fn l0_10_cancel_drains_and_staging_gauge() {
             .await,
         PutOutcome::Cancelled
     );
-    // The staging window lives until its delayed disk write completes, then drains.
+    // The fixed hold for the two-page record (2 x a 16 KiB window) lives
+    // until its delayed disk write completes, then drains.
     host.wait(|host| host.gauge("staging_allocated_bytes") > 0);
-    assert_eq!(host.gauge("staging_allocated_bytes"), 16384);
+    assert_eq!(host.gauge("staging_allocated_bytes"), 32768);
     host.wait(|host| host.gauge("staging_allocated_bytes") == 0);
     host.wait(|host| host.gauge("nvme_reserved_bytes") == 0);
     // A Get is not blocked by a draining Put.
@@ -850,10 +851,9 @@ fn l0_16_disk_queue_read_write_interleave() {
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let arena = Arena::new(8 * 4096).unwrap();
     let reader = worker.reader();
-    let write_arena = Arena::new(4 * 4096).unwrap();
     for index in 0..4 {
-        let mut extent = write_arena.allocate(4096).unwrap();
-        extent.bytes_mut().fill(index as u8);
+        let mut data = vec![0u8; 4096];
+        data.fill(index as u8);
         let temporary = Arc::new(disk::DiskExtent::new(base.join(format!("w-{index}.tmp"))));
         temporary.retire();
         worker
@@ -862,7 +862,7 @@ fn l0_16_disk_queue_read_write_interleave() {
                 id: index,
                 temporary,
                 offset: 0,
-                data: Arc::new(extent),
+                data,
             })
             .unwrap();
     }
@@ -1497,15 +1497,18 @@ async fn l0_32_streaming_reservation_includes_the_disk_record() {
     let mut client = host.client().await;
     let (sender, replies) = client.raw_begin(key(128), None).await;
     // key(128) is 2 pages + row: page_segment 8192, row_segment 16384,
-    // row 4096, so envelope + 20480 = 24576 is reserved before any staging.
+    // row 4096, so envelope + 20480 = 24576 of disk record plus the fixed
+    // 2 x 16 KiB staging hold is reserved before any window is granted.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while host.gauge("nvme_reserved_bytes") < 24576 {
+    while host.gauge("nvme_reserved_bytes") < 24576 + 32768 {
         assert!(
             Instant::now() < deadline,
             "streaming reservation was undercharged"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let before = host.gauge("nvme_reserved_bytes");
+    assert!(before >= 24576 + 32768, "hold was not included: {before}");
     sender
         .send(crosscache::PutMessage {
             m: Some(crosscache::put_message::M::Cancel(crosscache::Cancel {})),
@@ -1515,8 +1518,10 @@ async fn l0_32_streaming_reservation_includes_the_disk_record() {
     drop(sender);
     drop(replies);
     drop(client);
+    // A quarantine may keep the fixed hold, but the disk record reservation
+    // must be released.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while host.gauge("nvme_reserved_bytes") >= 24576 {
+    while host.gauge("nvme_reserved_bytes") > before - 24576 {
         assert!(
             Instant::now() < deadline,
             "streaming reservation was not released"
@@ -1691,10 +1696,9 @@ fn l0_38_async_reads_overtake_queued_writes() {
     fs::write(&source, vec![7u8; 4096]).unwrap();
     let file = Arc::new(disk::open_read(&source).unwrap());
     let arena = Arena::new(4096).unwrap();
-    let write_arena = Arena::new(8 * 4096).unwrap();
     for index in 0..8u64 {
-        let mut extent = write_arena.allocate(4096).unwrap();
-        extent.bytes_mut().fill(index as u8);
+        let mut data = vec![0u8; 4096];
+        data.fill(index as u8);
         let temporary = Arc::new(disk::DiskExtent::new(base.join(format!("w-{index}.tmp"))));
         temporary.retire();
         worker
@@ -1703,7 +1707,7 @@ fn l0_38_async_reads_overtake_queued_writes() {
                 id: index,
                 temporary,
                 offset: 0,
-                data: Arc::new(extent),
+                data,
             })
             .unwrap();
     }
@@ -1934,7 +1938,7 @@ async fn l0_45_reserve_before_pin_with_four_open_puts() {
         base.join("records"),
         base.join("run/m.sock"),
         8 * 1024 * 1024,
-        9 * 1024 * 1024,
+        24 * 1024 * 1024,
     );
     config.name = instance_name("reserve-pin");
     config.staging = 8 * 1024 * 1024;
@@ -2136,6 +2140,94 @@ async fn l0_49_oversized_window_never_earns_room() {
             .await
             .is_err(),
         "Room was offered for a window the staging region can never hold"
+    );
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_50_streaming_reserves_the_largest_trailing_window() {
+    // 192 pages and a 4 KiB row: 784 KiB of disk record plus a 1 MiB hold
+    // for two of the 512 KiB trailing window. A 1,400 KiB budget cannot take
+    // that complete requirement even though the first two windows would fit.
+    let tight = base("trailing-window-tight");
+    let mut config = Config::new(
+        tight.join("records"),
+        tight.join("run/m.sock"),
+        4096,
+        1400 * 1024,
+    );
+    config.name = instance_name("trailing-window-tight");
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let mut subscription = client.subscribe().await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(client.begin(key(192 * 64), None)),
+        })
+        .await
+        .unwrap();
+    let first = replies.message().await.unwrap().unwrap();
+    match first.r {
+        Some(crosscache::put_reply::R::Refused(refused)) => {
+            assert_eq!(refused.reason, crosscache::Reason::Budget as i32);
+        }
+        other => panic!("Put was accepted before the hold fitted: {other:?}"),
+    }
+    drop(sender);
+    drop(replies);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered for a requirement larger than the budget"
+    );
+
+    let fitted = base("trailing-window-fit");
+    let mut config = Config::new(
+        fitted.join("records"),
+        fitted.join("run/m.sock"),
+        4096,
+        2 * 1024 * 1024,
+    );
+    config.name = instance_name("trailing-window-fit");
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let stored = client.store(key(192 * 64), None).await;
+    let fetched = client.fetch(&[key(192 * 64)], 0, 192).await;
+    assert_eq!(fetched[0], stored);
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_51_rootless_child_waiting_for_its_parent_earns_no_room() {
+    // The 32 KiB arena holds a two-page parent. The four-page-tail child
+    // needs 32 KiB while its six-page root needs 64 KiB, so only the parent
+    // surviving can admit it; Room must not count that parent as reclaimable.
+    let mut host = Host::dram_only(32 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    let mut subscription = client.subscribe().await;
+    assert_eq!(
+        client
+            .put(key(384), Some(key(128)), PutOptions::default())
+            .await,
+        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered for an allocation that needs the protected parent"
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }

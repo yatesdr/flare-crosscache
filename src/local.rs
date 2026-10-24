@@ -807,9 +807,12 @@ impl Local {
     }
 
     /// Remembers the largest reservation refused `BUDGET` on this connection.
+    /// Replaces the armed reservation. The store arms the most recent refusal
+    /// for the connection, so a smaller later requirement must replace an
+    /// older, unserviceable one rather than being ignored.
     pub fn arm_budget(&mut self, connection: u64, bytes: u64) {
         if let Some(record) = self.connections.get_mut(&connection) {
-            record.armed = record.armed.max(bytes);
+            record.armed = bytes;
         }
     }
 

@@ -168,6 +168,39 @@ struct PutRequirement {
     unit: u64,
 }
 
+impl PutRequirement {
+    fn arena(extent: u64) -> Self {
+        let charge = disk::ENVELOPE_BYTES + extent;
+        Self {
+            streaming: false,
+            charge,
+            reservation: charge,
+            allocation: extent,
+            unit: extent,
+        }
+    }
+
+    /// A streamed Put reserves one fixed hold of two of its largest windows.
+    /// Live windows are slices of that hold, so the staging headroom the
+    /// transfer will need cannot be taken by a concurrent operation.
+    fn streaming(disk: u64, unit: u64) -> Self {
+        let allocation = unit.saturating_mul(2);
+        Self {
+            streaming: true,
+            charge: disk.saturating_add(allocation),
+            reservation: disk,
+            allocation,
+            unit,
+        }
+    }
+}
+
+enum RootChoice {
+    Store(Extent),
+    Wait(PutRequirement, Vec<Key>),
+    Oversize,
+}
+
 pub struct Put {
     namespace: NamespaceId,
     header: Header,
@@ -185,11 +218,19 @@ pub struct Put {
     terminal: bool,
     finished: bool,
     pending: usize,
-    blocked: VecDeque<(u64, u64, Arc<Extent>)>,
+    blocked: VecDeque<(u64, u64, Vec<u8>)>,
     pins: VecDeque<Key>,
     replacement: bool,
     reservation: u64,
     requirement: PutRequirement,
+    /// Fixed staging reservation for a streamed Put. Live windows are
+    /// slices of it, so concurrent operations cannot consume the headroom
+    /// the transfer still needs.
+    staging_hold: Option<Arc<Extent>>,
+    /// Slot size inside `staging_hold`.
+    hold_unit: usize,
+    /// Window index occupying each hold slot.
+    hold_slots: [Option<u32>; 2],
     events: tokio::sync::mpsc::Sender<Result<PutAnswer>>,
     outbox: VecDeque<Result<PutAnswer>>,
 }
@@ -438,6 +479,14 @@ struct PutDrain {
     pending: usize,
     reservation: u64,
     _temporary: Option<Arc<DiskExtent>>,
+    _staging_hold: Option<Arc<Extent>>,
+}
+
+#[derive(Clone, Debug)]
+struct ArmedRoom {
+    requirement: PutRequirement,
+    /// Keys the refused shape needs to survive the retry.
+    protected: Vec<Key>,
 }
 
 struct GetDrain {
@@ -506,7 +555,7 @@ pub struct Store {
     next_transfer: u64,
     read_backlog: VecDeque<(NamespaceId, u64, Task)>,
     detached_puts: HashMap<(u64, u64), Put>,
-    armed: HashMap<u64, PutRequirement>,
+    armed: HashMap<u64, ArmedRoom>,
     forward_events: Vec<ForwardEvent>,
 }
 
@@ -1111,72 +1160,119 @@ impl Store {
         };
         let rootless = self.config.root.is_none();
         let replacement = initial_old.is_some();
-        // The shape the Put will get: the selected child shape while the
-        // arena can take it, otherwise the streaming shape. A rootless
-        // manager cannot stream, so it may evict the parent and store the
-        // root instead.
+        let arena_bytes = self.memory.capacity() as u64;
         let selected_pins: Vec<Key> = initial_parent
             .into_iter()
             .chain(replacement.then_some(request.key))
             .collect();
-        let selected = self.put_requirement(
-            &child_header,
-            self.arena_headroom(&selected_pins, !rootless),
-        );
-        let (header, parent, pins, requirement): (Header, Option<Key>, Vec<Key>, PutRequirement) =
-            if selected.streaming && rootless {
-                let root_pins: Vec<Key> = replacement.then_some(request.key).into_iter().collect();
-                let root =
-                    self.put_requirement(&root_header, self.arena_headroom(&root_pins, false));
-                if root.streaming {
-                    let extent = child_header.length_with_row().max(4096).next_power_of_two();
-                    if extent > self.memory.capacity() as u64 {
-                        self.metrics.oversize += 1;
-                        self.reject_put(&events, crosscache::Reason::Oversize as u8);
-                    } else {
-                        // The selected record still fits the arena while it
-                        // is empty enough; wait for arena space instead of
-                        // reporting a root that can never be stored.
-                        self.metrics.retry_budget += 1;
-                        let waiting =
-                            self.put_requirement(&child_header, self.memory.capacity() as u64);
-                        self.arm(connection, waiting);
-                        self.reject_put(&events, crosscache::Reason::Budget as u8);
-                    }
-                    return;
-                }
-                (root_header, None, root_pins, root)
-            } else {
-                (child_header, initial_parent, selected_pins, selected)
-            };
-        let length = header.length_with_row();
-        if self.config.root.is_some() {
-            if disk::ENVELOPE_BYTES.saturating_add(length) > self.config.nvme {
-                self.metrics.oversize += 1;
-                self.reject_put(&events, crosscache::Reason::Oversize as u8);
-                return;
-            }
-        } else if length > self.memory.capacity() as u64 {
+        if !rootless
+            && disk::ENVELOPE_BYTES.saturating_add(child_header.length_with_row())
+                > self.config.nvme
+        {
             self.metrics.oversize += 1;
             self.reject_put(&events, crosscache::Reason::Oversize as u8);
             return;
         }
+        // Pick the shape by asking the arena allocator. A failed allocation
+        // falls back to streaming; a rootless manager instead tries to evict
+        // the parent and store the root. `memory` holds the extent the shape
+        // was admitted with.
+        let selected = self.put_requirement(&child_header, arena_bytes);
+        let mut memory: Option<Arc<Extent>> = None;
+        let (header, parent, pins, requirement): (Header, Option<Key>, Vec<Key>, PutRequirement) =
+            if !selected.streaming {
+                match self.memory_room_excluding(
+                    child_header.length_with_row() as usize,
+                    !rootless,
+                    &selected_pins,
+                ) {
+                    Some(extent) => {
+                        let requirement = PutRequirement::arena(extent.capacity() as u64);
+                        memory = Some(Arc::new(extent));
+                        (child_header, initial_parent, selected_pins, requirement)
+                    }
+                    None if rootless => {
+                        let root_pins: Vec<Key> =
+                            replacement.then_some(request.key).into_iter().collect();
+                        match self.rootless_fallback(
+                            &child_header,
+                            &selected_pins,
+                            &root_header,
+                            root_pins,
+                            arena_bytes,
+                        ) {
+                            RootChoice::Store(extent) => {
+                                let requirement = PutRequirement::arena(extent.capacity() as u64);
+                                memory = Some(Arc::new(extent));
+                                let root_pins: Vec<Key> =
+                                    replacement.then_some(request.key).into_iter().collect();
+                                (root_header, None, root_pins, requirement)
+                            }
+                            RootChoice::Wait(requirement, protected) => {
+                                self.metrics.retry_budget += 1;
+                                self.arm(connection, requirement, protected);
+                                self.reject_put(&events, crosscache::Reason::Budget as u8);
+                                return;
+                            }
+                            RootChoice::Oversize => {
+                                self.metrics.oversize += 1;
+                                self.reject_put(&events, crosscache::Reason::Oversize as u8);
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        let requirement = self.put_requirement(&child_header, 0);
+                        (child_header, initial_parent, selected_pins, requirement)
+                    }
+                }
+            } else if rootless {
+                let root_pins: Vec<Key> = replacement.then_some(request.key).into_iter().collect();
+                match self.rootless_fallback(
+                    &child_header,
+                    &selected_pins,
+                    &root_header,
+                    root_pins,
+                    arena_bytes,
+                ) {
+                    RootChoice::Store(extent) => {
+                        let requirement = PutRequirement::arena(extent.capacity() as u64);
+                        memory = Some(Arc::new(extent));
+                        let root_pins: Vec<Key> =
+                            replacement.then_some(request.key).into_iter().collect();
+                        (root_header, None, root_pins, requirement)
+                    }
+                    RootChoice::Wait(requirement, protected) => {
+                        self.metrics.retry_budget += 1;
+                        self.arm(connection, requirement, protected);
+                        self.reject_put(&events, crosscache::Reason::Budget as u8);
+                        return;
+                    }
+                    RootChoice::Oversize => {
+                        self.metrics.oversize += 1;
+                        self.reject_put(&events, crosscache::Reason::Oversize as u8);
+                        return;
+                    }
+                }
+            } else {
+                let requirement = self.put_requirement(&child_header, 0);
+                (child_header, initial_parent, selected_pins, requirement)
+            };
+        let length = header.length_with_row();
         // A window larger than the whole staging region can never be
         // granted. If the record still fits an arena extent, wait for arena
         // space; otherwise it can never be stored as configured.
         if requirement.streaming && requirement.unit > self.staging.capacity() as u64 {
             self.metrics.retry_budget += 1;
-            let extent = length.max(4096).next_power_of_two();
-            let waiting = if extent <= self.memory.capacity() as u64 {
-                self.put_requirement(&header, self.memory.capacity() as u64)
+            let waiting = if !selected.streaming {
+                selected
             } else {
                 requirement
             };
-            self.arm(connection, waiting);
+            self.arm(connection, waiting, pins.clone());
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }
-        let pins: VecDeque<Key> = pins.into();
         for key in &pins {
             if self.namespaces.get_mut(&id).unwrap().tree.pin(key).is_err() {
                 for key in &pins {
@@ -1186,38 +1282,41 @@ impl Store {
                 return;
             }
         }
-        if !self.make_room(requirement.charge) {
-            for key in &pins {
-                let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
-            }
-            self.metrics.retry_budget += 1;
-            self.arm(connection, requirement);
-            self.reject_put(&events, crosscache::Reason::Budget as u8);
-            return;
-        }
-        let memory = if requirement.streaming {
-            None
-        } else {
-            match self.memory_room(length as usize, !rootless) {
-                Some(extent) => Some(Arc::new(extent)),
-                None => {
-                    for key in &pins {
-                        let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
-                    }
-                    self.metrics.retry_budget += 1;
-                    self.arm(connection, requirement);
-                    self.reject_put(&events, crosscache::Reason::Budget as u8);
-                    return;
-                }
-            }
-        };
-        if !self.admit(connection, requirement.charge) {
+        if !self.make_room_with(Some(id), requirement.charge, &pins) {
             drop(memory);
             for key in &pins {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
             self.metrics.retry_budget += 1;
-            self.arm(connection, requirement);
+            self.arm(connection, requirement, pins.clone());
+            self.reject_put(&events, crosscache::Reason::Budget as u8);
+            return;
+        }
+        let staging_hold = if requirement.streaming {
+            match self.staging.allocate(requirement.allocation as usize) {
+                Some(extent) => Some(Arc::new(extent)),
+                None => {
+                    drop(memory);
+                    for key in &pins {
+                        let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
+                    }
+                    self.metrics.retry_budget += 1;
+                    self.arm(connection, requirement, pins.clone());
+                    self.reject_put(&events, crosscache::Reason::Budget as u8);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if !self.admit(connection, requirement.charge) {
+            drop(memory);
+            drop(staging_hold);
+            for key in &pins {
+                let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
+            }
+            self.metrics.retry_budget += 1;
+            self.arm(connection, requirement, pins.clone());
             self.reject_put(&events, crosscache::Reason::Budget as u8);
             return;
         }
@@ -1227,6 +1326,8 @@ impl Store {
             match self.namespaces[&id].temporary(job) {
                 Some(extent) => Some(extent),
                 None => {
+                    drop(memory);
+                    drop(staging_hold);
                     for key in &pins {
                         let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                     }
@@ -1267,10 +1368,13 @@ impl Store {
             finished: false,
             pending: 0,
             blocked: VecDeque::new(),
-            pins,
+            pins: pins.into(),
             replacement,
             reservation: requirement.reservation,
             requirement,
+            staging_hold,
+            hold_unit: requirement.unit as usize,
+            hold_slots: [None, None],
             events,
             outbox: VecDeque::new(),
         };
@@ -1323,24 +1427,67 @@ impl Store {
     }
 
     fn memory_room(&mut self, bytes: usize, require_durable: bool) -> Option<Extent> {
+        self.memory_room_excluding(bytes, require_durable, &[])
+    }
+
+    /// Attempt the arena allocation, evicting eligible leaves one at a time
+    /// until it succeeds. Asking the allocator rather than summing free bytes
+    /// handles buddy fragmentation and chains whose parent only becomes a
+    /// leaf after its child is evicted. `excluded` keys must survive.
+    fn memory_room_excluding(
+        &mut self,
+        bytes: usize,
+        require_durable: bool,
+        excluded: &[Key],
+    ) -> Option<Extent> {
         loop {
             if let Some(extent) = self.memory.allocate(bytes) {
                 return Some(extent);
             }
             let (id, key) = self.oldest(|node| {
-                node.location.memory.is_some()
-                    && (!require_durable || node.location.durable)
-                    // A rootless manager has no disk copy to fall back on, so it
-                    // may only evict true leaves.
-                    && (if require_durable {
-                        node.children() == 0 || (node.row && node.children() == 1)
-                    } else {
-                        node.children() == 0
-                    })
+                Self::memory_evictable(node, require_durable) && !excluded.contains(&node.key)
             })?;
             if !self.evict_memory(id, key) {
                 return None;
             }
+        }
+    }
+
+    /// Shared eligibility for reclaiming an arena extent. A rooted manager may
+    /// only drop records that have a disk copy; a rootless one may drop true
+    /// leaves outright.
+    fn memory_evictable(node: &crate::tree::Node<Location>, require_durable: bool) -> bool {
+        node.location.memory.is_some()
+            && (!require_durable || node.location.durable)
+            && (if require_durable {
+                node.children() == 0 || (node.row && node.children() == 1)
+            } else {
+                node.children() == 0
+            })
+    }
+
+    /// A rootless manager can only store the record as a root once the
+    /// selected parent is evicted. Report the root extent when the allocator
+    /// can provide it, otherwise what the retry has to wait for.
+    fn rootless_fallback(
+        &mut self,
+        child: &Header,
+        child_pins: &[Key],
+        root: &Header,
+        root_pins: Vec<Key>,
+        arena_bytes: u64,
+    ) -> RootChoice {
+        if child.length_with_row() > arena_bytes {
+            return RootChoice::Oversize;
+        }
+        let requirement = self.put_requirement(root, arena_bytes);
+        if requirement.streaming {
+            let waiting = self.put_requirement(child, arena_bytes);
+            return RootChoice::Wait(waiting, child_pins.to_vec());
+        }
+        match self.memory_room_excluding(root.length_with_row() as usize, false, &root_pins) {
+            Some(extent) => RootChoice::Store(extent),
+            None => RootChoice::Wait(requirement, root_pins),
         }
     }
 
@@ -1372,76 +1519,75 @@ impl Store {
     /// Arm Room with the requirement of the shape that was just refused. The
     /// latest refusal wins: an older, permanently unserviceable requirement
     /// must not keep Room from firing for one that now fits.
-    fn arm(&mut self, connection: u64, requirement: PutRequirement) {
+    /// Arm Room with the requirement of the shape that was just refused and
+    /// the keys it needs to survive. The latest refusal replaces the previous
+    /// one, so an older, unserviceable requirement cannot keep Room tied to a
+    /// charge this operation no longer needs.
+    fn arm(&mut self, connection: u64, requirement: PutRequirement, protected: Vec<Key>) {
         self.local.arm_budget(connection, requirement.charge);
-        self.armed.insert(connection, requirement);
-    }
-
-    /// Arena bytes this Put could use without evicting `protected`: free
-    /// space plus memory that `memory_room` would be allowed to reclaim.
-    fn arena_headroom(&self, protected: &[Key], require_durable: bool) -> u64 {
-        let free = self.memory.capacity().saturating_sub(self.memory.used()) as u64;
-        let reclaimable: u64 = self
-            .namespaces
-            .values()
-            .flat_map(|namespace| namespace.tree.nodes())
-            .filter(|node| !protected.contains(&node.key))
-            .filter(|node| !node.pinned() && !node.location.writing && !node.location.reading())
-            .filter(|node| node.location.memory.is_some())
-            .filter(|node| !require_durable || node.location.durable)
-            .filter(|node| {
-                if require_durable {
-                    node.children() == 0 || (node.row && node.children() == 1)
-                } else {
-                    node.children() == 0
-                }
-            })
-            .filter_map(|node| node.location.memory.as_ref())
-            .map(|extent| extent.capacity() as u64)
-            .sum();
-        free.saturating_add(reclaimable)
+        self.armed.insert(
+            connection,
+            ArmedRoom {
+                requirement,
+                protected,
+            },
+        );
     }
 
     /// The physical requirement for this Put shape. A record whose
-    /// buddy-rounded extent fits the arena headroom is stored in one arena
-    /// extent; otherwise it streams to disk and holds every staging window
-    /// the connection can have granted at once. `arena_bytes` is the
-    /// headroom for admission and the region capacity for Room.
+    /// buddy-rounded extent fits `arena_bytes` is stored in one arena extent;
+    /// otherwise it streams to disk behind a fixed staging hold of two of its
+    /// largest windows. `arena_bytes` is the arena capacity for the shape
+    /// decision; admission confirms it by allocating.
     fn put_requirement(&self, header: &Header, arena_bytes: u64) -> PutRequirement {
         let length = header.length_with_row();
         let extent = length.max(4096).next_power_of_two();
         if extent <= arena_bytes {
-            let charge = disk::ENVELOPE_BYTES + extent;
-            return PutRequirement {
-                streaming: false,
-                charge,
-                reservation: charge,
-                allocation: extent,
-                unit: extent,
-            };
+            return PutRequirement::arena(extent);
         }
         let first = header
             .parent
             .map_or(0, |parent| parent.consumed_tokens / header.page_tokens)
             as u32;
-        let windows: Vec<u64> = plan_put_grants(header, first, self.config.max_window_bytes)
+        let unit = plan_put_grants(header, first, self.config.max_window_bytes)
             .iter()
-            .take(crate::local::WINDOW_CREDITS as usize)
             .map(|grant| grant.length.max(4096).next_power_of_two())
-            .collect();
-        let unit = windows.iter().copied().max().unwrap_or(4096);
-        let allocation: u64 = windows.iter().sum();
-        let disk = disk::ENVELOPE_BYTES + length;
-        PutRequirement {
-            streaming: true,
-            charge: disk.saturating_add(allocation),
-            reservation: disk,
-            allocation,
-            unit,
-        }
+            .max()
+            .unwrap_or(4096);
+        PutRequirement::streaming(disk::ENVELOPE_BYTES + length, unit)
     }
 
-    fn make_room(&mut self, bytes: u64) -> bool {
+    /// Reserve budget space while the shape's protected keys stay put, so an
+    /// eviction cannot invalidate the shape the reservation was computed for.
+    fn make_room_with(
+        &mut self,
+        namespace: Option<NamespaceId>,
+        bytes: u64,
+        protected: &[Key],
+    ) -> bool {
+        if self.config.root.is_none() {
+            return true;
+        }
+        let mut pinned = Vec::new();
+        if let Some(id) = namespace {
+            for key in protected {
+                if let Some(namespace) = self.namespaces.get_mut(&id) {
+                    if namespace.tree.pin(key).is_ok() {
+                        pinned.push(*key);
+                    }
+                }
+            }
+        }
+        let result = self.make_room_evict(bytes);
+        if let Some(id) = namespace {
+            for key in pinned {
+                let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(&key);
+            }
+        }
+        result
+    }
+
+    fn make_room_evict(&mut self, bytes: u64) -> bool {
         if self.config.root.is_none() {
             return true;
         }
@@ -1600,26 +1746,52 @@ impl Store {
     }
 
     fn send_put_grant(&mut self, connection: u64, transfer: u64) -> bool {
-        let Some(open) = self
-            .sessions
-            .get_mut(&connection)
-            .unwrap()
-            .ops
-            .get_mut(&transfer)
-        else {
-            return false;
+        let prepared = {
+            let Some(open) = self
+                .sessions
+                .get_mut(&connection)
+                .unwrap()
+                .ops
+                .get_mut(&transfer)
+            else {
+                return false;
+            };
+            let Operation::Put(put) = &mut open.operation else {
+                return false;
+            };
+            if put.cancelled || put.terminal || put.windows.next >= put.grants.len() {
+                return false;
+            }
+            let index = put.windows.next as u32;
+            let plan = put.grants[put.windows.next];
+            let header = put.header.clone();
+            let memory = put.memory.clone();
+            let hold = put.staging_hold.clone();
+            let hold_unit = put.hold_unit;
+            let slot = if memory.is_some() {
+                None
+            } else {
+                put.hold_slots.iter().position(Option::is_none)
+            };
+            let requirement = put.requirement;
+            let protected: Vec<Key> = put.pins.iter().copied().collect();
+            (
+                index,
+                plan,
+                header,
+                memory,
+                hold,
+                hold_unit,
+                slot,
+                requirement,
+                protected,
+            )
         };
-        let Operation::Put(put) = &mut open.operation else {
-            return false;
-        };
-        if put.cancelled || put.terminal || put.windows.next >= put.grants.len() {
+        let (index, plan, header, memory, hold, hold_unit, slot, requirement, protected) = prepared;
+        if memory.is_none() && slot.is_none() {
+            // Both hold slots are still live; retry once one is released.
             return false;
         }
-        let index = put.windows.next as u32;
-        let plan = put.grants[put.windows.next];
-        let header = put.header.clone();
-        let memory = put.memory.clone();
-        put.windows.next += 1;
         let shape = match WindowShape::new(
             plan.pages,
             plan.row,
@@ -1645,48 +1817,24 @@ impl Store {
                 return false;
             }
         };
-        if memory.is_none() {
-            let window = plan.length.max(4096).next_power_of_two();
-            if self.charge_total().saturating_add(window) > self.config.nvme {
-                let complete = self
-                    .sessions
-                    .get(&connection)
-                    .and_then(|session| session.ops.get(&transfer))
-                    .and_then(|open| match &open.operation {
-                        Operation::Put(put) => Some(put.requirement),
-                        Operation::Get(_) => None,
-                    });
-                let requirement = complete.unwrap_or(PutRequirement {
-                    streaming: true,
-                    charge: disk::ENVELOPE_BYTES.saturating_add(window),
-                    reservation: disk::ENVELOPE_BYTES.saturating_add(window),
-                    allocation: window,
-                    unit: window,
-                });
-                self.arm(connection, requirement);
-                self.fail_put(
-                    connection,
-                    transfer,
-                    crosscache::Reason::Budget as u8,
-                    invalid("staging capacity"),
-                );
-                return false;
+        let (region, extent, within) = match &memory {
+            Some(memory) => (Region::Arena, memory.clone(), plan.record_offset as usize),
+            None => {
+                let Some(hold) = hold else {
+                    self.fail_put(
+                        connection,
+                        transfer,
+                        crosscache::Reason::Invalid as u8,
+                        invalid("missing staging hold"),
+                    );
+                    return false;
+                };
+                (Region::Staging, hold, slot.unwrap() * hold_unit)
             }
-        }
-        let result = match memory {
-            Some(memory) => self.local.grant_put_extent(
-                connection,
-                transfer,
-                index,
-                Region::Arena,
-                shape,
-                &memory,
-                plan.record_offset as usize,
-            ),
-            None => self
-                .local
-                .grant_put(connection, transfer, index, Region::Staging, shape),
         };
+        let result = self
+            .local
+            .grant_put_extent(connection, transfer, index, region, shape, &extent, within);
         match result {
             Ok(grant) => {
                 if let Some(open) = self
@@ -1697,6 +1845,10 @@ impl Store {
                     let Operation::Put(put) = &mut open.operation else {
                         return false;
                     };
+                    put.windows.next += 1;
+                    if let Some(slot) = slot {
+                        put.hold_slots[slot] = Some(index);
+                    }
                     put.windows.granted.insert(index, plan);
                     put.outbox.push_back(Ok(PutAnswer::Grant(WindowGrant {
                         transfer,
@@ -1716,25 +1868,7 @@ impl Store {
             }
             Err(GrantError::Credits) => false,
             Err(GrantError::Budget) => {
-                // A window refusal is a Put BUDGET too: arm Room with the
-                // extent this window still needs.
-                let complete = self
-                    .sessions
-                    .get(&connection)
-                    .and_then(|session| session.ops.get(&transfer))
-                    .and_then(|open| match &open.operation {
-                        Operation::Put(put) => Some(put.requirement),
-                        Operation::Get(_) => None,
-                    });
-                let window = plan.length.max(4096).next_power_of_two();
-                let requirement = complete.unwrap_or(PutRequirement {
-                    streaming: true,
-                    charge: disk::ENVELOPE_BYTES.saturating_add(window),
-                    reservation: disk::ENVELOPE_BYTES.saturating_add(window),
-                    allocation: window,
-                    unit: window,
-                });
-                self.arm(connection, requirement);
+                self.arm(connection, requirement, protected);
                 self.fail_put(
                     connection,
                     transfer,
@@ -2325,7 +2459,7 @@ impl Store {
             || (!plan.row && row_xxh3.is_some())
             || plan.pages > 64
         {
-            self.abort_put_window(connection, transfer, index, prepared.streaming);
+            self.abort_put_window(connection, transfer, index);
             self.fail_put(
                 connection,
                 transfer,
@@ -2358,7 +2492,7 @@ impl Store {
         for (position, hash) in page_xxh3.iter().enumerate() {
             let start = position * page_bytes;
             if record::checksum(&bytes[start..start + page_bytes]) != *hash {
-                self.abort_put_window(connection, transfer, index, prepared.streaming);
+                self.abort_put_window(connection, transfer, index);
                 self.fail_put(
                     connection,
                     transfer,
@@ -2373,7 +2507,7 @@ impl Store {
             let row_bytes = prepared.header.row_record_bytes() as usize;
             let start = bytes.len() - row_bytes;
             if record::checksum(&bytes[start..]) != row_xxh3.unwrap() {
-                self.abort_put_window(connection, transfer, index, prepared.streaming);
+                self.abort_put_window(connection, transfer, index);
                 self.fail_put(
                     connection,
                     transfer,
@@ -2383,8 +2517,8 @@ impl Store {
                 return Ok(());
             }
         }
-        let staging = if prepared.streaming {
-            self.local.take_allocated(connection, transfer, index)
+        let data = if prepared.streaming {
+            Some(bytes)
         } else {
             None
         };
@@ -2400,6 +2534,9 @@ impl Store {
                 return Ok(());
             };
             put.windows.granted.remove(&index);
+            if let Some(slot) = put.hold_slots.iter().position(|slot| *slot == Some(index)) {
+                put.hold_slots[slot] = None;
+            }
             for (position, hash) in verified.iter().enumerate() {
                 let relative =
                     (plan.page_first - u64::from(prepared.first_page)) as usize + position;
@@ -2412,9 +2549,9 @@ impl Store {
             }
             open.progress = Instant::now();
         }
+        let _ = self.local.release(connection, transfer, index);
         if prepared.streaming {
-            let _ = self.local.release(connection, transfer, index);
-            let Some(extent) = staging else {
+            let Some(data) = data else {
                 self.fail_put(
                     connection,
                     transfer,
@@ -2435,16 +2572,15 @@ impl Store {
             let namespace = self.sessions[&connection].namespace.unwrap();
             self.job_counter += 1;
             let job = self.job_counter;
-            let extent: Arc<Extent> = Arc::new(extent);
             let task = Task::Chunk {
                 id: job,
                 temporary,
                 offset: plan.record_offset,
-                data: extent.clone(),
+                data,
             };
             enum ChunkAction {
                 Sent,
-                Blocked(Arc<Extent>),
+                Blocked(Vec<u8>),
                 Failed,
             }
             let action = match &self.namespaces[&namespace].disk {
@@ -2501,15 +2637,21 @@ impl Store {
                     );
                 }
             }
-        } else {
-            let _ = self.local.release(connection, transfer, index);
         }
         Ok(())
     }
 
-    fn abort_put_window(&mut self, connection: u64, transfer: u64, index: u32, streaming: bool) {
-        if streaming {
-            let _ = self.local.take_allocated(connection, transfer, index);
+    fn abort_put_window(&mut self, connection: u64, transfer: u64, index: u32) {
+        if let Some(open) = self
+            .sessions
+            .get_mut(&connection)
+            .and_then(|session| session.ops.get_mut(&transfer))
+        {
+            if let Operation::Put(put) = &mut open.operation {
+                if let Some(slot) = put.hold_slots.iter().position(|slot| *slot == Some(index)) {
+                    put.hold_slots[slot] = None;
+                }
+            }
         }
         let _ = self.local.release(connection, transfer, index);
     }
@@ -3444,6 +3586,7 @@ impl Store {
                         pending: put.pending,
                         reservation: put.reservation,
                         _temporary: put.temporary,
+                        _staging_hold: put.staging_hold,
                     });
                 }
             }
@@ -3521,6 +3664,7 @@ impl Store {
                             pending: put.pending,
                             reservation: put.reservation,
                             _temporary: put.temporary,
+                            _staging_hold: put.staging_hold,
                         });
                     }
                 }
@@ -4011,7 +4155,7 @@ impl Store {
                         id: job,
                         temporary,
                         offset,
-                        data: data.clone(),
+                        data,
                     };
                     match worker.sender.try_send(task) {
                         Ok(()) => {
@@ -4089,7 +4233,7 @@ impl Store {
                     id: job,
                     temporary,
                     offset,
-                    data: data.clone(),
+                    data,
                 };
                 match worker.sender.try_send(task) {
                     Ok(()) => {
@@ -4351,38 +4495,47 @@ impl Store {
     fn room(&mut self) {
         let connections: Vec<u64> = self.sessions.keys().copied().collect();
         for connection in connections {
-            let Some(requirement) = self.armed.get(&connection).copied() else {
+            let Some(armed) = self.armed.get(&connection).cloned() else {
                 continue;
             };
-            let _ = self.make_room(requirement.charge);
+            let requirement = armed.requirement;
+            let namespace = self
+                .sessions
+                .get(&connection)
+                .and_then(|session| session.namespace);
+            let _ = self.make_room_with(namespace, requirement.charge, &armed.protected);
             let budget_ok = self
                 .sessions
                 .get(&connection)
                 .is_some_and(|session| session.budget.balance() >= 0);
             let capacity = if requirement.streaming {
-                // The whole disk record plus every simultaneously granted
-                // window must fit the budget, and each window must fit the
-                // staging region on its own.
-                let staging_ok = requirement.unit <= self.staging.capacity() as u64
-                    && requirement.allocation <= self.staging.capacity() as u64
-                    && self.staging.can_allocate(requirement.unit as usize);
+                // The disk record plus the fixed staging hold must fit.
                 self.charge_total().saturating_add(requirement.charge) <= self.config.nvme
-                    && staging_ok
+                    && requirement.allocation <= self.staging.capacity() as u64
+                    && self
+                        .staging
+                        .allocate(requirement.allocation as usize)
+                        .is_some()
             } else {
                 let arena_ok = requirement.allocation <= self.memory.capacity() as u64
-                    && (self.memory.can_allocate(requirement.allocation as usize)
-                        || self.arena_headroom(&[], self.config.root.is_some())
-                            >= requirement.allocation);
+                    && self
+                        .memory_room_excluding(
+                            requirement.allocation as usize,
+                            self.config.root.is_some(),
+                            &armed.protected,
+                        )
+                        .is_some();
                 arena_ok
                     && (self.config.root.is_none()
                         || self.charge_total().saturating_add(requirement.charge)
                             <= self.config.nvme)
             };
-            if budget_ok && capacity {
-                if let Some(bytes) = self.local.take_armed(connection) {
-                    self.armed.remove(&connection);
-                    self.events.push(StoreEvent::Room { connection, bytes });
-                }
+            if budget_ok && capacity && self.local.take_armed(connection).is_some() {
+                self.armed.remove(&connection);
+                self.events.push(StoreEvent::Room {
+                    connection,
+                    bytes: requirement.charge,
+                });
             }
         }
     }
@@ -5433,15 +5586,17 @@ mod tests {
     }
 
     fn store(label: &str) -> (Store, PathBuf) {
+        dram_store(label, 1024 * 1024)
+    }
+
+    fn dram_store(label: &str, memory: usize) -> (Store, PathBuf) {
         let name = format!(
             "cm-unit-{}-{label}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        let mut config = Config::dram_only(
-            std::env::temp_dir().join(format!("{name}.sock")),
-            1024 * 1024,
-        );
+        let mut config =
+            Config::dram_only(std::env::temp_dir().join(format!("{name}.sock")), memory);
         config.name = name.clone();
         config.staging = 8 * 1024 * 1024;
         let store = Store::open(config).unwrap();
@@ -5487,7 +5642,7 @@ mod tests {
         assert!(requirement.streaming);
         assert!(requirement.reservation > 8 * 1024 * 1024);
         assert!(requirement.unit <= 4 * 1024 * 1024);
-        store.arm(1, requirement);
+        store.arm(1, requirement, Vec::new());
         store.room();
         assert!(
             store
@@ -5523,9 +5678,191 @@ mod tests {
         let stream = store.put_requirement(&many, 0);
         assert!(stream.streaming);
         assert_eq!(stream.reservation, 528 * 1024);
-        assert_eq!(stream.allocation, (256 + 512) * 1024);
+        assert_eq!(stream.allocation, 2 * 512 * 1024);
         assert_eq!(stream.unit, 512 * 1024);
-        assert_eq!(stream.charge, (528 + 256 + 512) * 1024);
+        assert_eq!(stream.charge, (528 + 2 * 512) * 1024);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    fn insert_memory_node(
+        store: &mut Store,
+        id: NamespaceId,
+        value: &Descriptor,
+        key: Key,
+        parent: Option<Key>,
+        tail: u32,
+        extent: Extent,
+    ) {
+        let header = Header::new(value, key, parent, [0; 16], tail).unwrap();
+        let bytes = record_charge(&header, true);
+        store.charged += bytes;
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .insert(
+                key,
+                parent,
+                [0; 16],
+                tail as usize,
+                true,
+                Location {
+                    header,
+                    memory: Some(Arc::new(extent)),
+                    disk: None,
+                    durable: false,
+                    writing: false,
+                    retry: Instant::now(),
+                    bytes,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn fragmented_arena_holes_fall_back_to_streaming() {
+        // 64 KiB arena with 16 KiB live at 0 and 32 KiB; the freed buddies
+        // leave 32 KiB free as two separated 16 KiB holes.
+        let (mut store, base, directory) = store_with_root("fragmented", 64 * 1024);
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace.unwrap();
+        let first = store.memory.allocate(16 * 1024).unwrap();
+        let second = store.memory.allocate(16 * 1024).unwrap();
+        let third = store.memory.allocate(16 * 1024).unwrap();
+        let fourth = store.memory.allocate(16 * 1024).unwrap();
+        assert_eq!(first.offset(), 0);
+        assert_eq!(second.offset(), 16 * 1024);
+        assert_eq!(third.offset(), 32 * 1024);
+        assert_eq!(fourth.offset(), 48 * 1024);
+        drop(second);
+        drop(fourth);
+        insert_memory_node(
+            &mut store,
+            id,
+            &value,
+            Key {
+                consumed_tokens: 64,
+                digest: [1; 16],
+            },
+            None,
+            1,
+            first,
+        );
+        insert_memory_node(
+            &mut store,
+            id,
+            &value,
+            Key {
+                consumed_tokens: 128,
+                digest: [2; 16],
+            },
+            Some(Key {
+                consumed_tokens: 64,
+                digest: [1; 16],
+            }),
+            1,
+            third,
+        );
+        // A 32 KiB record cannot use the holes. With no evictable leaf (the
+        // occupants are not durable) the Put streams instead of refusing.
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 192,
+                    digest: [3; 16],
+                },
+                published_parent: Some(Key {
+                    consumed_tokens: 64,
+                    digest: [1; 16],
+                }),
+                bucket: [0; 16],
+                chain_pages: 3,
+                published_tail_pages: 2,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch_trace();
+        let open = &store.sessions[&1].ops[&1];
+        let Operation::Put(put) = &open.operation else {
+            panic!("expected Put");
+        };
+        assert!(put.streaming);
+        assert!(put.memory.is_none());
+        assert_eq!(put.requirement.allocation, 2 * 16 * 1024);
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_chain_admits_the_root_by_successive_leaf_eviction() {
+        // A full 64 KiB rootless arena: 32 -> 16 -> 16 KiB. The new record
+        // needs the arena only after three successive leaf evictions.
+        let (mut store, directory) = dram_store("chain", 64 * 1024);
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace.unwrap();
+        let root = store.memory.allocate(32 * 1024).unwrap();
+        let child = store.memory.allocate(16 * 1024).unwrap();
+        let leaf = store.memory.allocate(16 * 1024).unwrap();
+        let (r, c, l) = (
+            Key {
+                consumed_tokens: 128,
+                digest: [1; 16],
+            },
+            Key {
+                consumed_tokens: 192,
+                digest: [2; 16],
+            },
+            Key {
+                consumed_tokens: 256,
+                digest: [3; 16],
+            },
+        );
+        insert_memory_node(&mut store, id, &value, r, None, 2, root);
+        insert_memory_node(&mut store, id, &value, c, Some(r), 1, child);
+        insert_memory_node(&mut store, id, &value, l, Some(c), 1, leaf);
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                key: Key {
+                    consumed_tokens: 384,
+                    digest: [4; 16],
+                },
+                published_parent: Some(l),
+                bucket: [0; 16],
+                chain_pages: 6,
+                published_tail_pages: 2,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch_trace();
+        let open = &store.sessions[&1].ops[&1];
+        let Operation::Put(put) = &open.operation else {
+            panic!("expected Put");
+        };
+        assert!(!put.streaming);
+        assert!(put.memory.is_some());
+        assert_eq!(put.header.parent, None);
+        assert_eq!(put.header.tail_pages, 6);
+        let tree = &store.namespaces[&id].tree;
+        assert!(tree.node(&r).is_none());
+        assert!(tree.node(&c).is_none());
+        assert!(tree.node(&l).is_none());
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }
@@ -5546,6 +5883,7 @@ mod tests {
                 allocation: 16 * 1024 * 1024,
                 unit: 16 * 1024 * 1024,
             },
+            Vec::new(),
         );
         store.room();
         assert!(
@@ -5566,6 +5904,7 @@ mod tests {
                 allocation: 4 * 1024 * 1024,
                 unit: 4 * 1024 * 1024,
             },
+            Vec::new(),
         );
         store.room();
         assert!(
@@ -5610,8 +5949,7 @@ mod tests {
         };
         let mut put = *put;
         put.cancelled = true;
-        put.blocked
-            .push_back((777, 0, Arc::new(store.staging.allocate(4096).unwrap())));
+        put.blocked.push_back((777, 0, vec![0; 4096]));
         store.detached_puts.insert((1, 1), put);
         store.pump_chunks();
         assert!(!store.jobs.contains_key(&777));
@@ -5682,6 +6020,24 @@ mod tests {
     }
 
     #[test]
+    fn arm_replaces_the_requirement_with_the_latest_refusal() {
+        let (mut store, directory) = store("arm-latest");
+        let value = descriptor();
+        store
+            .hello(1, "l0".into(), std::process::id(), value)
+            .unwrap();
+        let large = PutRequirement::streaming(1024, 4096);
+        let small = PutRequirement::arena(8192);
+        store.arm(1, large, Vec::new());
+        store.arm(1, small, Vec::new());
+        assert_eq!(store.armed[&1].requirement, small);
+        assert_eq!(store.local.armed_budget(1), Some(small.charge));
+        assert_eq!(store.local.take_armed(1), Some(small.charge));
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn room_admits_an_arena_sized_reservation() {
         let (mut store, directory) = store("room-size");
         let value = descriptor();
@@ -5698,6 +6054,7 @@ mod tests {
                 allocation: capacity,
                 unit: capacity,
             },
+            Vec::new(),
         );
         store.room();
         assert!(
@@ -5717,9 +6074,9 @@ mod tests {
         store
             .hello(1, "l0".into(), std::process::id(), value)
             .unwrap();
-        // Hold all of staging so the first streaming window cannot be granted.
+        // Hold all of staging so the fixed hold cannot be reserved.
         let hold = store.staging.allocate(8 * 1024 * 1024).unwrap();
-        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let (events, mut receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
             1,
             1,
@@ -5737,17 +6094,15 @@ mod tests {
             events,
         );
         store.dispatch_trace();
-        store.pump_grants();
-        let requirement = {
-            let operation = &store.sessions[&1].ops[&1].operation;
-            let Operation::Put(put) = operation else {
-                panic!("expected Put");
-            };
-            put.requirement
-        };
+        assert!(!store.sessions[&1].ops.contains_key(&1));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Ok(PutAnswer::Refused(refused)))
+                if refused.reason == crosscache::Reason::Budget as u8
+        ));
+        let requirement = store.armed.get(&1).unwrap().requirement;
         assert!(requirement.streaming);
         assert_eq!(store.local.armed_budget(1), Some(requirement.charge));
-        assert_eq!(store.armed.get(&1).copied(), Some(requirement));
         drop(hold);
         store.events.clear();
         store.room();
@@ -5757,6 +6112,7 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
         );
+        assert!(!store.armed.contains_key(&1));
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);
@@ -6035,8 +6391,7 @@ mod tests {
             let Operation::Put(put) = operation else {
                 panic!("expected Put");
             };
-            put.blocked
-                .push_back((999, 0, Arc::new(store.staging.allocate(4096).unwrap())));
+            put.blocked.push_back((999, 0, vec![0; 4096]));
         }
         store.fail_put(1, 1, crosscache::Reason::Io as u8, invalid("test"));
         let operation = &store.sessions[&1].ops[&1].operation;
