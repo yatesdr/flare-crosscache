@@ -1188,13 +1188,28 @@ impl Store {
         let replacement = initial_old.is_some();
         let arena_bytes = self.memory.capacity() as u64;
         // The arena rounds every record extent up to a power of two. Without a
-        // root there is no disk to stream to, so a record whose extent cannot
-        // fit the arena can never be stored; refusing it as BUDGET would arm a
-        // Room that can never arrive.
-        if rootless && child_header.length_with_row().max(4096).next_power_of_two() > arena_bytes {
-            self.metrics.oversize += 1;
-            self.reject_put(&events, proto::Reason::Oversize as u8);
-            return;
+        // root there is no disk to stream to, so the child can be stored only
+        // beside its published parent or as a whole-chain replacement for it.
+        // When it fits neither shape, no Room can ever arrive and the Put is
+        // OVERSIZE; otherwise a shortage is a Budget wait.
+        if rootless {
+            let extent = |header: &Header| header.length_with_row().max(4096).next_power_of_two();
+            let parent_extent = initial_parent
+                .and_then(|parent| {
+                    self.namespaces
+                        .get(&id)
+                        .and_then(|namespace| namespace.tree.node(&parent))
+                        .and_then(|node| node.location.memory.as_ref())
+                        .map(|extent| extent.capacity() as u64)
+                })
+                .unwrap_or(0);
+            if extent(&child_header).saturating_add(parent_extent) > arena_bytes
+                && extent(&root_header) > arena_bytes
+            {
+                self.metrics.oversize += 1;
+                self.reject_put(&events, proto::Reason::Oversize as u8);
+                return;
+            }
         }
         let selected_pins: Vec<Key> = initial_parent
             .into_iter()

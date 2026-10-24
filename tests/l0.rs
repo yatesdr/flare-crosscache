@@ -2195,26 +2195,20 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_51_rootless_child_waiting_for_its_parent_earns_no_room() {
-    // The 32 KiB arena holds a two-page parent. The four-page-tail child
-    // needs 32 KiB while its six-page root needs 64 KiB, so only the parent
-    // surviving can admit it; Room must not count that parent as reclaimable.
+async fn l0_51_rootless_child_that_cannot_fit_beside_its_parent_is_oversize() {
+    // The 32 KiB arena holds a two-page parent, whose rounded extent fills
+    // it. The four-page-tail child also needs 32 KiB, so the two can never
+    // share the arena, and the six-page full-chain fallback needs 64 KiB. No
+    // shape can ever be admitted: OVERSIZE, not a Room that never arrives.
     let mut host = Host::dram_only(32 * 1024);
     host.start();
     let mut client = host.client().await;
     client.store(key(128), None).await;
-    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(384), Some(key(128)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered for an allocation that needs the protected parent"
+        PutOutcome::Refused(proto::Reason::Oversize as u8)
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }
