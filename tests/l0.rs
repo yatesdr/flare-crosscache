@@ -2928,3 +2928,52 @@ async fn l0_61_rootless_temporary_pressure_waits_instead_of_oversize() {
         }
     }
 }
+
+#[test]
+fn l0_62_socket_directory_modes() {
+    // The manager sets a mode only on a directory it created. An existing
+    // directory keeps its mode: pointing the socket into /tmp or /run must not
+    // change a host directory, and a manager started as root must not either.
+    use std::os::unix::fs::PermissionsExt;
+    let base = base("socket-mode");
+    fs::create_dir_all(&base).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+    let command = |name: &str, socket: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_selene"))
+            .args([
+                "--name",
+                name,
+                "--socket",
+                socket.to_str().unwrap(),
+                "--memory",
+                "8M",
+                "--staging",
+                "8M",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let socket = base.join("manager.sock");
+    let mut child = command(&instance_name("socket-mode"), &socket);
+    wait(|| socket.exists());
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    assert!(child.wait().unwrap().success());
+    let mode = fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "an existing socket directory keeps its mode");
+    // A directory the manager creates gets 0770.
+    let directory = base.join("run");
+    let socket = directory.join("manager.sock");
+    let mut child = command(&instance_name("socket-mode"), &socket);
+    wait(|| socket.exists());
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    assert!(child.wait().unwrap().success());
+    let mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o770, "a created socket directory gets 0770");
+    let _ = fs::remove_dir_all(base);
+}

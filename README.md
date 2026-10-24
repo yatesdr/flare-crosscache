@@ -20,8 +20,9 @@ target/release/selene \
   --metrics 127.0.0.1:9108
 ```
 
-Run with the same effective uid and gid as the replicas. Parent socket-directory
-permissions are set to 0770, socket permissions to 0660. One process exclusively
+Run with the same effective uid and gid as the replicas. A missing
+socket directory is created with permissions 0770, an existing one keeps its
+mode and ownership, and the socket itself is 0660. One process exclusively
 locks each root, and startup refuses to replace a live socket. A stale socket
 from a killed manager is removed once startup confirms nothing is listening. The
 NVMe file system must support 4096-byte O_DIRECT reads/writes, rename and

@@ -140,8 +140,9 @@ so the previous directory is safe to delete and cannot be reused accidentally.
 The root must be a local file system supporting 4096-byte `O_DIRECT` reads and
 writes, rename, and file and directory `fsync`. Network file systems are not
 supported. Run the manager with the same effective uid and gid as the replicas;
-it sets the socket to 0660 and its parent directory to 0770. The manager creates
-the socket directory when it can, but the default `/run/selene` lives under a
-root-owned `/run`, so create it with the runtime ownership first when running
-unprivileged. In containers, share the socket volume and the PID namespace with
-the replicas.
+it sets the socket to 0660, creates a missing socket directory with mode 0770,
+and never changes the mode or ownership of a directory that already exists. The
+default `/run/selene` lives under a root-owned `/run`, so when running
+unprivileged create it first with the runtime ownership and a mode the replicas
+can traverse (for example 0770). In containers, share the socket volume and the
+PID namespace with the replicas.

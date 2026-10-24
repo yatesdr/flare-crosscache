@@ -1112,7 +1112,13 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
         .build()?;
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
-    let listener = std::os::unix::net::UnixListener::bind(&config.socket)?;
+    let listener = std::os::unix::net::UnixListener::bind(&config.socket).map_err(|error| {
+        invalid(format!(
+            "cannot bind socket {} in {}: {error}",
+            config.socket.display(),
+            directory.display()
+        ))
+    })?;
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o660))?;
     listener.set_nonblocking(true)?;
     let socket_path = config.socket.clone();
@@ -1208,9 +1214,15 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     result
 }
 
+/// Creates the socket's directory when it is missing. A directory that already
+/// exists keeps its mode and ownership: the manager only sets the mode of a
+/// directory it created, so pointing `--socket` into a host directory such as
+/// `/tmp` or `/run` cannot change that directory's mode.
 fn prepare_socket_directory(directory: &Path) -> Result<()> {
-    fs::create_dir_all(directory)?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o770))?;
+    if !directory.exists() {
+        fs::create_dir_all(directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o770))?;
+    }
     Ok(())
 }
 
