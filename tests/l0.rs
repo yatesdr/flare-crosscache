@@ -1,13 +1,14 @@
 mod support;
 use selene::{
     arena::{Arena, ExtentSlice},
-    disk, proto,
+    control, disk, proto,
     record::{self, Header},
     store::Config,
     tree::{Eviction, Tree},
 };
 use std::{
     fs,
+    net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -381,6 +382,39 @@ fn l0_06_multiprocess_kill_recovery() {
         restarted.wait().unwrap();
         fs::remove_dir_all(base).unwrap();
     }
+}
+
+/// A startup failure after the store opened must release the instance and root locks and
+/// leave no socket, so the same manager can start again on the same paths immediately.
+#[test]
+fn l0_67_a_failed_start_releases_the_instance_and_root() {
+    let base = base("failed-start");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        4096,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("failed-start");
+    let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut failed = config.clone();
+    failed.metrics = Some(squatter.local_addr().unwrap().to_string());
+    let error = control::run(failed, Arc::new(AtomicBool::new(false)))
+        .expect_err("a taken metrics port must fail the start");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "the metrics refusal is reported: {error}"
+    );
+    assert!(!config.socket.exists(), "a failed start leaves no socket");
+    drop(squatter);
+    // The instance, lock and root are free again: the same manager starts at once.
+    config.metrics = None;
+    let mut host = Host::open_config(config);
+    host.try_start()
+        .expect("the previous attempt released its locks");
+    host.stop();
+    let _ = fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

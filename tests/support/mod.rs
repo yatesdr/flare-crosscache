@@ -107,6 +107,15 @@ pub fn instance_name(label: &str) -> String {
     )
 }
 
+/// A probed loopback port for a manager's metrics endpoint. The probe can lose the port to
+/// another process before the manager binds it; `Host::start` retries with a fresh one.
+fn free_metrics_address() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    address
+}
+
 pub fn wait(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !condition() {
@@ -162,9 +171,7 @@ impl Host {
         let name = instance_name("host");
         let mut config = Config::new(base.join("records"), base.join("run/m.sock"), memory, nvme);
         config.name = name;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        config.metrics = Some(listener.local_addr().unwrap().to_string());
-        drop(listener);
+        config.metrics = Some(free_metrics_address());
         Self {
             base,
             config,
@@ -193,9 +200,7 @@ impl Host {
 
     pub fn open_config(mut config: Config) -> Self {
         if config.metrics.is_none() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            config.metrics = Some(listener.local_addr().unwrap().to_string());
-            drop(listener);
+            config.metrics = Some(free_metrics_address());
         }
         let base = config
             .root
@@ -226,7 +231,36 @@ impl Host {
     }
 
     pub fn start(&mut self) {
-        self.try_start().unwrap();
+        for attempt in 0..4 {
+            if attempt > 0 {
+                // A failed attempt may have lost its metrics port after the probe.
+                self.config.metrics = Some(free_metrics_address());
+            }
+            match self.try_start() {
+                Ok(()) => {
+                    // A manager that failed after creating its socket is not serving.
+                    thread::sleep(Duration::from_millis(20));
+                    if self
+                        .thread
+                        .as_ref()
+                        .is_some_and(|thread| !thread.is_finished())
+                    {
+                        return;
+                    }
+                    if let Some(thread) = self.thread.take() {
+                        let _ = thread.join();
+                    }
+                }
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::AddrInUse,
+                        "manager did not start: {error}"
+                    );
+                }
+            }
+        }
+        panic!("manager did not start");
     }
 
     pub fn try_start(&mut self) -> std::io::Result<()> {

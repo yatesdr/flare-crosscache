@@ -13,7 +13,7 @@ use std::{
     io::{self, Read, Write},
     net::TcpListener,
     os::unix::fs::{FileTypeExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -1039,6 +1039,51 @@ async fn get_task(
     }
 }
 
+/// Stops the manager's threads and removes its socket, whether startup failed or serving
+/// ended. Dropping it releases the store's instance and root locks with the owner thread.
+struct Cleanup {
+    stop: Arc<AtomicBool>,
+    commands: mpsc::Sender<StoreCommand>,
+    owner: Option<thread::JoinHandle<()>>,
+    tick: Option<thread::JoinHandle<()>>,
+    metrics: Option<thread::JoinHandle<()>>,
+    socket: PathBuf,
+}
+
+impl Cleanup {
+    fn finish(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        // The owner leaves on Shutdown even while a task still holds a sender. The channel
+        // can be busy at shutdown, so retry briefly rather than drop the command.
+        for _ in 0..100 {
+            match self.commands.try_send(StoreCommand::Shutdown) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    thread::sleep(Duration::from_millis(1))
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+        // The tick thread exits on the flag.
+        if let Some(thread) = self.tick.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.owner.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.metrics.take() {
+            let _ = thread.join();
+        }
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let store = Store::open(config.clone())?;
     let directory = config
@@ -1058,10 +1103,45 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
         }
         fs::remove_file(&config.socket)?;
     }
+    // The runtime exists, and its signal handling is registered, before the socket does:
+    // a termination signal during startup then waits for the server instead of killing the
+    // process by default disposition.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let (mut terminate, mut interrupt) = runtime.block_on(async {
+        Ok::<_, io::Error>((
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+        ))
+    })?;
+    // Bind every listener before any thread starts, so a startup failure leaves no threads
+    // and no locks behind; the guard below also removes the socket it creates.
     let metrics_text = Arc::new(Mutex::new(String::new()));
-    let owner_metrics = metrics_text.clone();
+    let metrics_listener = bind_metrics(config.metrics.as_deref())?;
+    let listener = std::os::unix::net::UnixListener::bind(&config.socket).map_err(|error| {
+        invalid(format!(
+            "cannot bind socket {} in {}: {error}",
+            config.socket.display(),
+            directory.display()
+        ))
+    })?;
     let (commands, mut receiver) = mpsc::channel::<StoreCommand>(64);
-    let owner = thread::spawn(move || {
+    let mut cleanup = Cleanup {
+        stop: stop.clone(),
+        commands: commands.clone(),
+        owner: None,
+        tick: None,
+        metrics: None,
+        socket: config.socket.clone(),
+    };
+    fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o660))?;
+    listener.set_nonblocking(true)?;
+    if let Some(listener) = metrics_listener {
+        cleanup.metrics = Some(serve_metrics(listener, metrics_text.clone(), stop.clone()));
+    }
+    let owner_metrics = metrics_text.clone();
+    cleanup.owner = Some(thread::spawn(move || {
         let mut store = store;
         'outer: while let Some(mut command) = receiver.blocking_recv() {
             // Drain the batch before dispatching so queued Gets and Puts are
@@ -1086,20 +1166,15 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
             store.pump();
             *owner_metrics.lock().unwrap() = store.metrics_text();
         }
-    });
+    }));
     let tick_commands = commands.clone();
     let tick_stop = stop.clone();
-    let tick = thread::spawn(move || {
+    cleanup.tick = Some(thread::spawn(move || {
         while !tick_stop.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(10));
             let _ = tick_commands.try_send(StoreCommand::Tick);
         }
-    });
-    let metrics = start_metrics(
-        config.metrics.as_deref(),
-        metrics_text.clone(),
-        stop.clone(),
-    )?;
+    }));
     let generations = Arc::new(Mutex::new(HashMap::new()));
     let service = Service {
         commands: commands.clone(),
@@ -1107,28 +1182,14 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
         transfers: Arc::new(AtomicU64::new(1)),
         epochs: Arc::new(Mutex::new(HashMap::new())),
     };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
-    let listener = std::os::unix::net::UnixListener::bind(&config.socket).map_err(|error| {
-        invalid(format!(
-            "cannot bind socket {} in {}: {error}",
-            config.socket.display(),
-            directory.display()
-        ))
-    })?;
-    fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o660))?;
-    listener.set_nonblocking(true)?;
-    let socket_path = config.socket.clone();
     let incoming_commands = commands.clone();
     let incoming_generations = generations.clone();
     let counter = Arc::new(AtomicU64::new(1));
     let connections = Arc::new(AtomicUsize::new(0));
     let async_stop = stop.clone();
-    let run_stop = stop.clone();
-    let result = runtime.block_on(async move {
+    runtime.block_on(async move {
         let listener = tokio::net::UnixListener::from_std(listener)?;
         let incoming = UnixListenerStream::new(listener).map(move |stream| {
             let stream = stream?;
@@ -1158,7 +1219,6 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 generations: incoming_generations.clone(),
             })
         });
-        let shutdown_stop = run_stop.clone();
         let server = Server::builder()
             .http2_keepalive_interval(Some(Duration::from_secs(10)))
             .http2_keepalive_timeout(Some(Duration::from_secs(20)))
@@ -1167,26 +1227,11 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                     .max_decoding_message_size(MAX_MESSAGE)
                     .max_encoding_message_size(MAX_MESSAGE),
             );
-        let signal_stop = shutdown_stop.clone();
+        let signal_stop = async_stop.clone();
         tokio::spawn(async move {
-            let terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
-            let interrupt =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
-            match (terminate, interrupt) {
-                (Ok(mut terminate), Ok(mut interrupt)) => {
-                    tokio::select! {
-                        _ = terminate.recv() => {}
-                        _ = interrupt.recv() => {}
-                    }
-                }
-                (Ok(mut terminate), Err(_)) => {
-                    terminate.recv().await;
-                }
-                (Err(_), Ok(mut interrupt)) => {
-                    interrupt.recv().await;
-                }
-                (Err(_), Err(_)) => std::future::pending::<()>().await,
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
             }
             signal_stop.store(true, Ordering::Release);
         });
@@ -1199,19 +1244,9 @@ pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
             .map_err(|error| invalid(format!("server: {error}")))
-    });
-    stop.store(true, Ordering::Release);
-    runtime.block_on(async {
-        let _ = commands.send(StoreCommand::Shutdown).await;
-    });
-    drop(commands);
-    let _ = owner.join();
-    let _ = tick.join();
-    if let Some(metrics) = metrics {
-        let _ = metrics.join();
-    }
-    let _ = fs::remove_file(socket_path);
-    result
+    })
+    // `cleanup` stops and joins the threads and removes the socket on every path, before the
+    // runtime drops.
 }
 
 /// Creates the socket's directory when it is missing. A directory that already
@@ -1226,17 +1261,23 @@ fn prepare_socket_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn start_metrics(
-    address: Option<&str>,
-    text: Arc<Mutex<String>>,
-    stop: Arc<AtomicBool>,
-) -> Result<Option<thread::JoinHandle<()>>> {
+/// Bind the metrics listener before any thread exists, so a taken port fails startup while
+/// the manager still owns nothing.
+fn bind_metrics(address: Option<&str>) -> Result<Option<TcpListener>> {
     let Some(address) = address else {
         return Ok(None);
     };
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
-    let handle = thread::spawn(move || {
+    Ok(Some(listener))
+}
+
+fn serve_metrics(
+    listener: TcpListener,
+    text: Arc<Mutex<String>>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         while !stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -1261,6 +1302,5 @@ fn start_metrics(
                 Err(_) => break,
             }
         }
-    });
-    Ok(Some(handle))
+    })
 }
