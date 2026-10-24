@@ -1993,3 +1993,149 @@ async fn l0_45_reserve_before_pin_with_four_open_puts() {
     drop(streams);
     host.wait(|host| host.gauge("open_ops") == 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_46_small_arena_admits_the_record_that_fits_it() {
+    // 4 KiB pages/row: a one-page record is a 16 KiB arena extent plus the
+    // 4 KiB envelope, so 20 KiB. The old max of the arena and streaming
+    // paths wanted 28 KiB and refused forever.
+    let base = base("small-arena");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        16 * 1024,
+        24 * 1024,
+    );
+    config.name = instance_name("small-arena");
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let stored = match client.put(key(64), None, PutOptions::default()).await {
+        PutOutcome::Stored(bytes) => bytes,
+        other => panic!("one-page record was not admitted: {other:?}"),
+    };
+    let fetched = client.fetch(&[key(64)], 0, 1).await;
+    assert_eq!(fetched[0], stored);
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_47_dram_only_evicts_the_parent_to_store_the_root() {
+    // A 32 KiB arena holds a two-page parent. Its next-page child fits the
+    // arena only as a three-page root after the parent is evicted.
+    let mut host = Host::dram_only(32 * 1024);
+    host.start();
+    let mut client = host.client().await;
+    client.store(key(128), None).await;
+    let stored = match client
+        .put(key(192), Some(key(128)), PutOptions::default())
+        .await
+    {
+        PutOutcome::Stored(bytes) => bytes,
+        other => panic!("next-page child was not admitted: {other:?}"),
+    };
+    let fetched = client.fetch(&[key(192)], 0, 3).await;
+    assert_eq!(fetched[0], stored);
+    assert_eq!(
+        client.get(&[key(128)], 0, 2, GetOptions::default()).await,
+        GetOutcome::Refused(crosscache::Reason::Invalid as u8)
+    );
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_48_streaming_reserves_both_grantable_windows() {
+    // 128 pages and a 4 KiB row: 528 KiB of disk record plus the 256 KiB
+    // and 512 KiB windows pump_grants can issue at once. A 1,100 KiB budget
+    // cannot take the complete requirement even though disk plus one window
+    // would fit.
+    let tight = base("two-windows-small");
+    let mut config = Config::new(
+        tight.join("records"),
+        tight.join("run/m.sock"),
+        4096,
+        1100 * 1024,
+    );
+    config.name = instance_name("two-windows-small");
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let mut subscription = client.subscribe().await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut replies = client
+        .inner
+        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(crosscache::PutMessage {
+            m: Some(client.begin(key(128 * 64), None)),
+        })
+        .await
+        .unwrap();
+    let first = replies.message().await.unwrap().unwrap();
+    match first.r {
+        Some(crosscache::put_reply::R::Refused(refused)) => {
+            assert_eq!(refused.reason, crosscache::Reason::Budget as i32);
+        }
+        other => panic!("Put was accepted before its reservation fitted: {other:?}"),
+    }
+    drop(sender);
+    drop(replies);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered for a requirement larger than the budget"
+    );
+
+    let fitted = base("two-windows-fit");
+    let mut config = Config::new(
+        fitted.join("records"),
+        fitted.join("run/m.sock"),
+        4096,
+        2 * 1024 * 1024,
+    );
+    config.name = instance_name("two-windows-fit");
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut client = host.client().await;
+    let stored = client.store(key(128 * 64), None).await;
+    let fetched = client.fetch(&[key(128 * 64)], 0, 128).await;
+    assert_eq!(fetched[0], stored);
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_49_oversized_window_never_earns_room() {
+    // A 16 MiB page cannot fit the 8 MiB staging region and the record does
+    // not fit the 16 MiB arena, so no staging retry can ever succeed. Room
+    // must not be offered even though a single window fits the arena.
+    let base = base("oversized-window");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("oversized-window");
+    config.staging = 8 * 1024 * 1024;
+    let mut host = Host::open_config(config);
+    host.start();
+    let mut value = descriptor();
+    value.ranks[0].planes = vec![16 * 1024 * 1024];
+    let mut client = host.client_with(value).await.unwrap();
+    let mut subscription = client.subscribe().await;
+    assert_eq!(
+        client.put(key(64), None, PutOptions::default()).await,
+        PutOutcome::Refused(crosscache::Reason::Budget as u8)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
+            .await
+            .is_err(),
+        "Room was offered for a window the staging region can never hold"
+    );
+    host.wait(|host| host.gauge("open_ops") == 0);
+}
